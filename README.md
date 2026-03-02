@@ -35,7 +35,7 @@ Current scope is a minimal native CLI that lists connected devices with battery 
 ### Windows (Developer PowerShell)
 
 ```powershell
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --fresh -S . -B build -A x64
 cmake --build build --config Debug
 .\build\Debug\battery-monitor.exe
 ```
@@ -60,4 +60,3 @@ battery-monitor --json
 - Not every Bluetooth device exposes battery data through standard Battery Service/Battery1.
 - On Linux, `org.bluez.Battery1` availability depends on BlueZ/device support.
 - GUI is intentionally not included in this initial baseline. The current architecture is ready for a future Qt-based UI that can run in X11 and Wayland sessions.
-

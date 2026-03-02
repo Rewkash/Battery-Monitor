@@ -1,7 +1,25 @@
+# Build directories
 /build/
+/build-*/
+/cmake-build-*/
+/out/
+
+# CMake generated files (in-source fallback)
+/CMakeCache.txt
+/CMakeFiles/
+/cmake_install.cmake
+/install_manifest.txt
+/CTestTestfile.cmake
+/Testing/
+/Makefile
+
+# Visual Studio
 /.vs/
-/.vscode/ipch/
-*.user
 *.VC.db
 *.VC.opendb
+*.user
+*.suo
 
+# VS Code / Cursor transient files
+/.vscode/ipch/
+/.cursor/
