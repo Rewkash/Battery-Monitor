@@ -2,15 +2,14 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Debug battery-monitor (Windows, MSVC)",
-      "type": "cppvsdbg",
+      "name": "Debug battery-monitor (Windows, CodeLLDB)",
+      "type": "lldb",
       "request": "launch",
       "program": "${workspaceFolder}/build/Debug/battery-monitor.exe",
       "args": [],
       "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal",
+      "terminal": "integrated",
       "preLaunchTask": "CMake: build (Debug)"
     }
   ]
 }
-

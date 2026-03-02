@@ -1,7 +1,5 @@
 {
   "cmake.buildDirectory": "${workspaceFolder}/build",
-  "cmake.generator": "Visual Studio 17 2022",
   "cmake.configureOnOpen": true,
   "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools"
 }
-

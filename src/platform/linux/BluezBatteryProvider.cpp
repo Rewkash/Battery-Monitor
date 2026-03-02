@@ -293,6 +293,7 @@ std::vector<DeviceBatteryInfo> BluezBatteryProvider::GetConnectedDevicesBattery(
         DeviceBatteryInfo entry;
         entry.device_id = path;
         entry.device_name = alias;
+        entry.battery_component = "main";
         entry.battery_level_percent = battery_percent;
         devices.push_back(std::move(entry));
     }

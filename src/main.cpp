@@ -1,5 +1,4 @@
 #include <exception>
-#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -51,12 +50,12 @@ void PrintTable(const std::vector<DeviceBatteryInfo>& devices) {
         return;
     }
 
-    std::cout << std::left << std::setw(32) << "Device Name" << std::setw(48) << "Device ID" << "Battery\n";
-    std::cout << std::string(92, '-') << '\n';
+    std::cout << "Device Name | Component | Battery | Device ID\n";
+    std::cout << "-------------------------------------------------------------\n";
 
     for (const auto& device : devices) {
-        std::cout << std::left << std::setw(32) << device.device_name << std::setw(48) << device.device_id
-                  << static_cast<int>(device.battery_level_percent) << "%\n";
+        std::cout << device.device_name << " | " << device.battery_component << " | "
+                  << static_cast<int>(device.battery_level_percent) << "% | " << device.device_id << '\n';
     }
 }
 
@@ -66,6 +65,7 @@ void PrintJson(const std::vector<DeviceBatteryInfo>& devices) {
         const auto& device = devices[i];
         std::cout << "  {\"deviceId\":\"" << EscapeJson(device.device_id) << "\","
                   << "\"deviceName\":\"" << EscapeJson(device.device_name) << "\","
+                  << "\"component\":\"" << EscapeJson(device.battery_component) << "\","
                   << "\"batteryLevelPercent\":" << static_cast<int>(device.battery_level_percent) << "}";
         if (i + 1 < devices.size()) {
             std::cout << ",";
@@ -103,4 +103,3 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
-
