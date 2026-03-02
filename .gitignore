@@ -1,0 +1,7 @@
+/build/
+/.vs/
+/.vscode/ipch/
+*.user
+*.VC.db
+*.VC.opendb
+
