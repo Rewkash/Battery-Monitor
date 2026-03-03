@@ -124,7 +124,7 @@ int main(int argc, char** argv) {
             QApplication app(argc, argv);
             auto provider = battery_monitor::CreateBatteryProvider();
             battery_monitor::BatteryWindow window(std::move(provider));
-            window.show();
+            window.Launch();
             return app.exec();
         }
 #endif

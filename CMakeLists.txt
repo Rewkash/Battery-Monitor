@@ -38,6 +38,7 @@ if(MSVC)
             /W4
             /permissive-
             /EHsc
+            /utf-8
     )
 else()
     target_compile_options(
