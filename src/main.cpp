@@ -1,8 +1,20 @@
+#include <cstdint>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
+
+#ifdef BATTERY_MONITOR_WITH_QT
+#include <QApplication>
+
+#include "ui/BatteryWindow.h"
+#endif
+
+#ifdef _WIN32
+#include <winrt/base.h>
+#endif
 
 #include "core/BatteryTypes.h"
 #include "core/ProviderFactory.h"
@@ -89,13 +101,33 @@ void PrintJson(const std::vector<DeviceBatteryInfo>& devices) {
 
 int main(int argc, char** argv) {
     bool json_output = false;
+    bool cli_output = false;
+    bool gui_forced = false;
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--json") {
+        const std::string arg = argv[i];
+        if (arg == "--json") {
             json_output = true;
+            continue;
+        }
+        if (arg == "--cli") {
+            cli_output = true;
+            continue;
+        }
+        if (arg == "--gui") {
+            gui_forced = true;
         }
     }
 
     try {
+#ifdef BATTERY_MONITOR_WITH_QT
+        if (!json_output && (!cli_output || gui_forced)) {
+            QApplication app(argc, argv);
+            auto provider = battery_monitor::CreateBatteryProvider();
+            battery_monitor::BatteryWindow window(std::move(provider));
+            window.show();
+            return app.exec();
+        }
+#endif
         auto provider = battery_monitor::CreateBatteryProvider();
         const auto devices = provider->GetConnectedDevicesBattery();
 
@@ -106,8 +138,18 @@ int main(int argc, char** argv) {
         }
 
         return 0;
+#ifdef _WIN32
+    } catch (const winrt::hresult_error& ex) {
+        std::cerr << "Error: WinRT HRESULT=0x" << std::hex << std::uppercase
+                  << static_cast<std::uint32_t>(ex.code().value)
+                  << " message=" << winrt::to_string(ex.message()) << '\n';
+        return 1;
+#endif
     } catch (const std::exception& ex) {
         std::cerr << "Error: " << ex.what() << '\n';
+        return 1;
+    } catch (...) {
+        std::cerr << "Error: unknown exception\n";
         return 1;
     }
 }

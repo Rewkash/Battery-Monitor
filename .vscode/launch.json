@@ -50,9 +50,21 @@
             "type": "cppvsdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build/Debug/battery-monitor.exe",
-            "args": [],
+            "args": [
+                "--gui"
+            ],
             "stopAtEntry": false,
-            "cwd": "${workspaceFolder}",
+            "cwd": "${workspaceFolder}/build/Debug",
+            "environment": [
+                {
+                    "name": "QT_QPA_PLATFORM_PLUGIN_PATH",
+                    "value": "${workspaceFolder}\\build\\Debug\\platforms"
+                },
+                {
+                    "name": "BATTERY_MONITOR_DEBUG",
+                    "value": "1"
+                }
+            ],
             "console": "integratedTerminal",
             "preLaunchTask": "CMake: build (Debug)"
         },

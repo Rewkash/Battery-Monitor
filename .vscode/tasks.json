@@ -5,6 +5,9 @@
             "label": "CMake: configure (Debug)",
             "type": "shell",
             "command": "cmake --fresh -S . -B build -DCMAKE_BUILD_TYPE=Debug",
+            "windows": {
+                "command": "cmake --fresh -S . -B build -A x64 -DCMAKE_PREFIX_PATH=\"${config:batteryMonitor.qtMsvcDir}\""
+            },
             "options": {
                 "cwd": "${workspaceFolder}"
             },
@@ -14,6 +17,9 @@
             "label": "CMake: build (Debug)",
             "type": "shell",
             "command": "cmake --build build -j",
+            "windows": {
+                "command": "cmake --build build --config Debug"
+            },
             "options": {
                 "cwd": "${workspaceFolder}"
             },
