@@ -54,8 +54,11 @@ void PrintTable(const std::vector<DeviceBatteryInfo>& devices) {
     std::cout << "-------------------------------------------------------------\n";
 
     for (const auto& device : devices) {
-        const std::string battery_text =
+        std::string battery_text =
             device.battery_level_percent.has_value() ? (std::to_string(*device.battery_level_percent) + "%") : "N/A";
+        if (device.is_cached && device.battery_level_percent.has_value()) {
+            battery_text += " (cached)";
+        }
         std::cout << device.device_name << " | " << device.battery_component << " | "
                   << battery_text << " | " << device.device_id << '\n';
     }
@@ -70,7 +73,8 @@ void PrintJson(const std::vector<DeviceBatteryInfo>& devices) {
         std::cout << "  {\"deviceId\":\"" << EscapeJson(device.device_id) << "\","
                   << "\"deviceName\":\"" << EscapeJson(device.device_name) << "\","
                   << "\"component\":\"" << EscapeJson(device.battery_component) << "\","
-                  << "\"batteryLevelPercent\":" << battery_json << "}";
+                  << "\"batteryLevelPercent\":" << battery_json << ","
+                  << "\"isCached\":" << (device.is_cached ? "true" : "false") << "}";
         if (i + 1 < devices.size()) {
             std::cout << ",";
         }

@@ -11,6 +11,7 @@ struct DeviceBatteryInfo {
     std::string device_name;
     std::string battery_component = "main";
     std::optional<std::uint8_t> battery_level_percent;
+    bool is_cached = false;
 };
 
 }  // namespace battery_monitor
