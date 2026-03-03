@@ -55,6 +55,7 @@ if(WIN32)
         battery-monitor
         PRIVATE
             windowsapp
+            Ws2_32
     )
 elseif(UNIX AND NOT APPLE)
     find_package(PkgConfig REQUIRED)
@@ -86,4 +87,3 @@ elseif(UNIX AND NOT APPLE)
 else()
     message(FATAL_ERROR "This project currently supports only Windows and Linux.")
 endif()
-

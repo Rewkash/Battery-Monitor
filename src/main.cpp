@@ -54,8 +54,10 @@ void PrintTable(const std::vector<DeviceBatteryInfo>& devices) {
     std::cout << "-------------------------------------------------------------\n";
 
     for (const auto& device : devices) {
+        const std::string battery_text =
+            device.battery_level_percent.has_value() ? (std::to_string(*device.battery_level_percent) + "%") : "N/A";
         std::cout << device.device_name << " | " << device.battery_component << " | "
-                  << static_cast<int>(device.battery_level_percent) << "% | " << device.device_id << '\n';
+                  << battery_text << " | " << device.device_id << '\n';
     }
 }
 
@@ -63,10 +65,12 @@ void PrintJson(const std::vector<DeviceBatteryInfo>& devices) {
     std::cout << "[\n";
     for (std::size_t i = 0; i < devices.size(); ++i) {
         const auto& device = devices[i];
+        const std::string battery_json =
+            device.battery_level_percent.has_value() ? std::to_string(*device.battery_level_percent) : "null";
         std::cout << "  {\"deviceId\":\"" << EscapeJson(device.device_id) << "\","
                   << "\"deviceName\":\"" << EscapeJson(device.device_name) << "\","
                   << "\"component\":\"" << EscapeJson(device.battery_component) << "\","
-                  << "\"batteryLevelPercent\":" << static_cast<int>(device.battery_level_percent) << "}";
+                  << "\"batteryLevelPercent\":" << battery_json << "}";
         if (i + 1 < devices.size()) {
             std::cout << ",";
         }

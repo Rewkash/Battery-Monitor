@@ -2,13 +2,23 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Debug battery-monitor (Windows, CodeLLDB)",
-      "type": "lldb",
+      "name": "Debug battery-monitor (Windows, MSVC)",
+      "type": "cppvsdbg", 
       "request": "launch",
       "program": "${workspaceFolder}/build/Debug/battery-monitor.exe",
       "args": [],
       "cwd": "${workspaceFolder}",
-      "terminal": "integrated",
+      "console": "integratedTerminal",
+      "preLaunchTask": "CMake: build (Debug)"
+    },
+    {
+      "name": "Debug battery-monitor (Kylin IDE)",
+      "type": "anysphere.cpptools",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/Debug/battery-monitor.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
       "preLaunchTask": "CMake: build (Debug)"
     }
   ]
