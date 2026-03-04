@@ -20,10 +20,13 @@ class QAction;
 class QLabel;
 class QMenu;
 class QPaintEvent;
+class QPropertyAnimation;
 class QPushButton;
 class QScrollArea;
+class QSpinBox;
 class QSystemTrayIcon;
 class QTimer;
+class QToolButton;
 class QVBoxLayout;
 class QWidget;
 class QCloseEvent;
@@ -53,6 +56,9 @@ class BatteryWindow : public QWidget {
     void UpdateToggleActionText();
     void UpdateTrayTooltip(const std::vector<DeviceBatteryInfo>& devices);
     void AdjustWindowHeightForRows(int visible_rows);
+    void ApplyRefreshIntervalSeconds(int seconds, bool announce_status);
+    void ConfigureRefreshInterval();
+    void UpdateRefreshSettingsTooltip();
     void SetDeviceDragActive(bool active);
     static std::string FormatError(const std::exception& ex);
 
@@ -60,8 +66,12 @@ class BatteryWindow : public QWidget {
     QWidget* cards_container_ = nullptr;
     QVBoxLayout* cards_layout_ = nullptr;
     QScrollArea* scroll_area_ = nullptr;
+    QWidget* settings_panel_ = nullptr;
+    QPropertyAnimation* settings_panel_animation_ = nullptr;
+    QSpinBox* refresh_interval_spinbox_ = nullptr;
     QPushButton* refresh_button_ = nullptr;
     QPushButton* show_all_button_ = nullptr;
+    QToolButton* settings_button_ = nullptr;
     QLabel* summary_label_ = nullptr;
     QLabel* status_label_ = nullptr;
     QSystemTrayIcon* tray_icon_ = nullptr;
@@ -80,6 +90,8 @@ class BatteryWindow : public QWidget {
     std::atomic<bool> refresh_in_progress_{false};
     bool refresh_pending_ = false;
     bool drag_in_progress_ = false;
+    bool settings_panel_expanded_ = false;
+    int refresh_interval_ms_ = 15000;
     bool quitting_ = false;
 };
 

@@ -33,12 +33,14 @@
 #include <QPaintEvent>
 #include <QPainter>
 #include <QPainterPath>
+#include <QPropertyAnimation>
 #include <QProgressBar>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QScreen>
 #include <QSettings>
 #include <QSizePolicy>
+#include <QSpinBox>
 #include <QStyle>
 #include <QSystemTrayIcon>
 #include <QTimer>
@@ -96,10 +98,37 @@ constexpr const char* kDeviceRowMimeType = "application/x-chargeview-device-row"
 constexpr const char* kSettingsGroupUi = "ui";
 constexpr const char* kSettingsConnectedOrderKey = "connected_order";
 constexpr const char* kSettingsDisconnectedOrderKey = "disconnected_order";
+constexpr const char* kSettingsRefreshIntervalMsKey = "refresh_interval_ms";
+constexpr int kDefaultRefreshIntervalMs = 15000;
+constexpr int kMinRefreshIntervalSeconds = 5;
+constexpr int kMaxRefreshIntervalSeconds = 600;
 
 QSettings CreateUiSettings() {
     return QSettings(QSettings::IniFormat, QSettings::UserScope, QStringLiteral("BatteryMonitor"),
                      QStringLiteral("BatteryMonitor"));
+}
+
+int ClampRefreshIntervalMs(int interval_ms) {
+    const int min_ms = kMinRefreshIntervalSeconds * 1000;
+    const int max_ms = kMaxRefreshIntervalSeconds * 1000;
+    return std::clamp(interval_ms, min_ms, max_ms);
+}
+
+int LoadRefreshIntervalMs() {
+    QSettings settings = CreateUiSettings();
+    settings.beginGroup(QString::fromLatin1(kSettingsGroupUi));
+    const int saved = settings.value(QString::fromLatin1(kSettingsRefreshIntervalMsKey), kDefaultRefreshIntervalMs)
+                          .toInt();
+    settings.endGroup();
+    return ClampRefreshIntervalMs(saved);
+}
+
+void SaveRefreshIntervalMs(int interval_ms) {
+    QSettings settings = CreateUiSettings();
+    settings.beginGroup(QString::fromLatin1(kSettingsGroupUi));
+    settings.setValue(QString::fromLatin1(kSettingsRefreshIntervalMsKey), ClampRefreshIntervalMs(interval_ms));
+    settings.endGroup();
+    settings.sync();
 }
 
 std::vector<std::string> ReadOrderFromSettings(QSettings* settings, const char* key) {
@@ -1004,6 +1033,41 @@ QToolButton#inlineMenuButton:hover {
     background: rgba(255, 255, 255, 0.08);
     color: #D6DCE7;
 }
+QToolButton#settingsButton {
+    background: #40444B;
+    color: #E7EDF8;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 10px;
+    min-width: 30px;
+    max-width: 30px;
+    min-height: 30px;
+    max-height: 30px;
+    font-size: 14px;
+    font-weight: 700;
+}
+QToolButton#settingsButton:hover {
+    background: #4D525B;
+}
+QFrame#settingsPanel {
+    background: #3A3E45;
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    border-radius: 10px;
+}
+QLabel#settingsLabel {
+    color: #D8DEE9;
+    font-size: 11px;
+    font-weight: 500;
+}
+QSpinBox#settingsSpinBox {
+    background: #2E3238;
+    color: #F2F5FB;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 8px;
+    padding: 2px 6px;
+    min-height: 24px;
+    min-width: 90px;
+    font-size: 11px;
+}
 QLabel#statusLabel {
     color: #B6BDCA;
     font-size: 11px;
@@ -1067,28 +1131,86 @@ QWidget#listContainer {
 
     scroll_area_->setWidget(cards_container_);
 
+    settings_panel_ = new QFrame(this);
+    settings_panel_->setObjectName(QStringLiteral("settingsPanel"));
+    settings_panel_->setVisible(false);
+    settings_panel_->setMinimumHeight(0);
+    settings_panel_->setMaximumHeight(0);
+    settings_panel_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+
+    auto* settings_layout = new QHBoxLayout(settings_panel_);
+    settings_layout->setContentsMargins(10, 7, 10, 7);
+    settings_layout->setSpacing(8);
+
+    auto* settings_label =
+        new QLabel(QString::fromUtf8(u8"\u0410\u0432\u0442\u043E\u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435 (сек):"),
+                   settings_panel_);
+    settings_label->setObjectName(QStringLiteral("settingsLabel"));
+
+    refresh_interval_spinbox_ = new QSpinBox(settings_panel_);
+    refresh_interval_spinbox_->setObjectName(QStringLiteral("settingsSpinBox"));
+    refresh_interval_spinbox_->setRange(kMinRefreshIntervalSeconds, kMaxRefreshIntervalSeconds);
+    refresh_interval_spinbox_->setSingleStep(5);
+    refresh_interval_spinbox_->setSuffix(QString::fromUtf8(u8" с"));
+
+    settings_layout->addWidget(settings_label);
+    settings_layout->addStretch(1);
+    settings_layout->addWidget(refresh_interval_spinbox_);
+
+    settings_panel_animation_ = new QPropertyAnimation(settings_panel_, "maximumHeight", this);
+    settings_panel_animation_->setDuration(200);
+    settings_panel_animation_->setEasingCurve(QEasingCurve::OutCubic);
+    connect(settings_panel_animation_, &QPropertyAnimation::valueChanged, this,
+            [this](const QVariant&) { AdjustWindowHeightForRows(kMaxVisibleRows); });
+    connect(settings_panel_animation_, &QPropertyAnimation::finished, this, [this]() {
+        if (settings_panel_ != nullptr && !settings_panel_expanded_) {
+            settings_panel_->setVisible(false);
+        }
+        AdjustWindowHeightForRows(kMaxVisibleRows);
+    });
+
     status_label_ = new QLabel(QString::fromUtf8(u8"\u0413\u043E\u0442\u043E\u0432\u043E"), this);
     status_label_->setObjectName(QStringLiteral("statusLabel"));
     status_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
     status_label_->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
 
+    settings_button_ = new QToolButton(this);
+    settings_button_->setObjectName(QStringLiteral("settingsButton"));
+    settings_button_->setText(QString::fromUtf8(u8"\u2699"));
+    settings_button_->setCursor(Qt::PointingHandCursor);
+    settings_button_->setToolButtonStyle(Qt::ToolButtonTextOnly);
+
     auto* footer_layout = new QHBoxLayout();
     footer_layout->setContentsMargins(10, 0, 10, 0);
-    footer_layout->setSpacing(0);
-    footer_layout->addWidget(status_label_);
+    footer_layout->setSpacing(6);
+    footer_layout->addWidget(status_label_, 1);
+    footer_layout->addStretch(1);
+    footer_layout->addWidget(settings_button_);
 
     root_layout->addLayout(top_layout);
     root_layout->addWidget(summary_label_);
     root_layout->addWidget(scroll_area_, 1);
+    root_layout->addWidget(settings_panel_);
     root_layout->addLayout(footer_layout);
 
     connect(refresh_button_, &QPushButton::clicked, this, [this]() { RefreshBatteryData(); });
     connect(show_all_button_, &QPushButton::clicked, this, [this]() { ResetHiddenDevices(); });
+    connect(settings_button_, &QToolButton::clicked, this, [this]() { ConfigureRefreshInterval(); });
+    connect(refresh_interval_spinbox_,
+            static_cast<void (QSpinBox::*)(int)>(&QSpinBox::valueChanged),
+            this, [this](int seconds) { ApplyRefreshIntervalSeconds(seconds, true); });
 
     refresh_timer_ = new QTimer(this);
-    refresh_timer_->setInterval(15000);
+    refresh_interval_ms_ = LoadRefreshIntervalMs();
+    refresh_timer_->setInterval(refresh_interval_ms_);
+    if (refresh_interval_spinbox_ != nullptr) {
+        refresh_interval_spinbox_->blockSignals(true);
+        refresh_interval_spinbox_->setValue(std::max(kMinRefreshIntervalSeconds, refresh_interval_ms_ / 1000));
+        refresh_interval_spinbox_->blockSignals(false);
+    }
     connect(refresh_timer_, &QTimer::timeout, this, [this]() { RefreshBatteryData(); });
     refresh_timer_->start();
+    UpdateRefreshSettingsTooltip();
 
     LoadPersistedDeviceOrder(&connected_device_order_, &disconnected_device_order_);
 
@@ -1331,10 +1453,91 @@ void BatteryWindow::AdjustWindowHeightForRows(int visible_rows) {
 
     const int spacing = cards_layout_->spacing() * std::max(0, visible_rows - 1);
     const QMargins margins = cards_layout_->contentsMargins();
-    const int list_height = rows_height + spacing + margins.top() + margins.bottom() + kListHeightSlack;
+    int list_height = rows_height + spacing + margins.top() + margins.bottom() + kListHeightSlack;
+
+    // Keep window height stable when settings panel is shown/animated:
+    // reclaim current panel height from the device list instead of expanding the window.
+    if (settings_panel_ != nullptr && settings_panel_->isVisible()) {
+        int reclaim_height = std::max(0, settings_panel_->maximumHeight());
+        if (auto* root_layout = qobject_cast<QVBoxLayout*>(layout()); root_layout != nullptr) {
+            // When settings panel is visible, layout introduces one extra inter-item spacing.
+            // Reclaim it even while panel height is still 0 to avoid a one-frame "jump".
+            reclaim_height += root_layout->spacing();
+        }
+        list_height = std::max(kCollapsedRowHeight, list_height - reclaim_height);
+    }
 
     scroll_area_->setFixedHeight(list_height);
     setFixedHeight(layout()->sizeHint().height());
+}
+
+void BatteryWindow::UpdateRefreshSettingsTooltip() {
+    if (settings_button_ == nullptr) {
+        return;
+    }
+    const int seconds = std::max(kMinRefreshIntervalSeconds, refresh_interval_ms_ / 1000);
+    settings_button_->setToolTip(
+        QString::fromUtf8(u8"\u0410\u0432\u0442\u043E\u043E\u0431\u043D\u043E\u0432\u043B\u044F\u0442\u044C "
+                          u8"\u043A\u0430\u0436\u0434\u044B\u0435 %1 \u0441\u0435\u043A")
+            .arg(seconds));
+}
+
+void BatteryWindow::ApplyRefreshIntervalSeconds(int seconds, bool announce_status) {
+    refresh_interval_ms_ = ClampRefreshIntervalMs(seconds * 1000);
+    if (refresh_timer_ != nullptr) {
+        refresh_timer_->setInterval(refresh_interval_ms_);
+    }
+    SaveRefreshIntervalMs(refresh_interval_ms_);
+    UpdateRefreshSettingsTooltip();
+
+    if (!announce_status || status_label_ == nullptr) {
+        return;
+    }
+
+    status_label_->setText(QString::fromUtf8(u8"\u0418\u043D\u0442\u0435\u0440\u0432\u0430\u043B "
+                                             u8"\u0430\u0432\u0442\u043E\u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u044F: %1 \u0441\u0435\u043A")
+                              .arg(refresh_interval_ms_ / 1000));
+}
+
+void BatteryWindow::ConfigureRefreshInterval() {
+    if (settings_panel_ == nullptr || settings_panel_animation_ == nullptr) {
+        return;
+    }
+
+    settings_panel_expanded_ = !settings_panel_expanded_;
+    settings_panel_animation_->stop();
+
+    if (settings_panel_expanded_) {
+        settings_panel_->setVisible(true);
+        AdjustWindowHeightForRows(kMaxVisibleRows);
+
+        if (refresh_interval_spinbox_ != nullptr) {
+            refresh_interval_spinbox_->blockSignals(true);
+            refresh_interval_spinbox_->setValue(std::max(kMinRefreshIntervalSeconds, refresh_interval_ms_ / 1000));
+            refresh_interval_spinbox_->blockSignals(false);
+        }
+
+        const int start_height = std::max(0, settings_panel_->maximumHeight());
+        const int end_height = std::max(0, settings_panel_->sizeHint().height());
+        settings_panel_animation_->setStartValue(start_height);
+        settings_panel_animation_->setEndValue(end_height);
+        settings_panel_animation_->start();
+
+        QMetaObject::invokeMethod(
+            this,
+            [this]() {
+                if (refresh_interval_spinbox_ != nullptr) {
+                    refresh_interval_spinbox_->setFocus();
+                    refresh_interval_spinbox_->selectAll();
+                }
+            },
+            Qt::QueuedConnection);
+    } else {
+        const int start_height = std::max(0, settings_panel_->maximumHeight());
+        settings_panel_animation_->setStartValue(start_height);
+        settings_panel_animation_->setEndValue(0);
+        settings_panel_animation_->start();
+    }
 }
 
 void BatteryWindow::SetDeviceDragActive(bool active) {
