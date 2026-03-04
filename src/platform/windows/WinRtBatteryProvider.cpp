@@ -9,13 +9,17 @@
 #include <exception>
 #include <cstring>
 #include <cwchar>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <sstream>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -26,10 +30,12 @@
 
 #include <winsock2.h>
 #include <ws2bth.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <cfgmgr32.h>
 
 #include <winrt/Windows.Devices.Bluetooth.h>
+#include <winrt/Windows.Devices.Bluetooth.Advertisement.h>
 #include <winrt/Windows.Devices.Bluetooth.GenericAttributeProfile.h>
 #include <winrt/Windows.Devices.Enumeration.h>
 #include <winrt/Windows.Foundation.h>
@@ -48,6 +54,9 @@ using winrt::Windows::Devices::Bluetooth::BluetoothAddressType;
 using winrt::Windows::Devices::Bluetooth::BluetoothDevice;
 using winrt::Windows::Devices::Bluetooth::BluetoothConnectionStatus;
 using winrt::Windows::Devices::Bluetooth::BluetoothLEDevice;
+using winrt::Windows::Devices::Bluetooth::Advertisement::BluetoothLEAdvertisementReceivedEventArgs;
+using winrt::Windows::Devices::Bluetooth::Advertisement::BluetoothLEAdvertisementWatcher;
+using winrt::Windows::Devices::Bluetooth::Advertisement::BluetoothLEScanningMode;
 using winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattCharacteristicProperties;
 using winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattCharacteristicUuids;
 using winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattCommunicationStatus;
@@ -57,6 +66,8 @@ using winrt::Windows::Devices::Enumeration::DeviceInformationKind;
 using winrt::Windows::Foundation::AsyncStatus;
 using winrt::Windows::Foundation::IAsyncOperation;
 using winrt::Windows::Foundation::IInspectable;
+using winrt::Windows::Foundation::IPropertyValue;
+using winrt::Windows::Foundation::PropertyType;
 using winrt::Windows::Storage::Streams::DataReader;
 
 struct BatteryReading {
@@ -196,11 +207,27 @@ bool ForceAepScanEnabled() {
     return enabled;
 }
 
-bool PersistentXiaomiCacheEnabled() {
+bool PersistentXiaomiCacheWriteEnabled() {
     static const bool enabled = []() {
         char* value = nullptr;
         std::size_t length = 0;
         const errno_t status = _dupenv_s(&value, &length, "BATTERY_MONITOR_PERSIST_CACHE");
+        if (status == 0 && value != nullptr) {
+            const std::string text(value);
+            free(value);
+            return text != "0";
+        }
+        free(value);
+        return true;
+    }();
+    return enabled;
+}
+
+bool PersistentXiaomiCacheReadEnabled() {
+    static const bool enabled = []() {
+        char* value = nullptr;
+        std::size_t length = 0;
+        const errno_t status = _dupenv_s(&value, &length, "BATTERY_MONITOR_PERSIST_CACHE_READ");
         if (status == 0 && value != nullptr) {
             const std::string text(value);
             free(value);
@@ -229,6 +256,44 @@ int XiaomiCacheTtlMinutes() {
         return 180;
     }();
     return ttl_minutes;
+}
+
+int XiaomiAdvertisementScanMs() {
+    static const int scan_ms = []() {
+        char* value = nullptr;
+        std::size_t length = 0;
+        const errno_t status = _dupenv_s(&value, &length, "BATTERY_MONITOR_XIAOMI_ADV_SCAN_MS");
+        if (status == 0 && value != nullptr) {
+            try {
+                const int parsed = std::stoi(value);
+                free(value);
+                return std::clamp(parsed, 300, 6000);
+            } catch (const std::exception&) {
+            }
+        }
+        free(value);
+        return 1800;
+    }();
+    return scan_ms;
+}
+
+int ZmiObserveMs() {
+    static const int observe_ms = []() {
+        char* value = nullptr;
+        std::size_t length = 0;
+        const errno_t status = _dupenv_s(&value, &length, "BATTERY_MONITOR_ZMI_OBSERVE_MS");
+        if (status == 0 && value != nullptr) {
+            try {
+                const int parsed = std::stoi(value);
+                free(value);
+                return std::clamp(parsed, 0, 30000);
+            } catch (const std::exception&) {
+            }
+        }
+        free(value);
+        return 0;
+    }();
+    return observe_ms;
 }
 
 std::filesystem::path XiaomiCacheFilePath() {
@@ -712,10 +777,46 @@ std::optional<std::uint64_t> ParseBluetoothAddressFromDeviceId(const std::string
     return addresses.back();
 }
 
+std::optional<std::uint16_t> ReadBluetoothProductIdFromRegistry(std::uint64_t address) {
+    if (address <= 0xFFFFULL) {
+        return std::nullopt;
+    }
+
+    std::wstringstream key_builder;
+    key_builder << L"SYSTEM\\CurrentControlSet\\Services\\BTHPORT\\Parameters\\Devices\\"
+                << std::nouppercase << std::hex
+                << std::setw(12) << std::setfill(L'0') << address;
+    const std::wstring key_path = key_builder.str();
+
+    HKEY key_handle = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, key_path.c_str(), 0, KEY_QUERY_VALUE, &key_handle) != ERROR_SUCCESS) {
+        return std::nullopt;
+    }
+
+    DWORD value_type = 0;
+    DWORD value = 0;
+    DWORD value_size = sizeof(value);
+    const auto query_result = RegQueryValueExW(key_handle, L"PID", nullptr, &value_type,
+                                               reinterpret_cast<LPBYTE>(&value), &value_size);
+    RegCloseKey(key_handle);
+
+    if (query_result != ERROR_SUCCESS || value_size < sizeof(DWORD) || value_type != REG_DWORD) {
+        return std::nullopt;
+    }
+    if (value > 0xFFFFU) {
+        return std::nullopt;
+    }
+    return static_cast<std::uint16_t>(value);
+}
+
 std::vector<std::wstring> FindBthEnumInstanceIdsByAddress(std::uint64_t address) {
+    std::wstringstream prefix_builder;
+    prefix_builder << L"BTHENUM\\DEV_" << std::uppercase << std::hex
+                   << std::setw(12) << std::setfill(L'0') << address;
+    const std::wstring expected_prefix = prefix_builder.str();
+
     std::wstringstream filter_builder;
-    filter_builder << L"BTHENUM\\DEV_" << std::uppercase << std::hex
-                   << std::setw(12) << std::setfill(L'0') << address << L"\\*";
+    filter_builder << expected_prefix << L"\\*";
     const std::wstring filter = filter_builder.str();
 
     ULONG size = 0;
@@ -740,36 +841,355 @@ std::vector<std::wstring> FindBthEnumInstanceIdsByAddress(std::uint64_t address)
         if (length == 0U) {
             break;
         }
-        instance_ids.emplace_back(current, length);
+        std::wstring instance_id(current, length);
+        std::wstring normalized = instance_id;
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                       [](wchar_t value) {
+                           return static_cast<wchar_t>(std::towupper(value));
+                       });
+        if (normalized.rfind(expected_prefix, 0) == 0) {
+            instance_ids.push_back(std::move(instance_id));
+        }
         cursor += length + 1U;
     }
 
     return instance_ids;
 }
 
-std::optional<std::uint8_t> ReadZmiVendorBatteryHintFromPnpAddress(std::uint64_t address) {
+std::optional<std::uint8_t> NormalizeZmiVendorBatteryScalar(int raw_value) {
+    if (raw_value <= 0 || raw_value == 255) {
+        return std::nullopt;
+    }
+    if (raw_value <= 10) {
+        return static_cast<std::uint8_t>(raw_value * 10);
+    }
+    if (raw_value <= 100) {
+        return static_cast<std::uint8_t>(raw_value);
+    }
+    if ((raw_value & 0xFF) == raw_value) {
+        const int masked = raw_value & 0x7F;
+        if (masked > 0 && masked <= 100) {
+            return static_cast<std::uint8_t>(masked);
+        }
+    }
+    return std::nullopt;
+}
+
+std::vector<BatteryReading> BuildReadingsFromTriplet(const XiaomiBatterySnapshot& snapshot) {
+    std::vector<BatteryReading> readings;
+    if (snapshot.left.has_value()) {
+        readings.push_back(BatteryReading{"left", *snapshot.left});
+    }
+    if (snapshot.right.has_value()) {
+        readings.push_back(BatteryReading{"right", *snapshot.right});
+    }
+    if (snapshot.case_level.has_value()) {
+        readings.push_back(BatteryReading{"case", *snapshot.case_level});
+    }
+    return readings;
+}
+
+std::size_t XiaomiResolvedTwsComponentCount(const std::vector<BatteryReading>& readings) {
+    bool has_left = false;
+    bool has_right = false;
+    bool has_case = false;
+
+    for (const auto& reading : readings) {
+        const std::string component = ToLowerAscii(reading.component);
+        if (component == "left") {
+            has_left = true;
+        } else if (component == "right") {
+            has_right = true;
+        } else if (component == "case") {
+            has_case = true;
+        }
+    }
+
+    std::size_t count = 0;
+    if (has_left) {
+        ++count;
+    }
+    if (has_right) {
+        ++count;
+    }
+    if (has_case) {
+        ++count;
+    }
+    return count;
+}
+
+bool HasUsefulXiaomiTwsReadings(const std::vector<BatteryReading>& readings, std::size_t min_components = 2U) {
+    return XiaomiResolvedTwsComponentCount(readings) >= min_components;
+}
+
+int XiaomiReadingsRichnessScore(const std::vector<BatteryReading>& readings) {
+    const auto tws_components = static_cast<int>(XiaomiResolvedTwsComponentCount(readings));
+    int score = tws_components * 100;
+    for (const auto& reading : readings) {
+        const std::string component = ToLowerAscii(reading.component);
+        if (component == "main") {
+            score += 10;
+        }
+    }
+    score += static_cast<int>(std::min<std::size_t>(readings.size(), 9U));
+    return score;
+}
+
+std::vector<BatteryReading> DecodeZmiVendorBatteryReadingsFromUInt32(std::uint32_t raw_value);
+
+int ZmiSnapshotPresenceCount(const XiaomiBatterySnapshot& snapshot) {
+    int count = 0;
+    if (snapshot.left.has_value()) {
+        ++count;
+    }
+    if (snapshot.right.has_value()) {
+        ++count;
+    }
+    if (snapshot.case_level.has_value()) {
+        ++count;
+    }
+    return count;
+}
+
+std::vector<BatteryReading> DecodeZmiVendorReadingsFromNumericValues(const std::vector<int>& values) {
+    struct Candidate {
+        XiaomiBatterySnapshot snapshot;
+        int score = -1;
+        int presence = 0;
+    };
+
+    if (values.empty()) {
+        return {};
+    }
+
+    auto evaluate_triplet = [](int left_raw, int right_raw, int case_raw, int pattern_bonus) -> Candidate {
+        XiaomiBatterySnapshot snapshot;
+        snapshot.left = NormalizeZmiVendorBatteryScalar(left_raw);
+        snapshot.right = NormalizeZmiVendorBatteryScalar(right_raw);
+        snapshot.case_level = NormalizeZmiVendorBatteryScalar(case_raw);
+
+        const int presence = ZmiSnapshotPresenceCount(snapshot);
+        if (presence < 2) {
+            return Candidate{snapshot, -1, presence};
+        }
+
+        int score = pattern_bonus;
+        score += presence * 16;
+        if (presence == 3) {
+            score += 8;
+        }
+        if (snapshot.left.has_value() && snapshot.right.has_value() && *snapshot.left != *snapshot.right) {
+            score += 6;
+        }
+        if ((snapshot.left.has_value() && *snapshot.left > 10U) ||
+            (snapshot.right.has_value() && *snapshot.right > 10U) ||
+            (snapshot.case_level.has_value() && *snapshot.case_level > 10U)) {
+            score += 5;
+        }
+        if (snapshot.left.has_value() && snapshot.right.has_value() && snapshot.case_level.has_value() &&
+            *snapshot.left == *snapshot.right && *snapshot.right == *snapshot.case_level) {
+            score -= 7;
+        }
+
+        return Candidate{snapshot, score, presence};
+    };
+
+    std::optional<Candidate> best;
+    auto consider = [&](int left_raw, int right_raw, int case_raw, int pattern_bonus) {
+        const auto candidate = evaluate_triplet(left_raw, right_raw, case_raw, pattern_bonus);
+        if (candidate.score < 0) {
+            return;
+        }
+        if (!best.has_value() || candidate.score > best->score) {
+            best = candidate;
+        }
+    };
+
+    for (std::size_t index = 0; index + 2U < values.size(); ++index) {
+        int pattern_bonus = 0;
+        if (index >= 4U && values[index - 4U] == 0x02 && values[index - 3U] == 0x02 &&
+            values[index - 2U] == 0x04 && values[index - 1U] == 0x07) {
+            pattern_bonus += 30;
+        }
+        if (index >= 2U && values[index - 2U] >= 4 && values[index - 2U] <= 8 &&
+            values[index - 1U] >= 0 && values[index - 1U] <= 0x7F) {
+            pattern_bonus += 18;
+        }
+
+        consider(values[index], values[index + 1U], values[index + 2U], pattern_bonus);
+    }
+
+    if (best.has_value()) {
+        const int threshold = best->presence == 3 ? 58 : 50;
+        if (best->score >= threshold) {
+            return BuildReadingsFromTriplet(best->snapshot);
+        }
+    }
+
+    for (const auto raw : values) {
+        const auto scalar = NormalizeZmiVendorBatteryScalar(raw);
+        if (scalar.has_value()) {
+            return {BatteryReading{"main", *scalar}};
+        }
+    }
+
+    return {};
+}
+
+std::vector<BatteryReading> DecodeZmiVendorReadingsFromByteBlob(const std::vector<std::uint8_t>& bytes) {
+    if (bytes.empty()) {
+        return {};
+    }
+
+    std::vector<int> values;
+    values.reserve(bytes.size());
+    for (const auto value : bytes) {
+        values.push_back(static_cast<int>(value));
+    }
+
+    auto decoded = DecodeZmiVendorReadingsFromNumericValues(values);
+    if (decoded.size() >= 2U) {
+        return decoded;
+    }
+
+    if (bytes.size() >= sizeof(std::uint32_t)) {
+        std::vector<BatteryReading> best_packed = decoded;
+        for (std::size_t offset = 0; offset + sizeof(std::uint32_t) <= bytes.size(); ++offset) {
+            std::uint32_t packed = 0;
+            std::memcpy(&packed, bytes.data() + static_cast<std::ptrdiff_t>(offset), sizeof(packed));
+            auto packed_decoded = DecodeZmiVendorBatteryReadingsFromUInt32(packed);
+            if (packed_decoded.size() > best_packed.size()) {
+                best_packed = std::move(packed_decoded);
+            }
+        }
+        if (!best_packed.empty()) {
+            return best_packed;
+        }
+    }
+
+    return decoded;
+}
+
+std::vector<BatteryReading> DecodeZmiVendorBatteryReadingsFromUInt32(std::uint32_t raw_value) {
+    struct Candidate {
+        XiaomiBatterySnapshot snapshot;
+        int score = -1;
+        int presence = 0;
+    };
+
+    auto evaluate_triplet = [](std::uint8_t left_raw, std::uint8_t right_raw, std::uint8_t case_raw) -> Candidate {
+        XiaomiBatterySnapshot snapshot;
+        snapshot.left = NormalizeZmiVendorBatteryScalar(left_raw);
+        snapshot.right = NormalizeZmiVendorBatteryScalar(right_raw);
+        snapshot.case_level = NormalizeZmiVendorBatteryScalar(case_raw);
+
+        int presence = 0;
+        if (snapshot.left.has_value()) {
+            ++presence;
+        }
+        if (snapshot.right.has_value()) {
+            ++presence;
+        }
+        if (snapshot.case_level.has_value()) {
+            ++presence;
+        }
+
+        int score = 0;
+        score += presence * 20;
+        if (presence == 3) {
+            score += 30;
+        }
+        if (snapshot.left.has_value() && snapshot.right.has_value() && *snapshot.left != *snapshot.right) {
+            score += 8;
+        }
+        if ((snapshot.left.has_value() && *snapshot.left == 100U) ||
+            (snapshot.right.has_value() && *snapshot.right == 100U) ||
+            (snapshot.case_level.has_value() && *snapshot.case_level == 100U)) {
+            score += 4;
+        }
+
+        return Candidate{snapshot, score, presence};
+    };
+
+    const std::array<std::uint8_t, 4> little_endian_bytes = {
+        static_cast<std::uint8_t>((raw_value >> 0U) & 0xFFU),
+        static_cast<std::uint8_t>((raw_value >> 8U) & 0xFFU),
+        static_cast<std::uint8_t>((raw_value >> 16U) & 0xFFU),
+        static_cast<std::uint8_t>((raw_value >> 24U) & 0xFFU),
+    };
+
+    std::optional<Candidate> best;
+    auto consider = [&](std::uint8_t left_raw, std::uint8_t right_raw, std::uint8_t case_raw) {
+        const auto candidate = evaluate_triplet(left_raw, right_raw, case_raw);
+        if (candidate.presence < 2) {
+            return;
+        }
+        if (!best.has_value() || candidate.score > best->score) {
+            best = candidate;
+        }
+    };
+
+    consider(little_endian_bytes[0], little_endian_bytes[1], little_endian_bytes[2]);
+    consider(little_endian_bytes[1], little_endian_bytes[2], little_endian_bytes[3]);
+    consider(little_endian_bytes[2], little_endian_bytes[1], little_endian_bytes[0]);
+    consider(little_endian_bytes[3], little_endian_bytes[2], little_endian_bytes[1]);
+
+    if (best.has_value()) {
+        const int threshold = best->presence == 3 ? 70 : 55;
+        if (best->score >= threshold) {
+            return BuildReadingsFromTriplet(best->snapshot);
+        }
+    }
+
+    const auto scalar = NormalizeZmiVendorBatteryScalar(static_cast<int>(raw_value));
+    if (scalar.has_value()) {
+        return {BatteryReading{"main", *scalar}};
+    }
+
+    return {};
+}
+
+std::vector<BatteryReading> ReadZmiVendorBatteryHintFromPnpAddress(std::uint64_t address) {
+    static std::unordered_map<std::uint64_t, std::vector<BatteryReading>> cache;
+    if (const auto cached = cache.find(address); cached != cache.end()) {
+        return cached->second;
+    }
+
     const auto instance_ids = FindBthEnumInstanceIdsByAddress(address);
     if (instance_ids.empty()) {
         DebugLog("ZMI PnP lookup: instance id not found for address=" + std::to_string(address));
-        return std::nullopt;
+        cache[address] = {};
+        return {};
     }
 
-    std::array<std::uint8_t, 16> raw_data{};
+    std::wstringstream prefix_builder;
+    prefix_builder << L"BTHENUM\\DEV_" << std::uppercase << std::hex
+                   << std::setw(12) << std::setfill(L'0') << address;
+    const std::wstring preferred_prefix = prefix_builder.str();
 
-    auto normalize = [](int raw_value) -> std::optional<std::uint8_t> {
-        if (raw_value <= 0 || raw_value == 255) {
-            return std::nullopt;
-        }
-        if (raw_value <= 10) {
-            return static_cast<std::uint8_t>(raw_value * 10);
-        }
-        if (raw_value <= 100) {
-            return static_cast<std::uint8_t>(raw_value);
-        }
-        return std::nullopt;
-    };
+    std::vector<std::wstring> ranked_instance_ids = instance_ids;
+    std::stable_sort(ranked_instance_ids.begin(), ranked_instance_ids.end(),
+                     [&preferred_prefix](const std::wstring& lhs, const std::wstring& rhs) {
+                         auto score = [&preferred_prefix](const std::wstring& value) {
+                             int rank = 0;
+                             if (value.rfind(preferred_prefix, 0) == 0) {
+                                 rank += 100;
+                             }
+                             if (value.find(L"\\DEV_") != std::wstring::npos) {
+                                 rank += 20;
+                             }
+                             if (value.find(L"{") != std::wstring::npos) {
+                                 rank -= 12;
+                             }
+                             if (value.find(L"LOCALMFG") != std::wstring::npos) {
+                                 rank -= 8;
+                             }
+                             return rank;
+                         };
+                         return score(lhs) > score(rhs);
+                     });
 
-    for (const auto& instance_id : instance_ids) {
+    for (const auto& instance_id : ranked_instance_ids) {
         DEVINST dev_inst = 0;
         const auto locate_result =
             CM_Locate_DevNodeW(&dev_inst, const_cast<wchar_t*>(instance_id.c_str()), CM_LOCATE_DEVNODE_NORMAL);
@@ -777,47 +1197,150 @@ std::optional<std::uint8_t> ReadZmiVendorBatteryHintFromPnpAddress(std::uint64_t
             continue;
         }
 
-        DEVPROPTYPE property_type = DEVPROP_TYPE_EMPTY;
-        ULONG size = static_cast<ULONG>(raw_data.size());
-        const auto property_result = CM_Get_DevNode_PropertyW(
-            dev_inst, &kZmiVendorBatteryHintPropKey, &property_type,
-            reinterpret_cast<PBYTE>(raw_data.data()), &size, 0);
-        if (property_result != CR_SUCCESS) {
-            continue;
+        auto decode_property = [&](const DEVPROPKEY& property_key) -> std::vector<BatteryReading> {
+            DEVPROPTYPE property_type = DEVPROP_TYPE_EMPTY;
+            ULONG size = 0;
+            const auto query_result =
+                CM_Get_DevNode_PropertyW(dev_inst, &property_key, &property_type, nullptr, &size, 0);
+            if (query_result != CR_SUCCESS && query_result != CR_BUFFER_SMALL) {
+                return {};
+            }
+            if (size == 0U) {
+                return {};
+            }
+
+            std::vector<std::uint8_t> raw_data(size);
+            const auto property_result = CM_Get_DevNode_PropertyW(
+                dev_inst, &property_key, &property_type,
+                reinterpret_cast<PBYTE>(raw_data.data()), &size, 0);
+            if (property_result != CR_SUCCESS) {
+                return {};
+            }
+            raw_data.resize(size);
+            if (DebugEnabled() && (property_key.pid != 4U || raw_data.size() > 1U)) {
+                const std::size_t preview_len = std::min<std::size_t>(raw_data.size(), 24U);
+                std::vector<std::uint8_t> preview(raw_data.begin(),
+                                                  raw_data.begin() + static_cast<std::ptrdiff_t>(preview_len));
+                DebugLog("ZMI PnP raw pid=" + std::to_string(property_key.pid) +
+                         " type=" + std::to_string(property_type) +
+                         " size=" + std::to_string(raw_data.size()) +
+                         " data=" + BytesToHex(preview));
+            }
+
+            if (property_type == DEVPROP_TYPE_BYTE && !raw_data.empty()) {
+                const auto normalized = NormalizeZmiVendorBatteryScalar(static_cast<int>(raw_data[0]));
+                if (normalized.has_value()) {
+                    return {BatteryReading{"main", *normalized}};
+                }
+            }
+
+            if (property_type == DEVPROP_TYPE_UINT32 && size >= sizeof(std::uint32_t)) {
+                std::uint32_t value = 0;
+                std::memcpy(&value, raw_data.data(), sizeof(value));
+                auto decoded = DecodeZmiVendorBatteryReadingsFromUInt32(value);
+                if (!decoded.empty()) {
+                    return decoded;
+                }
+            }
+            if (property_type == DEVPROP_TYPE_INT32 && size >= sizeof(std::int32_t)) {
+                std::int32_t value = 0;
+                std::memcpy(&value, raw_data.data(), sizeof(value));
+                if (value > 0) {
+                    auto decoded = DecodeZmiVendorBatteryReadingsFromUInt32(static_cast<std::uint32_t>(value));
+                    if (!decoded.empty()) {
+                        return decoded;
+                    }
+                }
+            }
+
+            return DecodeZmiVendorReadingsFromByteBlob(raw_data);
+        };
+
+        std::vector<DEVPROPKEY> keys_to_probe;
+        constexpr int kVendorPidMin = 1;
+        constexpr int kVendorPidMax = 32;
+        for (int pid = kVendorPidMin; pid <= kVendorPidMax; ++pid) {
+            DEVPROPKEY key = kZmiVendorBatteryHintPropKey;
+            key.pid = static_cast<ULONG>(pid);
+            keys_to_probe.push_back(key);
         }
 
-        if (property_type == DEVPROP_TYPE_BYTE && size >= 1U) {
-            const auto normalized = normalize(static_cast<int>(raw_data[0]));
-            if (normalized.has_value()) {
-                DebugLog("ZMI PnP lookup: vendor property byte=" + std::to_string(raw_data[0]));
-                return normalized;
+        ULONG key_count = 0;
+        const auto key_count_result = CM_Get_DevNode_Property_Keys(dev_inst, nullptr, &key_count, 0);
+        if ((key_count_result == CR_SUCCESS || key_count_result == CR_BUFFER_SMALL) && key_count > 0U) {
+            std::vector<DEVPROPKEY> property_keys(key_count);
+            if (CM_Get_DevNode_Property_Keys(dev_inst, property_keys.data(), &key_count, 0) == CR_SUCCESS) {
+                property_keys.resize(key_count);
+                for (const auto& property_key : property_keys) {
+                    if (std::memcmp(&property_key.fmtid, &kZmiVendorBatteryHintPropKey.fmtid, sizeof(GUID)) != 0) {
+                        continue;
+                    }
+                    const bool already_added = std::any_of(
+                        keys_to_probe.begin(), keys_to_probe.end(),
+                        [&property_key](const DEVPROPKEY& existing) {
+                            return std::memcmp(&existing, &property_key, sizeof(DEVPROPKEY)) == 0;
+                        });
+                    if (!already_added) {
+                        keys_to_probe.push_back(property_key);
+                    }
+                }
             }
-            continue;
         }
-        if (property_type == DEVPROP_TYPE_UINT32 && size >= sizeof(std::uint32_t)) {
-            std::uint32_t value = 0;
-            std::memcpy(&value, raw_data.data(), sizeof(value));
-            const auto normalized = normalize(static_cast<int>(value));
-            if (normalized.has_value()) {
-                DebugLog("ZMI PnP lookup: vendor property uint32=" + std::to_string(value));
-                return normalized;
+
+        std::sort(keys_to_probe.begin(), keys_to_probe.end(),
+                  [](const DEVPROPKEY& lhs, const DEVPROPKEY& rhs) {
+                      return lhs.pid < rhs.pid;
+                  });
+        keys_to_probe.erase(
+            std::unique(keys_to_probe.begin(), keys_to_probe.end(),
+                        [](const DEVPROPKEY& lhs, const DEVPROPKEY& rhs) {
+                            return std::memcmp(&lhs, &rhs, sizeof(DEVPROPKEY)) == 0;
+                        }),
+            keys_to_probe.end());
+        if (DebugEnabled() && keys_to_probe.size() > 1U) {
+            std::string pid_list;
+            for (const auto& property_key : keys_to_probe) {
+                if (!pid_list.empty()) {
+                    pid_list += ",";
+                }
+                pid_list += std::to_string(property_key.pid);
             }
-            continue;
+            DebugLog("ZMI PnP lookup: probing vendor pids=" + pid_list +
+                     " instance='" + ToUtf8(winrt::hstring(instance_id)) + "'");
         }
-        if (property_type == DEVPROP_TYPE_INT32 && size >= sizeof(std::int32_t)) {
-            std::int32_t value = 0;
-            std::memcpy(&value, raw_data.data(), sizeof(value));
-            const auto normalized = normalize(static_cast<int>(value));
-            if (normalized.has_value()) {
-                DebugLog("ZMI PnP lookup: vendor property int32=" + std::to_string(value));
-                return normalized;
+
+        std::vector<BatteryReading> best_single_value;
+        for (const auto& property_key : keys_to_probe) {
+            auto decoded = decode_property(property_key);
+            if (decoded.empty()) {
+                continue;
             }
-            continue;
+
+            if (decoded.size() >= 2U) {
+                DebugLog("ZMI PnP lookup: vendor property pid=" + std::to_string(property_key.pid) +
+                         " decoded entries=" + std::to_string(decoded.size()));
+                cache[address] = decoded;
+                return decoded;
+            }
+
+            if (DebugEnabled()) {
+                DebugLog("ZMI PnP lookup: vendor property pid=" + std::to_string(property_key.pid) +
+                         " decoded scalar entries=" + std::to_string(decoded.size()));
+            }
+            if (best_single_value.empty()) {
+                best_single_value = decoded;
+            }
+        }
+
+        if (!best_single_value.empty()) {
+            cache[address] = best_single_value;
+            return best_single_value;
         }
     }
 
     DebugLog("ZMI PnP lookup: vendor property missing for address=" + std::to_string(address));
-    return std::nullopt;
+    cache[address] = {};
+    return {};
 }
 
 std::optional<std::uint64_t> TryGetBluetoothAddress(const BluetoothLEDevice& ble_device) {
@@ -1159,6 +1682,111 @@ bool ConnectWithTimeout(SOCKET socket_handle, const SOCKADDR_BTH& address, int t
     return true;
 }
 
+struct DiscoveredRfcommChannel {
+    std::uint32_t port = 0;
+    GUID service_uuid{};
+    std::string instance_name;
+};
+
+std::optional<std::wstring> BuildBluetoothLookupContext(std::uint64_t bluetooth_address) {
+    SOCKADDR_BTH context_address{};
+    context_address.addressFamily = AF_BTH;
+    context_address.btAddr = bluetooth_address;
+    context_address.port = BT_PORT_ANY;
+    context_address.serviceClassId = GUID{};
+
+    std::array<wchar_t, 96> context_text{};
+    DWORD context_length = static_cast<DWORD>(context_text.size());
+    if (WSAAddressToStringW(reinterpret_cast<LPSOCKADDR>(&context_address), sizeof(context_address),
+                            nullptr, context_text.data(), &context_length) == SOCKET_ERROR) {
+        return std::nullopt;
+    }
+
+    return std::wstring(context_text.data());
+}
+
+std::vector<DiscoveredRfcommChannel> DiscoverRfcommChannelsFromSdp(std::uint64_t bluetooth_address,
+                                                                   const GUID* service_filter,
+                                                                   bool flush_cache) {
+    std::vector<DiscoveredRfcommChannel> channels;
+    const auto lookup_context = BuildBluetoothLookupContext(bluetooth_address);
+    if (!lookup_context.has_value()) {
+        return channels;
+    }
+
+    WSAQUERYSETW query{};
+    query.dwSize = sizeof(query);
+    query.dwNameSpace = NS_BTH;
+    query.lpszContext = const_cast<LPWSTR>(lookup_context->c_str());
+    if (service_filter != nullptr) {
+        query.lpServiceClassId = const_cast<LPGUID>(service_filter);
+    }
+
+    HANDLE lookup_handle = nullptr;
+    DWORD begin_flags = LUP_RETURN_ADDR | LUP_RETURN_NAME;
+    if (flush_cache) {
+        begin_flags |= LUP_FLUSHCACHE;
+    }
+
+    if (WSALookupServiceBeginW(&query, begin_flags, &lookup_handle) == SOCKET_ERROR) {
+        return channels;
+    }
+
+    std::set<std::uint32_t> seen_ports;
+    std::vector<std::uint8_t> buffer(4096);
+
+    while (true) {
+        DWORD buffer_length = static_cast<DWORD>(buffer.size());
+        auto* result = reinterpret_cast<WSAQUERYSETW*>(buffer.data());
+        std::memset(result, 0, buffer.size());
+        result->dwSize = sizeof(WSAQUERYSETW);
+
+        if (WSALookupServiceNextW(lookup_handle, LUP_RETURN_ADDR | LUP_RETURN_NAME,
+                                  &buffer_length, result) == SOCKET_ERROR) {
+            const int error_code = WSAGetLastError();
+            if (error_code == WSAEFAULT && buffer_length > buffer.size()) {
+                buffer.resize(buffer_length);
+                continue;
+            }
+            break;
+        }
+
+        if (result->lpcsaBuffer == nullptr || result->dwNumberOfCsAddrs == 0U) {
+            continue;
+        }
+
+        for (DWORD index = 0; index < result->dwNumberOfCsAddrs; ++index) {
+            const auto& csaddr = result->lpcsaBuffer[index];
+            if (csaddr.RemoteAddr.lpSockaddr == nullptr ||
+                csaddr.RemoteAddr.iSockaddrLength < static_cast<int>(sizeof(SOCKADDR_BTH))) {
+                continue;
+            }
+
+            const auto* remote = reinterpret_cast<const SOCKADDR_BTH*>(csaddr.RemoteAddr.lpSockaddr);
+            if (remote->addressFamily != AF_BTH) {
+                continue;
+            }
+            if (remote->port == BT_PORT_ANY || remote->port == 0U || remote->port > 60U) {
+                continue;
+            }
+            if (!seen_ports.insert(remote->port).second) {
+                continue;
+            }
+
+            DiscoveredRfcommChannel channel;
+            channel.port = remote->port;
+            channel.service_uuid = service_filter != nullptr ? *service_filter : remote->serviceClassId;
+            if (result->lpszServiceInstanceName != nullptr) {
+                channel.instance_name = winrt::to_string(winrt::hstring(result->lpszServiceInstanceName));
+            }
+            channels.push_back(std::move(channel));
+        }
+    }
+
+    WSALookupServiceEnd(lookup_handle);
+    return channels;
+}
+
 std::optional<std::vector<std::uint8_t>> ReceiveChunk(SOCKET socket_handle) {
     std::array<char, 4096> recv_buffer{};
     const int received = recv(socket_handle, recv_buffer.data(), static_cast<int>(recv_buffer.size()), 0);
@@ -1215,7 +1843,7 @@ std::optional<XiaomiBatterySnapshot> ExtractBatterySnapshotFromXiaomiPayload(
         }
 
         const std::uint8_t tag = payload[index + 1U];
-        if (len != 4U || tag > 0x1FU) {
+        if (len < 4U || len > 8U || tag > 0x7FU) {
             index += len + 1U;
             continue;
         }
@@ -1238,7 +1866,8 @@ std::optional<XiaomiBatterySnapshot> ExtractBatterySnapshotFromXiaomiPayload(
         if (preferred_tag.has_value() && tag == *preferred_tag) {
             score += 50;
         }
-        if (!preferred_tag.has_value() && (tag == 0x00U || tag == 0x07U)) {
+        if (!preferred_tag.has_value() &&
+            (tag == 0x00U || tag == 0x07U || tag == 0x09U || tag == 0x0AU)) {
             score += 12;
         }
 
@@ -1309,6 +1938,419 @@ std::vector<BatteryReading> BuildXiaomiBatteryReadings(const XiaomiBatterySnapsh
     if (snapshot.case_level.has_value()) {
         readings.push_back(BatteryReading{"case", *snapshot.case_level});
     }
+    return readings;
+}
+
+std::optional<XiaomiBatterySnapshot> ExtractZmiSerialPatternSnapshot(const std::vector<std::uint8_t>& bytes) {
+    if (bytes.size() < 7U) {
+        return std::nullopt;
+    }
+
+    constexpr std::array<std::uint8_t, 4> kPattern = {0x02, 0x02, 0x04, 0x07};
+    for (std::size_t index = 0; index + 6U < bytes.size(); ++index) {
+        if (!(bytes[index] == kPattern[0] &&
+              bytes[index + 1U] == kPattern[1] &&
+              bytes[index + 2U] == kPattern[2] &&
+              bytes[index + 3U] == kPattern[3])) {
+            continue;
+        }
+
+        XiaomiBatterySnapshot snapshot;
+        snapshot.left = ParseXiaomiBatteryRaw(bytes[index + 4U]);
+        snapshot.right = ParseXiaomiBatteryRaw(bytes[index + 5U]);
+        snapshot.case_level = ParseXiaomiBatteryRaw(bytes[index + 6U]);
+        if (XiaomiBatteryPresenceCount(snapshot) >= 2) {
+            return snapshot;
+        }
+    }
+
+    return std::nullopt;
+}
+
+std::optional<XiaomiBatterySnapshot> ExtractZmiSerialTextSnapshot(const std::string& text) {
+    if (text.empty()) {
+        return std::nullopt;
+    }
+
+    const std::string lowered = ToLowerAscii(text);
+    const bool has_component_hints =
+        lowered.find("left") != std::string::npos ||
+        lowered.find("right") != std::string::npos ||
+        lowered.find("case") != std::string::npos ||
+        lowered.find(" l:") != std::string::npos ||
+        lowered.find(" r:") != std::string::npos ||
+        lowered.find(" c:") != std::string::npos ||
+        lowered.find("l=") != std::string::npos ||
+        lowered.find("r=") != std::string::npos ||
+        lowered.find("c=") != std::string::npos;
+    const bool has_triplet_probe_hint =
+        lowered.find("+xevent") != std::string::npos ||
+        lowered.find("xevent:") != std::string::npos ||
+        lowered.find("+batt:") != std::string::npos ||
+        lowered.find("battery:") != std::string::npos ||
+        lowered.find("battery,") != std::string::npos;
+    if (!has_component_hints && !has_triplet_probe_hint) {
+        return std::nullopt;
+    }
+
+    std::vector<int> numbers;
+    int current = -1;
+    for (const char ch : lowered) {
+        if (ch >= '0' && ch <= '9') {
+            if (current < 0) {
+                current = 0;
+            }
+            current = (current * 10) + static_cast<int>(ch - '0');
+            continue;
+        }
+        if (current >= 0) {
+            numbers.push_back(current);
+            current = -1;
+        }
+    }
+    if (current >= 0) {
+        numbers.push_back(current);
+    }
+
+    if (numbers.size() < 3U) {
+        return std::nullopt;
+    }
+
+    XiaomiBatterySnapshot best_snapshot;
+    int best_presence = -1;
+
+    for (std::size_t index = 0; index + 2U < numbers.size(); ++index) {
+        XiaomiBatterySnapshot snapshot;
+        snapshot.left = NormalizeZmiVendorBatteryScalar(numbers[index]);
+        snapshot.right = NormalizeZmiVendorBatteryScalar(numbers[index + 1U]);
+        snapshot.case_level = NormalizeZmiVendorBatteryScalar(numbers[index + 2U]);
+
+        const int presence = XiaomiBatteryPresenceCount(snapshot);
+        if (presence > best_presence) {
+            best_presence = presence;
+            best_snapshot = snapshot;
+        }
+    }
+
+    if (best_presence >= 2) {
+        return best_snapshot;
+    }
+
+    return std::nullopt;
+}
+
+void ReplyToHfpAgCommand(SOCKET socket_handle, const std::string& line);
+std::optional<std::uint8_t> ParseAtBatteryPercentFromLine(const std::string& line);
+
+std::vector<BatteryReading> TryReadZmiSerialBatteryFromSocket(SOCKET socket_handle) {
+    std::vector<BatteryReading> readings;
+    if (socket_handle == INVALID_SOCKET) {
+        return readings;
+    }
+
+    const int recv_timeout_ms = 75;
+    const int send_timeout_ms = 120;
+    setsockopt(socket_handle, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&recv_timeout_ms), sizeof(recv_timeout_ms));
+    setsockopt(socket_handle, SOL_SOCKET, SO_SNDTIMEO,
+               reinterpret_cast<const char*>(&send_timeout_ms), sizeof(send_timeout_ms));
+
+    auto make_probe_message =
+        [](XiaomiMessageType type,
+           XiaomiOpcode opcode,
+           std::uint8_t sequence,
+           std::initializer_list<std::uint8_t> payload) {
+            XiaomiMessage message;
+            message.type = type;
+            message.opcode = opcode;
+            message.sequence = sequence;
+            message.payload.assign(payload.begin(), payload.end());
+            return EncodeXiaomiMessage(message);
+        };
+
+    std::vector<std::vector<std::uint8_t>> probes;
+    probes.push_back(make_probe_message(XiaomiMessageType::kPhoneRequest, XiaomiOpcode::kGetDeviceInfo, 0x0B,
+                                        {0xFF, 0xFF, 0xFF, 0xFF}));
+    probes.push_back(make_probe_message(XiaomiMessageType::kPhoneRequest, XiaomiOpcode::kGetDeviceRunInfo, 0x0C,
+                                        {0xFF, 0xFF, 0xFF, 0xFF}));
+    probes.push_back(make_probe_message(XiaomiMessageType::kPhoneRequest, XiaomiOpcode::kReportStatus, 0x0D, {}));
+    probes.push_back(make_probe_message(XiaomiMessageType::kPhoneRequest, XiaomiOpcode::kReportStatus, 0x0E, {0x00}));
+    probes.push_back(make_probe_message(XiaomiMessageType::kResponse, XiaomiOpcode::kGetDeviceInfo, 0x0F,
+                                        {0xFF, 0xFF, 0xFF, 0xFF}));
+    probes.push_back(make_probe_message(XiaomiMessageType::kResponse, XiaomiOpcode::kGetDeviceRunInfo, 0x10,
+                                        {0xFF, 0xFF, 0xFF, 0xFF}));
+    probes.push_back(make_probe_message(XiaomiMessageType::kEarbudsRequest, XiaomiOpcode::kGetDeviceInfo, 0x11,
+                                        {0xFF, 0xFF, 0xFF, 0xFF}));
+    probes.push_back(make_probe_message(XiaomiMessageType::kEarbudsRequest, XiaomiOpcode::kGetDeviceRunInfo, 0x12,
+                                        {0xFF, 0xFF, 0xFF, 0xFF}));
+    probes.push_back(std::vector<std::uint8_t>{
+        0xFE, 0xDC, 0xBA, 0xC4, 0x02, 0x00, 0x05, 0x0B,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xEF, 0x4F});
+    probes.push_back(std::vector<std::uint8_t>{
+        0xFE, 0xDC, 0xBA, 0xC4, 0x09, 0x00, 0x05, 0x0C,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xEF, 0x46});
+
+    constexpr std::array<const char*, 33> kTextProbes = {
+        "AT\r",
+        "AT+XAPL=ABCD-1234-0100,7\r",
+        "AT+CIND?\r",
+        "AT+CIND=?\r",
+        "AT+BRSF=20\r",
+        "AT+IPHONEACCEV?\r",
+        "AT+XEVENT?\r",
+        "AT+XEVENT=BATTERY?\r",
+        "AT+XEVENT=BATTERY\r",
+        "AT+XEVENT=BATTERY,?\r",
+        "AT+XEVENT=BATTERY,GET\r",
+        "AT+XEVENT=BATTERY,0\r",
+        "AT+XEVENT=BATTERY,1\r",
+        "AT+XEVENT=GETBATTERY\r",
+        "AT+XEVENT=GETBAT\r",
+        "AT+XEVENT=STATUS?\r",
+        "AT+BIEV?\r",
+        "AT+CMER=3,0,0,1\r",
+        "AT+BATT?\r",
+        "AT+BATTERY?\r",
+        "AT+QBAT?\r",
+        "AT+BLEGETBAT?\r",
+        "AT+GETBAT?\r",
+        "AT+MBATT?\r",
+        "AT+MIBAT?\r",
+        "AT+BAT?\r",
+        "AT+EARBAT?\r",
+        "AT+PODBAT?\r",
+        "AT+XIAOMI?\r",
+        "AT+XMINFO?\r",
+        "AT+STATUS?\r",
+        "AT+VGS?\r",
+        "AT+VGM?\r",
+    };
+
+    std::vector<std::uint8_t> rolling_buffer;
+    rolling_buffer.reserve(4096);
+    std::vector<std::uint8_t> message_buffer;
+    message_buffer.reserve(4096);
+    std::optional<std::uint8_t> fallback_main;
+
+    auto process_chunk = [&](const std::vector<std::uint8_t>& bytes, const char* source_tag) -> bool {
+        if (bytes.empty()) {
+            return false;
+        }
+
+        if (DebugEnabled()) {
+            DebugLog(std::string("ZMI serial rx source=") + source_tag +
+                     " len=" + std::to_string(bytes.size()) +
+                     " data=" + BytesToHex(bytes));
+        }
+
+        rolling_buffer.insert(rolling_buffer.end(), bytes.begin(), bytes.end());
+        if (rolling_buffer.size() > 8192U) {
+            rolling_buffer.erase(rolling_buffer.begin(),
+                                 rolling_buffer.begin() + static_cast<std::ptrdiff_t>(rolling_buffer.size() - 8192U));
+        }
+
+        if (const auto snapshot = ExtractZmiSerialPatternSnapshot(bytes); snapshot.has_value()) {
+            readings = BuildXiaomiBatteryReadings(*snapshot);
+            if (HasUsefulXiaomiTwsReadings(readings)) {
+                DebugLog("ZMI serial fallback: extracted triplet from pattern (chunk)");
+                return true;
+            }
+        }
+        if (const auto snapshot = ExtractZmiSerialPatternSnapshot(rolling_buffer); snapshot.has_value()) {
+            readings = BuildXiaomiBatteryReadings(*snapshot);
+            if (HasUsefulXiaomiTwsReadings(readings)) {
+                DebugLog("ZMI serial fallback: extracted triplet from pattern (rolling)");
+                return true;
+            }
+        }
+
+        if (const auto snapshot = ExtractBatterySnapshotFromXiaomiPayload(bytes, std::nullopt); snapshot.has_value()) {
+            readings = BuildXiaomiBatteryReadings(*snapshot);
+            if (HasUsefulXiaomiTwsReadings(readings)) {
+                DebugLog("ZMI serial fallback: extracted triplet from raw payload");
+                return true;
+            }
+        }
+
+        message_buffer.insert(message_buffer.end(), bytes.begin(), bytes.end());
+        if (message_buffer.size() > 16384U) {
+            message_buffer.erase(message_buffer.begin(),
+                                 message_buffer.begin() + static_cast<std::ptrdiff_t>(message_buffer.size() - 16384U));
+        }
+        const auto messages = DecodeXiaomiMessages(&message_buffer);
+        for (const auto& message : messages) {
+            if (DebugEnabled()) {
+                DebugLog("ZMI serial message type=" + ByteToHex(static_cast<std::uint8_t>(message.type)) +
+                         " opcode=" + ByteToHex(static_cast<std::uint8_t>(message.opcode)) +
+                         " seq=" + std::to_string(message.sequence) +
+                         " payload=" + BytesToHex(message.payload));
+            }
+
+            if (message.payload.empty()) {
+                continue;
+            }
+
+            const auto preferred_device_info =
+                ExtractBatterySnapshotFromXiaomiPayload(
+                    message.payload, std::optional<std::uint8_t>{static_cast<std::uint8_t>(0x07U)});
+            const auto preferred_status =
+                ExtractBatterySnapshotFromXiaomiPayload(
+                    message.payload, std::optional<std::uint8_t>{static_cast<std::uint8_t>(0x00U)});
+            auto extracted = preferred_device_info.has_value() ? preferred_device_info : preferred_status;
+            if (!extracted.has_value()) {
+                extracted = ExtractBatterySnapshotFromXiaomiPayload(message.payload, std::nullopt);
+            }
+            if (extracted.has_value()) {
+                const auto candidate = BuildXiaomiBatteryReadings(*extracted);
+                if (XiaomiReadingsRichnessScore(candidate) > XiaomiReadingsRichnessScore(readings)) {
+                    readings = candidate;
+                }
+                if (HasUsefulXiaomiTwsReadings(readings)) {
+                    DebugLog("ZMI serial fallback: extracted triplet from Xiaomi message payload");
+                    return true;
+                }
+            }
+        }
+
+        const std::string chunk_text(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        std::size_t line_start = 0;
+        while (line_start < chunk_text.size()) {
+            const auto line_end = chunk_text.find_first_of("\r\n", line_start);
+            std::string line;
+            if (line_end == std::string::npos) {
+                line = chunk_text.substr(line_start);
+                line_start = chunk_text.size();
+            } else {
+                line = chunk_text.substr(line_start, line_end - line_start);
+                line_start = line_end + 1U;
+            }
+            if (line.empty()) {
+                continue;
+            }
+
+            ReplyToHfpAgCommand(socket_handle, line);
+            if (const auto parsed = ParseAtBatteryPercentFromLine(line); parsed.has_value()) {
+                fallback_main = parsed;
+            }
+            if (const auto snapshot = ExtractZmiSerialTextSnapshot(line); snapshot.has_value()) {
+                const auto candidate = BuildXiaomiBatteryReadings(*snapshot);
+                if (XiaomiReadingsRichnessScore(candidate) > XiaomiReadingsRichnessScore(readings)) {
+                    readings = candidate;
+                }
+                if (HasUsefulXiaomiTwsReadings(readings)) {
+                    DebugLog("ZMI serial fallback: extracted triplet from text line");
+                    return true;
+                }
+            }
+        }
+        if (const auto snapshot = ExtractZmiSerialTextSnapshot(chunk_text); snapshot.has_value()) {
+            const auto candidate = BuildXiaomiBatteryReadings(*snapshot);
+            if (XiaomiReadingsRichnessScore(candidate) > XiaomiReadingsRichnessScore(readings)) {
+                readings = candidate;
+            }
+            if (HasUsefulXiaomiTwsReadings(readings)) {
+                DebugLog("ZMI serial fallback: extracted triplet from text chunk");
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    auto receive_attempts = [&](int attempts, int wait_ms, const char* source_tag) {
+        for (int attempt = 0; attempt < attempts; ++attempt) {
+            if (wait_ms > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
+            }
+            const auto chunk = ReceiveChunk(socket_handle);
+            if (!chunk.has_value() || chunk->empty()) {
+                continue;
+            }
+            if (process_chunk(*chunk, source_tag)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    if (receive_attempts(2, 25, "warmup")) {
+        return readings;
+    }
+
+    for (const auto& probe : probes) {
+        if (!SendAll(socket_handle, probe)) {
+            continue;
+        }
+        if (receive_attempts(2, 35, "binary-probe")) {
+            return readings;
+        }
+    }
+
+    auto send_text_probe = [&](const char* probe) {
+        const std::size_t command_length = std::strlen(probe);
+        if (send(socket_handle, probe, static_cast<int>(command_length), 0) <= 0) {
+            return false;
+        }
+        if (command_length > 0U && probe[command_length - 1U] == '\r') {
+            std::string probe_crlf(probe, command_length);
+            probe_crlf.push_back('\n');
+            send(socket_handle, probe_crlf.data(), static_cast<int>(probe_crlf.size()), 0);
+        }
+        return true;
+    };
+
+    for (const auto* probe : kTextProbes) {
+        if (!send_text_probe(probe)) {
+            continue;
+        }
+        if (receive_attempts(1, 30, "text-probe")) {
+            return readings;
+        }
+    }
+
+    const int observe_ms = ZmiObserveMs();
+    if (observe_ms > 0) {
+        const auto observe_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(observe_ms);
+        auto next_active_probe_at = std::chrono::steady_clock::now();
+        std::size_t next_binary_probe = 0;
+        std::size_t next_text_probe = 0;
+        while (std::chrono::steady_clock::now() < observe_deadline) {
+            const auto chunk = ReceiveChunk(socket_handle);
+            if (chunk.has_value() && !chunk->empty()) {
+                if (process_chunk(*chunk, "observe")) {
+                    return readings;
+                }
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= next_active_probe_at) {
+                if (!probes.empty()) {
+                    const auto& probe = probes[next_binary_probe % probes.size()];
+                    ++next_binary_probe;
+                    SendAll(socket_handle, probe);
+                }
+                if (!kTextProbes.empty()) {
+                    send_text_probe(kTextProbes[next_text_probe % kTextProbes.size()]);
+                    ++next_text_probe;
+                }
+                next_active_probe_at = now + std::chrono::milliseconds(650);
+            }
+
+            if (receive_attempts(1, 20, "observe-probe")) {
+                return readings;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(35));
+        }
+    }
+
+    if (!readings.empty()) {
+        return readings;
+    }
+
+    if (fallback_main.has_value()) {
+        readings.push_back(BatteryReading{"main", *fallback_main});
+    }
+
     return readings;
 }
 
@@ -1440,18 +2482,79 @@ std::optional<std::uint8_t> TryParseHfpCindBatteryPercent(const std::string& res
     return std::nullopt;
 }
 
+void ReplyToHfpAgCommand(SOCKET socket_handle, const std::string& line) {
+    if (socket_handle == INVALID_SOCKET || line.empty()) {
+        return;
+    }
+
+    auto send_reply = [&](const std::string& reply) {
+        if (reply.empty()) {
+            return;
+        }
+        send(socket_handle, reply.data(), static_cast<int>(reply.size()), 0);
+    };
+
+    const std::string lowered = ToLowerAscii(line);
+    if (lowered.rfind("at+brsf=", 0) == 0U) {
+        send_reply("\r\n+BRSF: 1024\r\n\r\nOK\r\n");
+        send_reply("\r\n+XAPL=ABCD-1234-0100,7\r\n");
+        return;
+    }
+    if (lowered.rfind("at+cind=?", 0) == 0U) {
+        send_reply("\r\n+CIND: (\"service\",(0,1)),(\"call\",(0,1)),(\"callsetup\",(0-3)),"
+                   "(\"callheld\",(0-2)),(\"battchg\",(0-5))\r\n\r\nOK\r\n");
+        return;
+    }
+    if (lowered.rfind("at+cind?", 0) == 0U) {
+        send_reply("\r\n+CIND: 1,0,0,0,5\r\n\r\nOK\r\n");
+        return;
+    }
+    if (lowered.rfind("at+cmer=", 0) == 0U ||
+        lowered.rfind("at+bac=", 0) == 0U ||
+        lowered.rfind("at+xapl=", 0) == 0U) {
+        send_reply("\r\nOK\r\n");
+        if (lowered.rfind("at+cmer=", 0) == 0U) {
+            send_reply("AT+XEVENT?\r");
+            send_reply("AT+XEVENT=BATTERY?\r");
+            send_reply("AT+BATT?\r");
+            send_reply("AT+BATTERY?\r");
+        }
+        return;
+    }
+    if (lowered.rfind("at+iphoneaccev=", 0) == 0U ||
+        lowered.rfind("at+xevent", 0) == 0U ||
+        lowered.rfind("at+biev", 0) == 0U) {
+        send_reply("\r\nOK\r\n");
+        send_reply("AT+XEVENT=BATTERY?\r");
+        return;
+    }
+    if (lowered.rfind("at+aplsiri?", 0) == 0U) {
+        send_reply("\r\n+APLSIRI: 1\r\n\r\nOK\r\n");
+        return;
+    }
+    if (lowered.rfind("at+", 0) == 0U || lowered == "at") {
+        send_reply("\r\nOK\r\n");
+    }
+}
+
 std::optional<std::uint8_t> TryReadHfpBatteryFromSocket(SOCKET socket_handle) {
     if (socket_handle == INVALID_SOCKET) {
         return std::nullopt;
     }
 
-    constexpr std::array<const char*, 6> kProbeCommands = {
+    constexpr std::array<const char*, 12> kProbeCommands = {
+        "AT+XAPL=ABCD-1234-0100,7\r",
         "AT+BRSF=20\r",
         "AT+CIND=?\r",
         "AT+CIND?\r",
         "AT+IPHONEACCEV?\r",
         "AT+XEVENT?\r",
         "AT+BIEV?\r",
+        "AT+XEVENT=BATTERY?\r",
+        "AT+XEVENT=BATTERY\r",
+        "AT+BATT?\r",
+        "AT+BATTERY?\r",
+        "AT+QBAT?\r",
     };
 
     std::string response_text;
@@ -1472,6 +2575,11 @@ std::optional<std::uint8_t> TryReadHfpBatteryFromSocket(SOCKET socket_handle) {
         const std::size_t command_length = std::strlen(command);
         if (send(socket_handle, command, static_cast<int>(command_length), 0) <= 0) {
             continue;
+        }
+        if (command_length > 0U && command[command_length - 1U] == '\r') {
+            std::string command_crlf(command, command_length);
+            command_crlf.push_back('\n');
+            send(socket_handle, command_crlf.data(), static_cast<int>(command_crlf.size()), 0);
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(90));
@@ -1498,6 +2606,74 @@ std::optional<std::uint8_t> TryReadHfpBatteryFromSocket(SOCKET socket_handle) {
     }
 
     return std::nullopt;
+}
+
+std::vector<BatteryReading> TryReadHfpAgBatteryFromSocket(SOCKET socket_handle) {
+    std::vector<BatteryReading> readings;
+    if (socket_handle == INVALID_SOCKET) {
+        return readings;
+    }
+
+    std::optional<std::uint8_t> main_battery;
+    std::string text_buffer;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(3200);
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto chunk = ReceiveChunk(socket_handle);
+        if (!chunk.has_value() || chunk->empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(55));
+            continue;
+        }
+
+        const std::string chunk_text(reinterpret_cast<const char*>(chunk->data()), chunk->size());
+        text_buffer.append(chunk_text);
+        if (DebugEnabled()) {
+            DebugLog("HFP AG rx='" + chunk_text + "'");
+        }
+
+        std::size_t start = 0;
+        while (start < text_buffer.size()) {
+            const auto line_end = text_buffer.find_first_of("\r\n", start);
+            if (line_end == std::string::npos) {
+                break;
+            }
+
+            std::string line = text_buffer.substr(start, line_end - start);
+            start = line_end + 1U;
+            while (start < text_buffer.size() &&
+                   (text_buffer[start] == '\r' || text_buffer[start] == '\n')) {
+                ++start;
+            }
+
+            if (line.empty()) {
+                continue;
+            }
+
+            ReplyToHfpAgCommand(socket_handle, line);
+
+            if (const auto snapshot = ExtractZmiSerialTextSnapshot(line); snapshot.has_value()) {
+                readings = BuildXiaomiBatteryReadings(*snapshot);
+                if (!readings.empty()) {
+                    DebugLog("HFP AG battery triplet parsed from line: '" + line + "'");
+                    return readings;
+                }
+            }
+
+            if (const auto parsed = ParseAtBatteryPercentFromLine(line); parsed.has_value()) {
+                main_battery = parsed;
+            }
+        }
+
+        if (start > 0U) {
+            text_buffer.erase(0, start);
+        }
+    }
+
+    if (main_battery.has_value()) {
+        readings.push_back(BatteryReading{"main", *main_battery});
+    }
+
+    return readings;
 }
 
 XiaomiBatterySnapshot SnapshotFromBatteryReadings(const std::vector<BatteryReading>& readings) {
@@ -1611,7 +2787,7 @@ XiaomiPersistentCacheMap& PersistentXiaomiCacheStore() {
 }
 
 void PutPersistentXiaomiSnapshot(std::uint64_t address, const XiaomiBatterySnapshot& snapshot) {
-    if (!PersistentXiaomiCacheEnabled() || !HasAnyBattery(snapshot)) {
+    if (!PersistentXiaomiCacheWriteEnabled() || !HasAnyBattery(snapshot)) {
         return;
     }
 
@@ -1624,7 +2800,7 @@ void PutPersistentXiaomiSnapshot(std::uint64_t address, const XiaomiBatterySnaps
 }
 
 std::optional<XiaomiBatterySnapshot> GetPersistentXiaomiSnapshot(std::uint64_t address) {
-    if (!PersistentXiaomiCacheEnabled()) {
+    if (!PersistentXiaomiCacheReadEnabled()) {
         return std::nullopt;
     }
 
@@ -1650,7 +2826,8 @@ std::optional<XiaomiBatterySnapshot> GetPersistentXiaomiSnapshot(std::uint64_t a
     return found->second.snapshot;
 }
 
-std::vector<BatteryReading> TryReadXiaomiClassicBattery(std::uint64_t bluetooth_address) {
+std::vector<BatteryReading> TryReadXiaomiClassicBattery(std::uint64_t bluetooth_address,
+                                                        bool enable_dynamic_port_scan) {
     std::vector<BatteryReading> readings;
 
     DebugLog("Xiaomi classic fallback: attempting RFCOMM connection to address=" + std::to_string(bluetooth_address));
@@ -1669,71 +2846,201 @@ std::vector<BatteryReading> TryReadXiaomiClassicBattery(std::uint64_t bluetooth_
     std::string connected_path;
 
     auto try_connect = [&](const GUID& service_uuid, const char* service_name) -> bool {
-        const SOCKET candidate_socket = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
-        if (candidate_socket == INVALID_SOCKET) {
-            DebugLog("Xiaomi classic fallback: socket() failed for " + std::string(service_name) +
-                     " error=" + std::to_string(WSAGetLastError()));
-            return false;
-        }
+        auto connect_once = [&](bool secure_mode, const char* mode_suffix) -> bool {
+            const SOCKET candidate_socket = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
+            if (candidate_socket == INVALID_SOCKET) {
+                DebugLog("Xiaomi classic fallback: socket() failed for " + std::string(service_name) +
+                         " error=" + std::to_string(WSAGetLastError()));
+                return false;
+            }
 
-        const int timeout_ms = 280;
-        setsockopt(candidate_socket, SOL_SOCKET, SO_RCVTIMEO,
-                   reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
-        setsockopt(candidate_socket, SOL_SOCKET, SO_SNDTIMEO,
-                   reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+            const ULONG secure_transport = secure_mode ? TRUE : FALSE;
+            setsockopt(candidate_socket, SOL_RFCOMM, SO_BTH_AUTHENTICATE,
+                       reinterpret_cast<const char*>(&secure_transport), sizeof(secure_transport));
+            setsockopt(candidate_socket, SOL_RFCOMM, SO_BTH_ENCRYPT,
+                       reinterpret_cast<const char*>(&secure_transport), sizeof(secure_transport));
 
-        auto service_address = address;
-        service_address.serviceClassId = service_uuid;
+            const int timeout_ms = 280;
+            setsockopt(candidate_socket, SOL_SOCKET, SO_RCVTIMEO,
+                       reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+            setsockopt(candidate_socket, SOL_SOCKET, SO_SNDTIMEO,
+                       reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
 
-        if (!ConnectWithTimeout(candidate_socket, service_address, timeout_ms)) {
-            DebugLog("Xiaomi classic fallback: connect(" + std::string(service_name) +
-                     ") failed error=" + std::to_string(WSAGetLastError()));
-            closesocket(candidate_socket);
-            return false;
-        }
+            auto service_address = address;
+            service_address.serviceClassId = service_uuid;
 
-        socket_handle = candidate_socket;
-        connected_path = service_name;
-        DebugLog("Xiaomi classic fallback: RFCOMM connected via " + std::string(service_name));
-        return true;
+            if (!ConnectWithTimeout(candidate_socket, service_address, timeout_ms)) {
+                DebugLog("Xiaomi classic fallback: connect(" + std::string(service_name) + mode_suffix +
+                         ") failed error=" + std::to_string(WSAGetLastError()));
+                closesocket(candidate_socket);
+                return false;
+            }
+
+            socket_handle = candidate_socket;
+            connected_path = std::string(service_name) + mode_suffix;
+            DebugLog("Xiaomi classic fallback: RFCOMM connected via " + connected_path);
+            return true;
+        };
+
+        return connect_once(true, "") || connect_once(false, "-insecure");
     };
 
-    auto try_connect_port = [&](std::uint32_t port, const char* name) -> bool {
-        const SOCKET candidate_socket = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
-        if (candidate_socket == INVALID_SOCKET) {
-            DebugLog("Xiaomi classic fallback: socket() failed for " + std::string(name) +
-                     " error=" + std::to_string(WSAGetLastError()));
-            return false;
-        }
+    auto try_connect_port = [&](std::uint32_t port, const char* name, int timeout_ms = 280) -> bool {
+        auto connect_once = [&](bool secure_mode, const char* mode_suffix) -> bool {
+            const SOCKET candidate_socket = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
+            if (candidate_socket == INVALID_SOCKET) {
+                DebugLog("Xiaomi classic fallback: socket() failed for " + std::string(name) +
+                         " error=" + std::to_string(WSAGetLastError()));
+                return false;
+            }
 
-        const int timeout_ms = 280;
-        setsockopt(candidate_socket, SOL_SOCKET, SO_RCVTIMEO,
-                   reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
-        setsockopt(candidate_socket, SOL_SOCKET, SO_SNDTIMEO,
-                   reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+            const ULONG secure_transport = secure_mode ? TRUE : FALSE;
+            setsockopt(candidate_socket, SOL_RFCOMM, SO_BTH_AUTHENTICATE,
+                       reinterpret_cast<const char*>(&secure_transport), sizeof(secure_transport));
+            setsockopt(candidate_socket, SOL_RFCOMM, SO_BTH_ENCRYPT,
+                       reinterpret_cast<const char*>(&secure_transport), sizeof(secure_transport));
 
-        auto service_address = address;
-        service_address.serviceClassId = GUID{};
-        service_address.port = port;
+            setsockopt(candidate_socket, SOL_SOCKET, SO_RCVTIMEO,
+                       reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+            setsockopt(candidate_socket, SOL_SOCKET, SO_SNDTIMEO,
+                       reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
 
-        if (!ConnectWithTimeout(candidate_socket, service_address, timeout_ms)) {
-            DebugLog("Xiaomi classic fallback: connect(" + std::string(name) +
-                     ") failed error=" + std::to_string(WSAGetLastError()));
-            closesocket(candidate_socket);
-            return false;
-        }
+            auto service_address = address;
+            service_address.serviceClassId = GUID{};
+            service_address.port = port;
 
-        socket_handle = candidate_socket;
-        connected_path = name;
-        DebugLog("Xiaomi classic fallback: RFCOMM connected via " + std::string(name));
-        return true;
+            if (!ConnectWithTimeout(candidate_socket, service_address, timeout_ms)) {
+                DebugLog("Xiaomi classic fallback: connect(" + std::string(name) + mode_suffix +
+                         ") failed error=" + std::to_string(WSAGetLastError()));
+                closesocket(candidate_socket);
+                return false;
+            }
+
+            socket_handle = candidate_socket;
+            connected_path = std::string(name) + mode_suffix;
+            DebugLog("Xiaomi classic fallback: RFCOMM connected via " + connected_path);
+            return true;
+        };
+
+        return connect_once(true, "") || connect_once(false, "-insecure");
     };
 
-    if (!try_connect(kXiaomiDeviceCtrlServiceUuid, "FD2D") &&
-        !try_connect(kBluetoothSerialPortServiceUuid, "SPP-1101") &&
-        !try_connect(kZmiPurPodsSerialServiceUuid, "ZMI-1101") &&
-        !try_connect(kHandsfreeAudioGatewayServiceUuid, "HFP-111E") &&
-        !try_connect_port(15, "RFCOMM-port-15")) {
+    bool connected = try_connect(kXiaomiDeviceCtrlServiceUuid, "FD2D") ||
+                     try_connect(kBluetoothSerialPortServiceUuid, "SPP-1101") ||
+                     try_connect(kZmiPurPodsSerialServiceUuid, "ZMI-1101") ||
+                     try_connect(kHandsfreeAudioGatewayServiceUuid, "HFP-111E") ||
+                     try_connect_port(15, "RFCOMM-port-15");
+
+    if (!connected && enable_dynamic_port_scan) {
+        std::set<std::uint32_t> sdp_ports_attempted;
+        auto try_sdp = [&](const GUID* service_filter, const char* source_name, bool flush_cache) {
+            const auto channels = DiscoverRfcommChannelsFromSdp(bluetooth_address, service_filter, flush_cache);
+            if (!channels.empty()) {
+                DebugLog("Xiaomi classic fallback: SDP discovered channels=" + std::to_string(channels.size()) +
+                         " source=" + std::string(source_name));
+            }
+
+            for (const auto& channel : channels) {
+                if (!sdp_ports_attempted.insert(channel.port).second) {
+                    continue;
+                }
+
+                std::string label = std::string(source_name) + "-port-" + std::to_string(channel.port);
+                if (!channel.instance_name.empty()) {
+                    label += " '" + channel.instance_name + "'";
+                }
+
+                if (try_connect_port(channel.port, label.c_str(), 180)) {
+                    DebugLog("Xiaomi classic fallback: SDP matched port=" + std::to_string(channel.port) +
+                             " source=" + std::string(source_name));
+                    connected = true;
+                    return;
+                }
+            }
+        };
+
+        try_sdp(&kZmiPurPodsSerialServiceUuid, "SDP-ZMI-1101", true);
+        if (!connected) {
+            try_sdp(&kBluetoothSerialPortServiceUuid, "SDP-SPP-1101", false);
+        }
+        if (!connected) {
+            try_sdp(&kHandsfreeAudioGatewayServiceUuid, "SDP-HFP-111E", false);
+        }
+        if (!connected) {
+            try_sdp(nullptr, "SDP-ANY", false);
+        }
+
+        if (!connected) {
+        constexpr std::array<std::uint32_t, 24> kZmiCandidatePorts = {
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+            13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25};
+        for (const auto port : kZmiCandidatePorts) {
+            if (sdp_ports_attempted.contains(port)) {
+                continue;
+            }
+            std::string port_name = "RFCOMM-port-" + std::to_string(port);
+            if (try_connect_port(port, port_name.c_str(), 110)) {
+                DebugLog("Xiaomi classic fallback: dynamic port scan matched port=" + std::to_string(port));
+                connected = true;
+                break;
+            }
+        }
+        }
+    }
+
+    if (!connected) {
+        return readings;
+    }
+
+    const bool zmi_serial_path =
+        connected_path.find("ZMI-1101") != std::string::npos ||
+        connected_path.find("SDP-ZMI-1101") != std::string::npos;
+    const bool try_zmi_pre_auth_probe = zmi_serial_path || enable_dynamic_port_scan;
+    std::vector<BatteryReading> partial_pre_auth_readings;
+    if (try_zmi_pre_auth_probe) {
+        auto pre_auth_readings = TryReadZmiSerialBatteryFromSocket(socket_handle);
+        if (!pre_auth_readings.empty()) {
+            if (HasUsefulXiaomiTwsReadings(pre_auth_readings)) {
+                readings = std::move(pre_auth_readings);
+                DebugLog("Xiaomi classic fallback: ZMI pre-auth serial probe succeeded, entries=" +
+                         std::to_string(readings.size()));
+                closesocket(socket_handle);
+                return readings;
+            }
+
+            partial_pre_auth_readings = std::move(pre_auth_readings);
+            DebugLog("Xiaomi classic fallback: ZMI pre-auth serial probe yielded partial entries=" +
+                     std::to_string(partial_pre_auth_readings.size()) +
+                     ", continue auth flow");
+        }
+    }
+
+    // Restore a less aggressive socket timeout before auth/status flow.
+    const int io_timeout_ms = 260;
+    setsockopt(socket_handle, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&io_timeout_ms), sizeof(io_timeout_ms));
+    setsockopt(socket_handle, SOL_SOCKET, SO_SNDTIMEO,
+               reinterpret_cast<const char*>(&io_timeout_ms), sizeof(io_timeout_ms));
+
+    const bool likely_hfp_transport =
+        connected_path.find("HFP") != std::string::npos ||
+        connected_path.find("SDP-HFP") != std::string::npos;
+    if (enable_dynamic_port_scan && likely_hfp_transport) {
+        auto hfp_triplet = TryReadHfpAgBatteryFromSocket(socket_handle);
+        if (HasUsefulXiaomiTwsReadings(hfp_triplet)) {
+            readings = std::move(hfp_triplet);
+            closesocket(socket_handle);
+            return readings;
+        }
+
+        const auto hfp_main = TryReadHfpBatteryFromSocket(socket_handle);
+        if (hfp_main.has_value()) {
+            readings.push_back(BatteryReading{"main", *hfp_main});
+        }
+        if (readings.empty() && !partial_pre_auth_readings.empty()) {
+            readings = partial_pre_auth_readings;
+        }
+        closesocket(socket_handle);
         return readings;
     }
 
@@ -1748,6 +3055,21 @@ std::vector<BatteryReading> TryReadXiaomiClassicBattery(std::uint64_t bluetooth_
     auth_start.payload.insert(auth_start.payload.end(), challenge.begin(), challenge.end());
     if (!SendAll(socket_handle, EncodeXiaomiMessage(auth_start))) {
         DebugLog("Xiaomi classic fallback: failed to send auth challenge");
+        if (!partial_pre_auth_readings.empty()) {
+            readings = partial_pre_auth_readings;
+        }
+        if (enable_dynamic_port_scan) {
+            auto hfp_triplet = TryReadHfpAgBatteryFromSocket(socket_handle);
+            if (HasUsefulXiaomiTwsReadings(hfp_triplet)) {
+                readings = std::move(hfp_triplet);
+            }
+            if (readings.empty()) {
+                const auto hfp_main = TryReadHfpBatteryFromSocket(socket_handle);
+                if (hfp_main.has_value()) {
+                    readings.push_back(BatteryReading{"main", *hfp_main});
+                }
+            }
+        }
         closesocket(socket_handle);
         return readings;
     }
@@ -1920,40 +3242,77 @@ std::vector<BatteryReading> TryReadXiaomiClassicBattery(std::uint64_t bluetooth_
         }
 
         readings = BuildXiaomiBatteryReadings(merged);
+        if (!HasUsefulXiaomiTwsReadings(readings) && !partial_pre_auth_readings.empty()) {
+            if (XiaomiReadingsRichnessScore(partial_pre_auth_readings) > XiaomiReadingsRichnessScore(readings)) {
+                readings = partial_pre_auth_readings;
+            }
+        }
         const std::string left_text = merged.left.has_value() ? std::to_string(*merged.left) : "na";
         const std::string right_text = merged.right.has_value() ? std::to_string(*merged.right) : "na";
         const std::string case_text = merged.case_level.has_value() ? std::to_string(*merged.case_level) : "na";
         DebugLog("Xiaomi classic fallback: battery merged left=" + left_text +
                  " right=" + right_text + " case=" + case_text);
     } else {
-        DebugLog("Xiaomi classic fallback: timeout without battery payload");
-
-        const bool likely_hfp_path = connected_path.find("HFP") != std::string::npos;
-        std::optional<std::uint8_t> hfp_battery;
-        if (likely_hfp_path) {
-            hfp_battery = TryReadHfpBatteryFromSocket(socket_handle);
-        } else {
-            const SOCKET hfp_socket = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
-            if (hfp_socket != INVALID_SOCKET) {
-                const int timeout_ms = 240;
-                setsockopt(hfp_socket, SOL_SOCKET, SO_RCVTIMEO,
-                           reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
-                setsockopt(hfp_socket, SOL_SOCKET, SO_SNDTIMEO,
-                           reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
-
-                auto hfp_address = address;
-                hfp_address.port = BT_PORT_ANY;
-                hfp_address.serviceClassId = kHandsfreeAudioGatewayServiceUuid;
-                if (ConnectWithTimeout(hfp_socket, hfp_address, timeout_ms)) {
-                    hfp_battery = TryReadHfpBatteryFromSocket(hfp_socket);
-                }
-                closesocket(hfp_socket);
+        if (zmi_serial_path || enable_dynamic_port_scan) {
+            auto zmi_serial_readings = TryReadZmiSerialBatteryFromSocket(socket_handle);
+            if (!zmi_serial_readings.empty()) {
+                readings = std::move(zmi_serial_readings);
+                DebugLog("Xiaomi classic fallback: ZMI serial pattern fallback succeeded, entries=" +
+                         std::to_string(readings.size()));
             }
         }
 
-        if (hfp_battery.has_value()) {
-            readings.push_back(BatteryReading{"main", *hfp_battery});
-            DebugLog("Xiaomi classic fallback: HFP battery main=" + std::to_string(*hfp_battery));
+        if (readings.empty()) {
+            DebugLog("Xiaomi classic fallback: timeout without battery payload");
+
+            const bool likely_hfp_path = connected_path.find("HFP") != std::string::npos;
+            if (enable_dynamic_port_scan && likely_hfp_path) {
+                auto hfp_triplet = TryReadHfpAgBatteryFromSocket(socket_handle);
+                if (!hfp_triplet.empty()) {
+                    readings = std::move(hfp_triplet);
+                }
+            }
+
+            std::optional<std::uint8_t> hfp_battery;
+            if (readings.empty() && likely_hfp_path) {
+                hfp_battery = TryReadHfpBatteryFromSocket(socket_handle);
+            } else if (readings.empty()) {
+                const SOCKET hfp_socket = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
+                if (hfp_socket != INVALID_SOCKET) {
+                    const int timeout_ms = 240;
+                    setsockopt(hfp_socket, SOL_SOCKET, SO_RCVTIMEO,
+                               reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+                    setsockopt(hfp_socket, SOL_SOCKET, SO_SNDTIMEO,
+                               reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+
+                    auto hfp_address = address;
+                    hfp_address.port = BT_PORT_ANY;
+                    hfp_address.serviceClassId = kHandsfreeAudioGatewayServiceUuid;
+                    if (ConnectWithTimeout(hfp_socket, hfp_address, timeout_ms)) {
+                        if (enable_dynamic_port_scan) {
+                            auto hfp_triplet = TryReadHfpAgBatteryFromSocket(hfp_socket);
+                            if (!hfp_triplet.empty()) {
+                                readings = std::move(hfp_triplet);
+                            }
+                        }
+                        if (readings.empty()) {
+                            hfp_battery = TryReadHfpBatteryFromSocket(hfp_socket);
+                        }
+                    }
+                    closesocket(hfp_socket);
+                }
+            }
+
+            if (readings.empty() && hfp_battery.has_value()) {
+                readings.push_back(BatteryReading{"main", *hfp_battery});
+                DebugLog("Xiaomi classic fallback: HFP battery main=" + std::to_string(*hfp_battery));
+            }
+        }
+    }
+
+    if (!HasUsefulXiaomiTwsReadings(readings) && !partial_pre_auth_readings.empty()) {
+        if (XiaomiReadingsRichnessScore(partial_pre_auth_readings) > XiaomiReadingsRichnessScore(readings)) {
+            readings = partial_pre_auth_readings;
         }
     }
 
@@ -2006,57 +3365,186 @@ bool TryExtractBatteryPercent(const IInspectable& raw_value, std::uint8_t* value
     return false;
 }
 
-std::optional<std::uint8_t> NormalizeZmiVendorBatteryHint(int raw_value) {
-    if (raw_value <= 0 || raw_value == 255) {
-        return std::nullopt;
-    }
-    if (raw_value <= 10) {
-        return static_cast<std::uint8_t>(raw_value * 10);
-    }
-    if (raw_value <= 100) {
-        return static_cast<std::uint8_t>(raw_value);
-    }
-    return std::nullopt;
-}
-
-std::optional<std::uint8_t> ReadZmiVendorBatteryHint(const DeviceInformation& endpoint_info) {
+std::vector<BatteryReading> ReadZmiVendorBatteryHint(const DeviceInformation& endpoint_info) {
     constexpr auto kVendorBatteryHintKey = L"{670245F9-6E25-4179-85C1-981C33B9D3B7} 4";
+    constexpr auto kVendorGuidPrefixLower = "{670245f9-6e25-4179-85c1-981c33b9d3b7}";
+
+    auto decode_from_value = [](const IInspectable& value) -> std::vector<BatteryReading> {
+        if (value == nullptr) {
+            return {};
+        }
+
+        try {
+            const auto normalized = NormalizeZmiVendorBatteryScalar(static_cast<int>(winrt::unbox_value<std::uint8_t>(value)));
+            if (normalized.has_value()) {
+                return {BatteryReading{"main", *normalized}};
+            }
+        } catch (const winrt::hresult_error&) {
+        }
+
+        try {
+            const auto uint32_value = winrt::unbox_value<std::uint32_t>(value);
+            auto decoded = DecodeZmiVendorBatteryReadingsFromUInt32(uint32_value);
+            if (!decoded.empty()) {
+                return decoded;
+            }
+        } catch (const winrt::hresult_error&) {
+        }
+
+        try {
+            const auto int32_value = winrt::unbox_value<std::int32_t>(value);
+            if (int32_value > 0) {
+                auto decoded = DecodeZmiVendorBatteryReadingsFromUInt32(static_cast<std::uint32_t>(int32_value));
+                if (!decoded.empty()) {
+                    return decoded;
+                }
+                const auto normalized = NormalizeZmiVendorBatteryScalar(int32_value);
+                if (normalized.has_value()) {
+                    return {BatteryReading{"main", *normalized}};
+                }
+            }
+        } catch (const winrt::hresult_error&) {
+        }
+
+        if (const auto property_value = value.try_as<IPropertyValue>()) {
+            try {
+                const auto type = property_value.Type();
+                if (type == PropertyType::UInt8Array) {
+                    winrt::com_array<std::uint8_t> values;
+                    property_value.GetUInt8Array(values);
+                    std::vector<std::uint8_t> bytes(values.begin(), values.end());
+                    auto decoded = DecodeZmiVendorReadingsFromByteBlob(bytes);
+                    if (!decoded.empty()) {
+                        return decoded;
+                    }
+                } else if (type == PropertyType::UInt16Array) {
+                    winrt::com_array<std::uint16_t> values;
+                    property_value.GetUInt16Array(values);
+                    std::vector<int> numbers;
+                    numbers.reserve(values.size());
+                    for (const auto raw : values) {
+                        numbers.push_back(static_cast<int>(raw));
+                    }
+                    auto decoded = DecodeZmiVendorReadingsFromNumericValues(numbers);
+                    if (!decoded.empty()) {
+                        return decoded;
+                    }
+                } else if (type == PropertyType::UInt32Array) {
+                    winrt::com_array<std::uint32_t> values;
+                    property_value.GetUInt32Array(values);
+                    std::vector<BatteryReading> best_decoded;
+                    std::vector<int> numbers;
+                    numbers.reserve(values.size());
+                    for (const auto raw : values) {
+                        auto decoded = DecodeZmiVendorBatteryReadingsFromUInt32(raw);
+                        if (decoded.size() > best_decoded.size()) {
+                            best_decoded = std::move(decoded);
+                        }
+                        if (raw <= static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
+                            numbers.push_back(static_cast<int>(raw));
+                        }
+                    }
+                    if (!best_decoded.empty()) {
+                        return best_decoded;
+                    }
+                    auto decoded = DecodeZmiVendorReadingsFromNumericValues(numbers);
+                    if (!decoded.empty()) {
+                        return decoded;
+                    }
+                } else if (type == PropertyType::Int32Array) {
+                    winrt::com_array<std::int32_t> values;
+                    property_value.GetInt32Array(values);
+                    std::vector<int> numbers;
+                    numbers.reserve(values.size());
+                    for (const auto raw : values) {
+                        numbers.push_back(raw);
+                    }
+                    auto decoded = DecodeZmiVendorReadingsFromNumericValues(numbers);
+                    if (!decoded.empty()) {
+                        return decoded;
+                    }
+                } else if (type == PropertyType::StringArray) {
+                    winrt::com_array<winrt::hstring> values;
+                    property_value.GetStringArray(values);
+                    for (const auto& text : values) {
+                        auto decoded = DecodeZmiVendorReadingsFromNumericValues(ExtractIntegersFromText(ToUtf8(text)));
+                        if (!decoded.empty()) {
+                            return decoded;
+                        }
+                    }
+                }
+            } catch (const winrt::hresult_error&) {
+            }
+        }
+
+        try {
+            const auto text = ToUtf8(winrt::unbox_value<winrt::hstring>(value));
+            auto decoded = DecodeZmiVendorReadingsFromNumericValues(ExtractIntegersFromText(text));
+            if (!decoded.empty()) {
+                return decoded;
+            }
+        } catch (const winrt::hresult_error&) {
+        }
+
+        return {};
+    };
+
+    std::vector<BatteryReading> best_single_value;
+    std::unordered_set<std::string> processed_keys;
 
     IInspectable raw_value = nullptr;
     if (!TryGetPropertyValue(endpoint_info, kVendorBatteryHintKey, &raw_value)) {
-        DebugLog("ZMI vendor key was not present in DeviceInformation properties");
-        return std::nullopt;
+        DebugLog("ZMI vendor key #4 was not present in DeviceInformation properties");
+    } else {
+        auto decoded = decode_from_value(raw_value);
+        if (decoded.size() >= 2U) {
+            DebugLog("ZMI vendor key #4 decoded entries=" + std::to_string(decoded.size()));
+            return decoded;
+        }
+        if (!decoded.empty()) {
+            best_single_value = decoded;
+        }
+        processed_keys.insert(ToLowerAscii(ToUtf8(winrt::to_hstring(kVendorBatteryHintKey))));
     }
 
-    try {
-        const auto normalized = NormalizeZmiVendorBatteryHint(static_cast<int>(winrt::unbox_value<std::uint8_t>(raw_value)));
-        if (!normalized.has_value()) {
-            DebugLog("ZMI vendor key was present but value was not usable (uint8)");
+    for (const auto& property : endpoint_info.Properties()) {
+        const std::string key = ToLowerAscii(ToUtf8(property.Key()));
+        if (key.find(kVendorGuidPrefixLower) == std::string::npos) {
+            continue;
         }
-        return normalized;
-    } catch (const winrt::hresult_error&) {
+        if (!processed_keys.insert(key).second) {
+            continue;
+        }
+
+        auto decoded = decode_from_value(property.Value());
+        if (decoded.size() >= 2U) {
+            DebugLog("ZMI vendor key '" + key + "' decoded entries=" + std::to_string(decoded.size()));
+            return decoded;
+        }
+        if (DebugEnabled() && !decoded.empty()) {
+            DebugLog("ZMI vendor key '" + key + "' decoded scalar entries=" + std::to_string(decoded.size()));
+        }
+        if (!decoded.empty() && best_single_value.empty()) {
+            best_single_value = decoded;
+        }
     }
 
-    try {
-        const auto normalized = NormalizeZmiVendorBatteryHint(static_cast<int>(winrt::unbox_value<std::uint32_t>(raw_value)));
-        if (!normalized.has_value()) {
-            DebugLog("ZMI vendor key was present but value was not usable (uint32)");
-        }
-        return normalized;
-    } catch (const winrt::hresult_error&) {
-    }
-
-    try {
-        const auto normalized = NormalizeZmiVendorBatteryHint(winrt::unbox_value<std::int32_t>(raw_value));
-        if (!normalized.has_value()) {
-            DebugLog("ZMI vendor key was present but value was not usable (int32)");
-        }
-        return normalized;
-    } catch (const winrt::hresult_error&) {
+    if (!best_single_value.empty()) {
+        return best_single_value;
     }
 
     DebugLog("ZMI vendor key type was not supported");
-    return std::nullopt;
+    return {};
+}
+
+void AppendZmiVendorHintPropertyRequests(
+    const winrt::Windows::Foundation::Collections::IVector<winrt::hstring>& requested_properties) {
+    constexpr int kPropertyIdMin = 1;
+    constexpr int kPropertyIdMax = 32;
+    for (int property_id = kPropertyIdMin; property_id <= kPropertyIdMax; ++property_id) {
+        requested_properties.Append(winrt::to_hstring(
+            "{670245F9-6E25-4179-85C1-981C33B9D3B7} " + std::to_string(property_id)));
+    }
 }
 
 std::optional<std::uint8_t> ReadBatteryPercentFromEndpointProperties(const DeviceInformation& endpoint_info) {
@@ -2114,6 +3602,369 @@ std::vector<std::uint8_t> ReadBufferBytes(const winrt::Windows::Storage::Streams
         reader.ReadBytes(bytes);
     }
     return bytes;
+}
+
+struct ScoredXiaomiSnapshot {
+    XiaomiBatterySnapshot snapshot;
+    int score = -1;
+};
+
+struct AdvertisementSnapshotResult {
+    std::unordered_map<std::uint64_t, XiaomiBatterySnapshot> by_address;
+    std::unordered_map<std::string, XiaomiBatterySnapshot> by_name;
+    std::unordered_map<std::uint16_t, XiaomiBatterySnapshot> by_product_id;
+};
+
+std::optional<BluetoothLEDevice> TryOpenBleDeviceByAddress(std::uint64_t address,
+                                                           std::chrono::milliseconds timeout);
+
+std::optional<ScoredXiaomiSnapshot> DecodeXiaomiSnapshotFromAdvertisementPayload(
+    const std::vector<std::uint8_t>& payload) {
+    if (payload.empty()) {
+        return std::nullopt;
+    }
+
+    std::optional<ScoredXiaomiSnapshot> best_candidate;
+
+    auto score_snapshot = [](const XiaomiBatterySnapshot& snapshot, int base_score) {
+        int score = base_score;
+        const int presence = XiaomiBatteryPresenceCount(snapshot);
+        score += presence * 10;
+        if (presence == 3) {
+            score += 8;
+        }
+        if (snapshot.left.has_value() && snapshot.right.has_value() && *snapshot.left != *snapshot.right) {
+            score += 5;
+        }
+        if ((snapshot.left.has_value() && *snapshot.left == 100U) ||
+            (snapshot.right.has_value() && *snapshot.right == 100U) ||
+            (snapshot.case_level.has_value() && *snapshot.case_level == 100U)) {
+            score += 2;
+        }
+        return score;
+    };
+
+    auto consider = [&](const XiaomiBatterySnapshot& snapshot, int base_score) {
+        const int presence = XiaomiBatteryPresenceCount(snapshot);
+        if (presence < 2) {
+            return;
+        }
+        const int score = score_snapshot(snapshot, base_score);
+        if (!best_candidate.has_value() || score > best_candidate->score) {
+            best_candidate = ScoredXiaomiSnapshot{snapshot, score};
+        }
+    };
+
+    if (const auto parsed = ExtractBatterySnapshotFromXiaomiPayload(payload, std::nullopt); parsed.has_value()) {
+        consider(*parsed, 64);
+    }
+
+    if (const auto parsed = ExtractZmiSerialPatternSnapshot(payload); parsed.has_value()) {
+        consider(*parsed, 74);
+    }
+
+    for (std::size_t index = 0; index + 4U < payload.size(); ++index) {
+        if (payload[index] != 0x04U || payload[index + 1U] > 0x7FU) {
+            continue;
+        }
+
+        XiaomiBatterySnapshot snapshot;
+        snapshot.left = ParseXiaomiBatteryRaw(payload[index + 2U]);
+        snapshot.right = ParseXiaomiBatteryRaw(payload[index + 3U]);
+        snapshot.case_level = ParseXiaomiBatteryRaw(payload[index + 4U]);
+        consider(snapshot, 56);
+    }
+
+    for (std::size_t index = 0; index + 2U < payload.size(); ++index) {
+        const std::uint8_t left_raw = payload[index];
+        const std::uint8_t right_raw = payload[index + 1U];
+        const std::uint8_t case_raw = payload[index + 2U];
+
+        const int plausible_raw_count =
+            (left_raw <= 100U || left_raw == 0xFFU ? 1 : 0) +
+            (right_raw <= 100U || right_raw == 0xFFU ? 1 : 0) +
+            (case_raw <= 100U || case_raw == 0xFFU ? 1 : 0);
+        if (plausible_raw_count < 2) {
+            continue;
+        }
+
+        XiaomiBatterySnapshot snapshot;
+        snapshot.left = ParseXiaomiBatteryRaw(left_raw);
+        snapshot.right = ParseXiaomiBatteryRaw(right_raw);
+        snapshot.case_level = ParseXiaomiBatteryRaw(case_raw);
+        consider(snapshot, 38);
+    }
+
+    if (!best_candidate.has_value() || best_candidate->score < 58) {
+        return std::nullopt;
+    }
+
+    return best_candidate;
+}
+
+std::uint64_t ComposeBluetoothAddressFromBytes(const std::uint8_t* bytes, bool reverse_order) {
+    if (bytes == nullptr) {
+        return 0ULL;
+    }
+
+    std::uint64_t address = 0ULL;
+    for (std::size_t index = 0; index < 6U; ++index) {
+        const std::size_t source_index = reverse_order ? (5U - index) : index;
+        address = (address << 8U) | static_cast<std::uint64_t>(bytes[source_index]);
+    }
+    return address;
+}
+
+std::vector<std::uint64_t> ParseXiaomiAddressAliasesFromPayload(const std::vector<std::uint8_t>& payload) {
+    std::vector<std::uint64_t> aliases;
+    if (payload.size() < 11U) {
+        return aliases;
+    }
+
+    // Xiaomi Service Data layout: frame-control(2), product-id(2), counter(1), mac(6, optional), ...
+    const std::uint16_t frame_control = static_cast<std::uint16_t>(
+        payload[0] | (static_cast<std::uint16_t>(payload[1]) << 8U));
+    constexpr std::uint16_t kFrameControlMacIncluded = 0x0010U;
+    if ((frame_control & kFrameControlMacIncluded) == 0U) {
+        return aliases;
+    }
+
+    const auto* mac_bytes = payload.data() + 5U;
+    auto append_alias = [&](std::uint64_t address) {
+        if (address <= 0xFFFFULL || address == 0ULL || address == 0xFFFFFFFFFFFFULL) {
+            return;
+        }
+        if (std::find(aliases.begin(), aliases.end(), address) != aliases.end()) {
+            return;
+        }
+        aliases.push_back(address);
+    };
+
+    // Some Xiaomi payloads expose MAC bytes in direct order, some in reversed order.
+    append_alias(ComposeBluetoothAddressFromBytes(mac_bytes, false));
+    append_alias(ComposeBluetoothAddressFromBytes(mac_bytes, true));
+
+    return aliases;
+}
+
+std::optional<std::uint16_t> ParseXiaomiProductIdFromPayload(const std::vector<std::uint8_t>& payload) {
+    if (payload.size() < 4U) {
+        return std::nullopt;
+    }
+
+    const std::uint16_t frame_control = static_cast<std::uint16_t>(
+        payload[0] | (static_cast<std::uint16_t>(payload[1]) << 8U));
+    const std::uint16_t product_id = static_cast<std::uint16_t>(
+        payload[2] | (static_cast<std::uint16_t>(payload[3]) << 8U));
+
+    if (product_id == 0U || product_id == 0xFFFFU) {
+        return std::nullopt;
+    }
+
+    // Xiaomi beacons normally set at least one control flag; reject obviously invalid headers.
+    if (frame_control == 0U) {
+        return std::nullopt;
+    }
+
+    return product_id;
+}
+
+void StoreBestAdvertisementSnapshot(
+    std::unordered_map<std::uint64_t, ScoredXiaomiSnapshot>* snapshots,
+    std::uint64_t address, const XiaomiBatterySnapshot& snapshot, int score) {
+    if (snapshots == nullptr || address <= 0xFFFFULL) {
+        return;
+    }
+
+    auto found = snapshots->find(address);
+    if (found == snapshots->end() || score > found->second.score) {
+        (*snapshots)[address] = ScoredXiaomiSnapshot{snapshot, score};
+    }
+}
+
+void StoreBestAdvertisementSnapshotByName(
+    std::unordered_map<std::string, ScoredXiaomiSnapshot>* snapshots,
+    const std::string& normalized_name, const XiaomiBatterySnapshot& snapshot, int score) {
+    if (snapshots == nullptr || normalized_name.empty()) {
+        return;
+    }
+
+    auto found = snapshots->find(normalized_name);
+    if (found == snapshots->end() || score > found->second.score) {
+        (*snapshots)[normalized_name] = ScoredXiaomiSnapshot{snapshot, score};
+    }
+}
+
+void StoreBestAdvertisementSnapshotByProductId(
+    std::unordered_map<std::uint16_t, ScoredXiaomiSnapshot>* snapshots,
+    std::uint16_t product_id, const XiaomiBatterySnapshot& snapshot, int score) {
+    if (snapshots == nullptr || product_id == 0U || product_id == 0xFFFFU) {
+        return;
+    }
+
+    auto found = snapshots->find(product_id);
+    if (found == snapshots->end() || score > found->second.score) {
+        (*snapshots)[product_id] = ScoredXiaomiSnapshot{snapshot, score};
+    }
+}
+
+AdvertisementSnapshotResult ScanXiaomiAdvertisementSnapshots(
+    std::chrono::milliseconds scan_duration) {
+    AdvertisementSnapshotResult snapshots;
+
+    try {
+        BluetoothLEAdvertisementWatcher watcher;
+        watcher.ScanningMode(BluetoothLEScanningMode::Active);
+
+        std::mutex snapshots_mutex;
+        std::unordered_map<std::uint64_t, ScoredXiaomiSnapshot> scored_snapshots;
+        std::unordered_map<std::string, ScoredXiaomiSnapshot> scored_name_snapshots;
+        std::unordered_map<std::uint16_t, ScoredXiaomiSnapshot> scored_pid_snapshots;
+
+        const auto received_token = watcher.Received(
+            [&snapshots_mutex, &scored_snapshots, &scored_name_snapshots, &scored_pid_snapshots](
+                const BluetoothLEAdvertisementWatcher&,
+                const BluetoothLEAdvertisementReceivedEventArgs& args) {
+                const auto bluetooth_address = args.BluetoothAddress();
+                if (bluetooth_address <= 0xFFFFULL) {
+                    return;
+                }
+
+                const auto advertisement = args.Advertisement();
+                const std::string local_name = ToLowerAscii(ToUtf8(advertisement.LocalName()));
+                for (const auto& manufacturer : advertisement.ManufacturerData()) {
+                    const auto company_id = manufacturer.CompanyId();
+                    if (company_id != 0x038FU && company_id != 0x2717U) {
+                        continue;
+                    }
+                    const auto payload = ReadBufferBytes(manufacturer.Data());
+                    const auto decoded = DecodeXiaomiSnapshotFromAdvertisementPayload(payload);
+                    if (!decoded.has_value()) {
+                        continue;
+                    }
+                    const auto product_id = ParseXiaomiProductIdFromPayload(payload);
+                    const auto address_aliases = ParseXiaomiAddressAliasesFromPayload(payload);
+
+                    int source_bonus = 18;
+
+                    const int score = decoded->score + source_bonus;
+                    std::scoped_lock lock(snapshots_mutex);
+                    StoreBestAdvertisementSnapshot(&scored_snapshots, bluetooth_address, decoded->snapshot, score);
+                    for (const auto alias : address_aliases) {
+                        StoreBestAdvertisementSnapshot(&scored_snapshots, alias, decoded->snapshot, score + 6);
+                    }
+                    StoreBestAdvertisementSnapshotByName(&scored_name_snapshots, local_name, decoded->snapshot, score);
+                    if (product_id.has_value()) {
+                        StoreBestAdvertisementSnapshotByProductId(
+                            &scored_pid_snapshots, *product_id, decoded->snapshot, score + 8);
+                    }
+                }
+
+                for (const auto& section : advertisement.DataSections()) {
+                    const auto section_bytes = ReadBufferBytes(section.Data());
+                    std::vector<std::uint8_t> payload;
+                    int source_bonus = 0;
+                    std::optional<std::uint16_t> product_id;
+
+                    const auto data_type = section.DataType();
+                    if (data_type != 0x16U || section_bytes.size() < 2U) {
+                        continue;
+                    }
+                    const std::uint16_t service_uuid = static_cast<std::uint16_t>(
+                        section_bytes[0] | (static_cast<std::uint16_t>(section_bytes[1]) << 8U));
+                    if (service_uuid != 0xFD2DU && service_uuid != 0xFE95U) {
+                        continue;
+                    }
+                    source_bonus += 20;
+                    payload.assign(section_bytes.begin() + 2, section_bytes.end());
+                    product_id = ParseXiaomiProductIdFromPayload(payload);
+
+                    const auto decoded = DecodeXiaomiSnapshotFromAdvertisementPayload(payload);
+                    if (!decoded.has_value()) {
+                        continue;
+                    }
+                    const auto address_aliases = ParseXiaomiAddressAliasesFromPayload(payload);
+
+                    const int score = decoded->score + source_bonus;
+                    std::scoped_lock lock(snapshots_mutex);
+                    StoreBestAdvertisementSnapshot(&scored_snapshots, bluetooth_address, decoded->snapshot, score);
+                    for (const auto alias : address_aliases) {
+                        StoreBestAdvertisementSnapshot(&scored_snapshots, alias, decoded->snapshot, score + 8);
+                    }
+                    StoreBestAdvertisementSnapshotByName(&scored_name_snapshots, local_name, decoded->snapshot, score);
+                    if (product_id.has_value()) {
+                        StoreBestAdvertisementSnapshotByProductId(
+                            &scored_pid_snapshots, *product_id, decoded->snapshot, score + 10);
+                    }
+                }
+            });
+
+        watcher.Start();
+        std::this_thread::sleep_for(scan_duration);
+        watcher.Stop();
+        watcher.Received(received_token);
+
+        std::scoped_lock lock(snapshots_mutex);
+        snapshots.by_address.reserve(scored_snapshots.size());
+        for (const auto& [address, scored] : scored_snapshots) {
+            snapshots.by_address[address] = scored.snapshot;
+            if (DebugEnabled()) {
+                const auto readings = BuildXiaomiBatteryReadings(scored.snapshot);
+                DebugLog("BLE advertisement snapshot address=" + std::to_string(address) +
+                         " entries=" + std::to_string(readings.size()) +
+                         " score=" + std::to_string(scored.score));
+            }
+        }
+
+        for (const auto& [address, scored] : scored_snapshots) {
+            const auto maybe_ble_device =
+                TryOpenBleDeviceByAddress(address, std::chrono::milliseconds(1200));
+            if (!maybe_ble_device.has_value() || !(*maybe_ble_device)) {
+                continue;
+            }
+
+            const std::string resolved_name = ToLowerAscii(ToUtf8((*maybe_ble_device).Name()));
+            if (resolved_name.empty()) {
+                continue;
+            }
+            StoreBestAdvertisementSnapshotByName(
+                &scored_name_snapshots, resolved_name, scored.snapshot, scored.score + 6);
+            if (DebugEnabled()) {
+                DebugLog("BLE advertisement snapshot resolved name='" + resolved_name +
+                         "' from address=" + std::to_string(address));
+            }
+        }
+
+        snapshots.by_name.reserve(scored_name_snapshots.size());
+        for (const auto& [name, scored] : scored_name_snapshots) {
+            snapshots.by_name[name] = scored.snapshot;
+            if (DebugEnabled()) {
+                const auto readings = BuildXiaomiBatteryReadings(scored.snapshot);
+                DebugLog("BLE advertisement snapshot name='" + name + "'" +
+                         " entries=" + std::to_string(readings.size()) +
+                         " score=" + std::to_string(scored.score));
+            }
+        }
+        snapshots.by_product_id.reserve(scored_pid_snapshots.size());
+        for (const auto& [product_id, scored] : scored_pid_snapshots) {
+            snapshots.by_product_id[product_id] = scored.snapshot;
+            if (DebugEnabled()) {
+                const auto readings = BuildXiaomiBatteryReadings(scored.snapshot);
+                std::ostringstream pid_stream;
+                pid_stream << "0x" << std::uppercase << std::hex
+                           << std::setw(4) << std::setfill('0') << product_id;
+                DebugLog("BLE advertisement snapshot productId=" + pid_stream.str() +
+                         " entries=" + std::to_string(readings.size()) +
+                         " score=" + std::to_string(scored.score));
+            }
+        }
+    } catch (const winrt::hresult_error& error) {
+        DebugLog("BLE advertisement fallback failed: " + DescribeHresultError(error));
+    } catch (const std::exception& error) {
+        DebugLog(std::string("BLE advertisement fallback failed: ") + error.what());
+    }
+
+    return snapshots;
 }
 
 std::optional<std::array<std::uint8_t, 3>> FindLikelyBatteryTriplet(const std::vector<std::uint8_t>& bytes) {
@@ -2364,7 +4215,7 @@ std::vector<DeviceBatteryInfo> ReadConnectedBluetoothDeviceBatteryFast(std::vect
     requested_properties.Append(L"System.Devices.BatteryLife");
     requested_properties.Append(L"System.Devices.BatteryPlusCharging");
     requested_properties.Append(L"System.Devices.BatteryPlusChargingText");
-    requested_properties.Append(L"{670245F9-6E25-4179-85C1-981C33B9D3B7} 4");
+    AppendZmiVendorHintPropertyRequests(requested_properties);
 
     const auto query_started_at = std::chrono::steady_clock::now();
     const auto maybe_device_infos = WaitForAsyncResult(
@@ -2425,19 +4276,36 @@ std::vector<DeviceBatteryInfo> ReadConnectedBluetoothDeviceBatteryFast(std::vect
             tws_candidates->push_back(std::move(candidate));
         }
 
-        auto battery_percent = ReadBatteryPercentFromEndpointProperties(device_info);
-        if (!battery_percent.has_value() && IsLikelyZmiPurPods(device_name, device_name, device_id)) {
-            battery_percent = ReadZmiVendorBatteryHint(device_info);
-            if (!battery_percent.has_value() && address.has_value()) {
-                battery_percent = ReadZmiVendorBatteryHintFromPnpAddress(*address);
-                if (battery_percent.has_value()) {
-                    DebugLog("Fast connected fallback: ZMI PnP vendor key battery=" + std::to_string(*battery_percent));
+        const bool is_zmi_family = IsLikelyZmiPurPods(device_name, device_name, device_id);
+        std::vector<BatteryReading> zmi_readings;
+        if (is_zmi_family) {
+            zmi_readings = ReadZmiVendorBatteryHint(device_info);
+            if (zmi_readings.empty() && address.has_value()) {
+                zmi_readings = ReadZmiVendorBatteryHintFromPnpAddress(*address);
+                if (!zmi_readings.empty()) {
+                    DebugLog("Fast connected fallback: ZMI PnP vendor key decoded entries=" +
+                             std::to_string(zmi_readings.size()));
                 }
             }
-            if (battery_percent.has_value()) {
-                DebugLog("Fast connected fallback: ZMI vendor key battery=" + std::to_string(*battery_percent));
+            if (!zmi_readings.empty()) {
+                DebugLog("Fast connected fallback: ZMI vendor key decoded entries=" +
+                         std::to_string(zmi_readings.size()));
             }
         }
+
+        if (!zmi_readings.empty()) {
+            for (const auto& reading : zmi_readings) {
+                DeviceBatteryInfo entry;
+                entry.device_id = device_id;
+                entry.device_name = device_name.empty() ? "Unknown" : device_name;
+                entry.battery_component = reading.component.empty() ? "main" : reading.component;
+                entry.battery_level_percent = reading.percent;
+                entries.push_back(std::move(entry));
+            }
+            continue;
+        }
+
+        auto battery_percent = ReadBatteryPercentFromEndpointProperties(device_info);
         DeviceBatteryInfo entry;
         entry.device_id = device_id;
         entry.device_name = device_name.empty() ? "Unknown" : device_name;
@@ -2493,14 +4361,28 @@ std::vector<DeviceBatteryInfo> ReadConnectedBluetoothDeviceBatteryFast(std::vect
                     tws_candidates->push_back(std::move(candidate));
                 }
 
-                auto battery_percent = ReadBatteryPercentFromEndpointProperties(device_info);
-                if (!battery_percent.has_value() && IsLikelyZmiPurPods(device_name, device_name, device_id)) {
-                    battery_percent = ReadZmiVendorBatteryHint(device_info);
-                    if (!battery_percent.has_value() && address.has_value()) {
-                        battery_percent = ReadZmiVendorBatteryHintFromPnpAddress(*address);
+                const bool is_zmi_family = IsLikelyZmiPurPods(device_name, device_name, device_id);
+                std::vector<BatteryReading> zmi_readings;
+                if (is_zmi_family) {
+                    zmi_readings = ReadZmiVendorBatteryHint(device_info);
+                    if (zmi_readings.empty() && address.has_value()) {
+                        zmi_readings = ReadZmiVendorBatteryHintFromPnpAddress(*address);
                     }
                 }
 
+                if (!zmi_readings.empty()) {
+                    for (const auto& reading : zmi_readings) {
+                        DeviceBatteryInfo entry;
+                        entry.device_id = device_id;
+                        entry.device_name = device_name.empty() ? "Unknown" : device_name;
+                        entry.battery_component = reading.component.empty() ? "main" : reading.component;
+                        entry.battery_level_percent = reading.percent;
+                        entries.push_back(std::move(entry));
+                    }
+                    continue;
+                }
+
+                auto battery_percent = ReadBatteryPercentFromEndpointProperties(device_info);
                 DeviceBatteryInfo entry;
                 entry.device_id = device_id;
                 entry.device_name = device_name.empty() ? "Unknown" : device_name;
@@ -2535,7 +4417,7 @@ std::vector<DeviceBatteryInfo> ReadAssociationEndpointBattery(std::vector<Endpoi
     requested_properties.Append(L"System.Devices.BatteryPlusCharging");
     requested_properties.Append(L"System.Devices.BatteryPlusChargingText");
     requested_properties.Append(L"System.ItemNameDisplay");
-    requested_properties.Append(L"{670245F9-6E25-4179-85C1-981C33B9D3B7} 4");
+    AppendZmiVendorHintPropertyRequests(requested_properties);
 
     constexpr auto kEndpointSelector = LR"((System.Devices.Aep.IsPresent:=System.StructuredQueryType.Boolean#True)
 AND ((System.Devices.Aep.ProtocolId:="{E0CBF06C-CD8B-4647-BB8A-263B43F0F974}")
@@ -2545,7 +4427,7 @@ OR (System.Devices.Aep.ProtocolId:="{BB7BB05E-5972-42B5-94FC-76EAA7084D49}")))";
     const auto endpoint_infos_operation =
         DeviceInformation::FindAllAsync(kEndpointSelector, requested_properties, DeviceInformationKind::AssociationEndpoint);
     const auto endpoint_infos_result =
-        WaitForAsyncResult(endpoint_infos_operation, std::chrono::milliseconds(1800));
+        WaitForAsyncResult(endpoint_infos_operation, std::chrono::milliseconds(3600));
     if (DebugEnabled()) {
         const auto elapsed_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - query_started_at);
@@ -2625,22 +4507,39 @@ OR (System.Devices.Aep.ProtocolId:="{BB7BB05E-5972-42B5-94FC-76EAA7084D49}")))";
             }
         }
 
-        auto battery_percent = ReadBatteryPercentFromEndpointProperties(endpoint_info);
-        if (!battery_percent.has_value() && IsLikelyZmiPurPods(endpoint_name, endpoint_name, endpoint_id)) {
-            battery_percent = ReadZmiVendorBatteryHint(endpoint_info);
-            if (!battery_percent.has_value()) {
+        const bool is_zmi_family = IsLikelyZmiPurPods(endpoint_name, endpoint_name, endpoint_id);
+        std::vector<BatteryReading> zmi_readings;
+        if (is_zmi_family) {
+            zmi_readings = ReadZmiVendorBatteryHint(endpoint_info);
+            if (zmi_readings.empty()) {
                 const auto parsed_address = ParseBluetoothAddressFromDeviceId(endpoint_id);
                 if (parsed_address.has_value()) {
-                    battery_percent = ReadZmiVendorBatteryHintFromPnpAddress(*parsed_address);
-                    if (battery_percent.has_value()) {
-                        DebugLog("AEP fallback: ZMI PnP vendor key battery=" + std::to_string(*battery_percent));
+                    zmi_readings = ReadZmiVendorBatteryHintFromPnpAddress(*parsed_address);
+                    if (!zmi_readings.empty()) {
+                        DebugLog("AEP fallback: ZMI PnP vendor key decoded entries=" +
+                                 std::to_string(zmi_readings.size()));
                     }
                 }
             }
-            if (battery_percent.has_value()) {
-                DebugLog("AEP fallback: ZMI vendor key battery=" + std::to_string(*battery_percent));
+            if (!zmi_readings.empty()) {
+                DebugLog("AEP fallback: ZMI vendor key decoded entries=" +
+                         std::to_string(zmi_readings.size()));
             }
         }
+
+        if (!zmi_readings.empty()) {
+            for (const auto& reading : zmi_readings) {
+                DeviceBatteryInfo entry;
+                entry.device_id = endpoint_id;
+                entry.device_name = endpoint_name;
+                entry.battery_component = reading.component.empty() ? "main" : reading.component;
+                entry.battery_level_percent = reading.percent;
+                endpoint_entries.push_back(std::move(entry));
+            }
+            continue;
+        }
+
+        auto battery_percent = ReadBatteryPercentFromEndpointProperties(endpoint_info);
         if (!battery_percent.has_value()) {
             if (interesting) {
                 DebugLog("AEP battery props not found for '" + endpoint_name + "'");
@@ -2673,7 +4572,7 @@ std::vector<DeviceBatteryInfo> ReadGenericDeviceBattery() {
     requested_properties.Append(L"System.Devices.BatteryPlusCharging");
     requested_properties.Append(L"System.Devices.BatteryPlusChargingText");
     requested_properties.Append(L"System.ItemNameDisplay");
-    requested_properties.Append(L"{670245F9-6E25-4179-85C1-981C33B9D3B7} 4");
+    AppendZmiVendorHintPropertyRequests(requested_properties);
 
     constexpr auto kDeviceSelector = LR"(System.Devices.IsPresent:=System.StructuredQueryType.Boolean#True)";
 
@@ -2700,35 +4599,52 @@ std::vector<DeviceBatteryInfo> ReadGenericDeviceBattery() {
                                  lowered_probe.find("zmi") != std::string::npos ||
                                  lowered_probe.find("purpods") != std::string::npos;
 
-        auto battery = ReadBatteryPercentFromEndpointProperties(device);
-        if (!battery.has_value() && IsLikelyZmiPurPods(device_name_probe, device_name_probe, device_id)) {
-            battery = ReadZmiVendorBatteryHint(device);
-            if (!battery.has_value()) {
-                const auto parsed_address = ParseBluetoothAddressFromDeviceId(device_id);
-                if (parsed_address.has_value()) {
-                    battery = ReadZmiVendorBatteryHintFromPnpAddress(*parsed_address);
-                    if (battery.has_value()) {
-                        DebugLog("Generic fallback: ZMI PnP vendor key battery=" + std::to_string(*battery));
-                    }
-                }
-            }
-            if (battery.has_value()) {
-                DebugLog("Generic fallback: ZMI vendor key battery=" + std::to_string(*battery));
-            }
-        }
-        if (!battery.has_value()) {
-            if (interesting) {
-                DebugLog("Generic battery props not found for name='" + device_name_probe + "' id='" + device_id + "'");
-            }
-            continue;
-        }
-
         std::string name = ToUtf8(device.Name());
         if (name.empty()) {
             TryGetStringProperty(device, L"System.ItemNameDisplay", &name);
         }
         if (name.empty()) {
             name = "Unknown";
+        }
+
+        const bool is_zmi_family = IsLikelyZmiPurPods(device_name_probe, device_name_probe, device_id);
+        std::vector<BatteryReading> zmi_readings;
+        if (is_zmi_family) {
+            zmi_readings = ReadZmiVendorBatteryHint(device);
+            if (zmi_readings.empty()) {
+                const auto parsed_address = ParseBluetoothAddressFromDeviceId(device_id);
+                if (parsed_address.has_value()) {
+                    zmi_readings = ReadZmiVendorBatteryHintFromPnpAddress(*parsed_address);
+                    if (!zmi_readings.empty()) {
+                        DebugLog("Generic fallback: ZMI PnP vendor key decoded entries=" +
+                                 std::to_string(zmi_readings.size()));
+                    }
+                }
+            }
+            if (!zmi_readings.empty()) {
+                DebugLog("Generic fallback: ZMI vendor key decoded entries=" +
+                         std::to_string(zmi_readings.size()));
+            }
+        }
+
+        if (!zmi_readings.empty()) {
+            for (const auto& reading : zmi_readings) {
+                DeviceBatteryInfo entry;
+                entry.device_id = device_id;
+                entry.device_name = name;
+                entry.battery_component = reading.component.empty() ? "main" : reading.component;
+                entry.battery_level_percent = reading.percent;
+                entries.push_back(std::move(entry));
+            }
+            continue;
+        }
+
+        auto battery = ReadBatteryPercentFromEndpointProperties(device);
+        if (!battery.has_value()) {
+            if (interesting) {
+                DebugLog("Generic battery props not found for name='" + device_name_probe + "' id='" + device_id + "'");
+            }
+            continue;
         }
 
         DeviceBatteryInfo entry;
@@ -2861,12 +4777,11 @@ std::vector<DeviceInformation> EnumerateCandidateDevices() {
     } catch (const winrt::hresult_error& error) {
         DebugLog("GetDeviceSelectorFromConnectionStatus failed: " + DescribeHresultError(error));
     }
-    if (candidates.empty()) {
-        try {
-            AddCandidatesFromSelector(BluetoothLEDevice::GetDeviceSelectorFromPairingState(true), &candidates, &known_ids);
-        } catch (const winrt::hresult_error& error) {
-            DebugLog("GetDeviceSelectorFromPairingState failed: " + DescribeHresultError(error));
-        }
+
+    try {
+        AddCandidatesFromSelector(BluetoothLEDevice::GetDeviceSelectorFromPairingState(true), &candidates, &known_ids);
+    } catch (const winrt::hresult_error& error) {
+        DebugLog("GetDeviceSelectorFromPairingState failed: " + DescribeHresultError(error));
     }
 
     return candidates;
@@ -2895,37 +4810,270 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetConnectedDevicesBattery(
             }
             devices_with_battery.push_back(std::move(entry));
         };
-        auto read_xiaomi_classic_cached = [&](std::uint64_t address, bool aggressive_retry) -> const XiaomiReadResult& {
-            if (const auto found = xiaomi_classic_cache.find(address); found != xiaomi_classic_cache.end()) {
+        auto read_xiaomi_classic_cached =
+            [&](std::uint64_t address,
+                bool aggressive_retry,
+                bool enable_dynamic_port_scan,
+                std::size_t min_tws_components = 1U) -> const XiaomiReadResult& {
+            auto found = xiaomi_classic_cache.find(address);
+            const bool has_cached_result = found != xiaomi_classic_cache.end();
+            const bool cached_is_sufficient =
+                has_cached_result &&
+                (!found->second.readings.empty()) &&
+                (min_tws_components <= 1U ||
+                 XiaomiResolvedTwsComponentCount(found->second.readings) >= min_tws_components);
+            if (cached_is_sufficient) {
                 return found->second;
             }
 
             XiaomiReadResult read_result;
-            auto readings = TryReadXiaomiClassicBattery(address);
-            if (aggressive_retry && readings.empty()) {
+            auto readings = TryReadXiaomiClassicBattery(address, enable_dynamic_port_scan);
+            const auto is_sufficient = [&](const std::vector<BatteryReading>& candidate_readings) {
+                if (candidate_readings.empty()) {
+                    return false;
+                }
+                if (min_tws_components <= 1U) {
+                    return true;
+                }
+                return XiaomiResolvedTwsComponentCount(candidate_readings) >= min_tws_components;
+            };
+
+            if (aggressive_retry && !is_sufficient(readings)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(180));
-                readings = TryReadXiaomiClassicBattery(address);
+                auto retried = TryReadXiaomiClassicBattery(address, enable_dynamic_port_scan);
+                if (XiaomiReadingsRichnessScore(retried) > XiaomiReadingsRichnessScore(readings)) {
+                    readings = std::move(retried);
+                }
             }
-            if (aggressive_retry && readings.empty()) {
+            if (aggressive_retry && !is_sufficient(readings)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(260));
-                readings = TryReadXiaomiClassicBattery(address);
+                auto retried = TryReadXiaomiClassicBattery(address, enable_dynamic_port_scan);
+                if (XiaomiReadingsRichnessScore(retried) > XiaomiReadingsRichnessScore(readings)) {
+                    readings = std::move(retried);
+                }
             }
 
             if (!readings.empty()) {
                 read_result.readings = readings;
                 read_result.from_persistent_cache = false;
-                PutPersistentXiaomiSnapshot(address, SnapshotFromBatteryReadings(readings));
-            } else {
-                const auto persistent_snapshot = GetPersistentXiaomiSnapshot(address);
-                if (persistent_snapshot.has_value()) {
-                    read_result.readings = BuildXiaomiBatteryReadings(*persistent_snapshot);
-                    read_result.from_persistent_cache = true;
-                    DebugLog("Xiaomi classic fallback: using persisted cache for address=" + std::to_string(address));
+                if (HasUsefulXiaomiTwsReadings(readings, 2U)) {
+                    PutPersistentXiaomiSnapshot(address, SnapshotFromBatteryReadings(readings));
                 }
+            }
+
+            const auto persistent_snapshot = GetPersistentXiaomiSnapshot(address);
+            if (persistent_snapshot.has_value()) {
+                auto persistent_readings = BuildXiaomiBatteryReadings(*persistent_snapshot);
+                if (!persistent_readings.empty()) {
+                    const bool live_sufficient = is_sufficient(read_result.readings);
+                    const bool persistent_sufficient = is_sufficient(persistent_readings);
+                    if ((!live_sufficient && persistent_sufficient) ||
+                        (read_result.readings.empty() &&
+                         XiaomiReadingsRichnessScore(persistent_readings) > XiaomiReadingsRichnessScore(read_result.readings))) {
+                        read_result.readings = std::move(persistent_readings);
+                        read_result.from_persistent_cache = true;
+                        DebugLog("Xiaomi classic fallback: using persisted cache for address=" + std::to_string(address));
+                    }
+                }
+            }
+
+            if (has_cached_result) {
+                if (XiaomiReadingsRichnessScore(found->second.readings) > XiaomiReadingsRichnessScore(read_result.readings)) {
+                    return found->second;
+                }
+                found->second = std::move(read_result);
+                return found->second;
             }
 
             auto inserted = xiaomi_classic_cache.emplace(address, std::move(read_result));
             return inserted.first->second;
+        };
+
+        AdvertisementSnapshotResult advertisement_snapshot_cache;
+        bool advertisement_scan_attempted = false;
+        bool advertisement_rescan_attempted = false;
+        int advertisement_scan_budget_ms = 0;
+        auto read_xiaomi_advertisement_cached =
+            [&](std::uint64_t address,
+                const std::string& device_name_hint,
+                bool prefer_extended_scan = false) -> std::vector<BatteryReading> {
+            if (address <= 0xFFFFULL) {
+                if (device_name_hint.empty()) {
+                    return {};
+                }
+            }
+
+            int requested_scan_ms = XiaomiAdvertisementScanMs();
+            if (prefer_extended_scan) {
+                const int observe_ms = ZmiObserveMs();
+                if (observe_ms > 0) {
+                    requested_scan_ms = std::max(requested_scan_ms, std::min(observe_ms, 20000));
+                } else {
+                    requested_scan_ms = std::max(requested_scan_ms, 3200);
+                }
+            }
+
+            const auto cache_has_hit = [&]() {
+                if (address > 0xFFFFULL &&
+                    advertisement_snapshot_cache.by_address.find(address) != advertisement_snapshot_cache.by_address.end()) {
+                    return true;
+                }
+
+                if (!device_name_hint.empty()) {
+                    const std::string normalized_hint = ToLowerAscii(device_name_hint);
+                    if (advertisement_snapshot_cache.by_name.find(normalized_hint) != advertisement_snapshot_cache.by_name.end()) {
+                        return true;
+                    }
+                    for (const auto& [name, snapshot] : advertisement_snapshot_cache.by_name) {
+                        if (name.empty()) {
+                            continue;
+                        }
+                        if (name.find(normalized_hint) != std::string::npos ||
+                            normalized_hint.find(name) != std::string::npos) {
+                            return true;
+                        }
+                    }
+                }
+
+                if (address > 0xFFFFULL) {
+                    const auto expected_product_id = ReadBluetoothProductIdFromRegistry(address);
+                    if (expected_product_id.has_value() &&
+                        advertisement_snapshot_cache.by_product_id.find(*expected_product_id) !=
+                            advertisement_snapshot_cache.by_product_id.end()) {
+                        return true;
+                    }
+                }
+
+                return false;
+            };
+
+            auto snapshot_score = [](const XiaomiBatterySnapshot& snapshot) {
+                return XiaomiReadingsRichnessScore(BuildXiaomiBatteryReadings(snapshot));
+            };
+            auto merge_snapshot_map = [&](auto* target, const auto& source) {
+                if (target == nullptr) {
+                    return;
+                }
+                for (const auto& [key, snapshot] : source) {
+                    const auto found = target->find(key);
+                    if (found == target->end() ||
+                        snapshot_score(snapshot) > snapshot_score(found->second)) {
+                        (*target)[key] = snapshot;
+                    }
+                }
+            };
+            auto scan_and_merge = [&](int scan_ms, const char* phase_tag) {
+                if (scan_ms <= 0) {
+                    return;
+                }
+                const auto scan_started_at = std::chrono::steady_clock::now();
+                auto scanned_result =
+                    ScanXiaomiAdvertisementSnapshots(std::chrono::milliseconds(scan_ms));
+
+                merge_snapshot_map(&advertisement_snapshot_cache.by_address, scanned_result.by_address);
+                merge_snapshot_map(&advertisement_snapshot_cache.by_name, scanned_result.by_name);
+                merge_snapshot_map(&advertisement_snapshot_cache.by_product_id, scanned_result.by_product_id);
+
+                const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - scan_started_at);
+                DebugLog(std::string("BLE advertisement fallback ") + phase_tag + " in " +
+                         std::to_string(elapsed_ms.count()) +
+                         " ms (requested=" + std::to_string(scan_ms) + ")" +
+                         ", candidate addresses=" + std::to_string(advertisement_snapshot_cache.by_address.size()) +
+                         " names=" + std::to_string(advertisement_snapshot_cache.by_name.size()));
+            };
+            auto resolve_readings_from_snapshot_cache = [&]() -> std::vector<BatteryReading> {
+                const auto found = advertisement_snapshot_cache.by_address.find(address);
+                if (found != advertisement_snapshot_cache.by_address.end()) {
+                    auto readings = BuildXiaomiBatteryReadings(found->second);
+                    if (DebugEnabled()) {
+                        std::string components;
+                        for (const auto& reading : readings) {
+                            if (!components.empty()) {
+                                components += ",";
+                            }
+                            components += reading.component + ":" + std::to_string(reading.percent);
+                        }
+                        DebugLog("BLE advertisement fallback hit address=" + std::to_string(address) +
+                                 " entries=" + std::to_string(readings.size()) +
+                                 (components.empty() ? "" : " values=" + components));
+                    }
+                    return readings;
+                }
+
+                if (!device_name_hint.empty()) {
+                    const std::string normalized_hint = ToLowerAscii(device_name_hint);
+                    auto by_name = advertisement_snapshot_cache.by_name.find(normalized_hint);
+                    if (by_name == advertisement_snapshot_cache.by_name.end()) {
+                        for (const auto& [name, snapshot] : advertisement_snapshot_cache.by_name) {
+                            if (name.empty()) {
+                                continue;
+                            }
+                            if (name.find(normalized_hint) != std::string::npos ||
+                                normalized_hint.find(name) != std::string::npos) {
+                                by_name = advertisement_snapshot_cache.by_name.find(name);
+                                break;
+                            }
+                        }
+                    }
+                    if (by_name != advertisement_snapshot_cache.by_name.end()) {
+                        auto readings = BuildXiaomiBatteryReadings(by_name->second);
+                        if (DebugEnabled()) {
+                            DebugLog("BLE advertisement fallback hit by name='" + normalized_hint +
+                                     "' entries=" + std::to_string(readings.size()));
+                        }
+                        return readings;
+                    }
+                }
+
+                const auto expected_product_id = ReadBluetoothProductIdFromRegistry(address);
+                if (expected_product_id.has_value()) {
+                    const auto by_pid = advertisement_snapshot_cache.by_product_id.find(*expected_product_id);
+                    if (by_pid != advertisement_snapshot_cache.by_product_id.end()) {
+                        auto readings = BuildXiaomiBatteryReadings(by_pid->second);
+                        if (DebugEnabled()) {
+                            std::ostringstream pid_stream;
+                            pid_stream << "0x" << std::uppercase << std::hex
+                                       << std::setw(4) << std::setfill('0') << *expected_product_id;
+                            DebugLog("BLE advertisement fallback hit by productId=" + pid_stream.str() +
+                                     " entries=" + std::to_string(readings.size()));
+                        }
+                        return readings;
+                    }
+                }
+
+                return {};
+            };
+
+            if (!advertisement_scan_attempted ||
+                (!cache_has_hit() && requested_scan_ms > advertisement_scan_budget_ms + 250)) {
+                advertisement_scan_attempted = true;
+                advertisement_scan_budget_ms = std::max(advertisement_scan_budget_ms, requested_scan_ms);
+                scan_and_merge(requested_scan_ms, "scanned");
+            }
+
+            auto readings = resolve_readings_from_snapshot_cache();
+            if (!readings.empty()) {
+                return readings;
+            }
+
+            if (prefer_extended_scan &&
+                !advertisement_rescan_attempted &&
+                !cache_has_hit()) {
+                advertisement_rescan_attempted = true;
+                const int rescan_ms =
+                    requested_scan_ms >= 16000 ? 4200 :
+                    (requested_scan_ms >= 10000 ? 3200 :
+                     std::clamp(requested_scan_ms + 2200, 2200, 12000));
+                advertisement_scan_budget_ms = std::max(advertisement_scan_budget_ms, rescan_ms);
+                scan_and_merge(rescan_ms, "rescanned");
+                readings = resolve_readings_from_snapshot_cache();
+                if (!readings.empty()) {
+                    return readings;
+                }
+            }
+
+            return {};
         };
 
     const auto device_infos = EnumerateCandidateDevices();
@@ -2970,6 +5118,7 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetConnectedDevicesBattery(
 
             const bool likely_tws = IsLikelyTwsDevice(device_name, ble_name, device_id);
             const bool likely_xiaomi_tws = likely_tws && IsLikelyXiaomiEarbuds(device_name, ble_name, device_id);
+            const bool likely_zmi_family = IsLikelyZmiPurPods(device_name, ble_name, device_id);
             const bool aggressive_xiaomi_retry =
                 ShouldAggressiveXiaomiClassicRetry(device_name, ble_name, device_id);
             if (DebugEnabled()) {
@@ -2986,7 +5135,7 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetConnectedDevicesBattery(
                 }
             }
             std::vector<BatteryReading> battery_readings;
-            if (!likely_xiaomi_tws) {
+            if (!likely_xiaomi_tws || likely_zmi_family) {
                 const auto read_started_at = std::chrono::steady_clock::now();
                 battery_readings = ReadBatteryReadings(ble_device, likely_tws);
                 if (DebugEnabled()) {
@@ -3001,15 +5150,18 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetConnectedDevicesBattery(
             }
             std::vector<BatteryReading> resolved_readings = battery_readings;
             bool resolved_from_persistent_cache = false;
-            if (likely_xiaomi_tws && resolved_readings.size() <= 1U) {
-                std::optional<std::uint64_t> classic_address = TryGetBluetoothAddress(ble_device);
-                if (!classic_address.has_value()) {
-                    classic_address = ParseBluetoothAddressFromDeviceId(device_id);
-                }
+            std::optional<std::uint64_t> resolved_address_for_fallback = TryGetBluetoothAddress(ble_device);
+            if (!resolved_address_for_fallback.has_value()) {
+                resolved_address_for_fallback = ParseBluetoothAddressFromDeviceId(device_id);
+            }
 
-                if (classic_address.has_value()) {
+            if (likely_xiaomi_tws && !HasUsefulXiaomiTwsReadings(resolved_readings)) {
+                if (resolved_address_for_fallback.has_value()) {
                     const auto& classic_result =
-                        read_xiaomi_classic_cached(*classic_address, aggressive_xiaomi_retry);
+                        read_xiaomi_classic_cached(*resolved_address_for_fallback,
+                                                   aggressive_xiaomi_retry,
+                                                   likely_zmi_family,
+                                                   2U);
                     if (!classic_result.readings.empty()) {
                         resolved_readings = classic_result.readings;
                         resolved_from_persistent_cache = classic_result.from_persistent_cache;
@@ -3024,6 +5176,46 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetConnectedDevicesBattery(
                     resolved_readings = vendor_triplet;
                     resolved_from_persistent_cache = false;
                     DebugLog("BLE vendor triplet fallback accepted for '" + device_name + "'");
+                }
+            }
+            if (likely_xiaomi_tws &&
+                !HasUsefulXiaomiTwsReadings(resolved_readings) &&
+                resolved_address_for_fallback.has_value()) {
+                const auto advertisement_readings =
+                    read_xiaomi_advertisement_cached(*resolved_address_for_fallback, device_name, likely_zmi_family);
+                if (advertisement_readings.size() >= 2U) {
+                    resolved_readings = advertisement_readings;
+                    resolved_from_persistent_cache = false;
+                    DebugLog("BLE advertisement fallback accepted for '" + device_name + "'");
+                }
+            }
+            if (likely_xiaomi_tws &&
+                !likely_zmi_family &&
+                !HasUsefulXiaomiTwsReadings(resolved_readings)) {
+                const auto late_standard_readings = ReadBatteryReadings(ble_device, likely_tws);
+                if (XiaomiReadingsRichnessScore(late_standard_readings) >
+                    XiaomiReadingsRichnessScore(resolved_readings)) {
+                    resolved_readings = late_standard_readings;
+                    resolved_from_persistent_cache = false;
+                    if (!resolved_readings.empty()) {
+                        DebugLog("BLE Xiaomi fallback: standard battery service yielded " +
+                                 std::to_string(resolved_readings.size()) +
+                                 " entries for '" + device_name + "'");
+                    }
+                }
+            }
+            if (likely_xiaomi_tws &&
+                !HasUsefulXiaomiTwsReadings(resolved_readings) &&
+                resolved_address_for_fallback.has_value()) {
+                const auto persistent_snapshot = GetPersistentXiaomiSnapshot(*resolved_address_for_fallback);
+                if (persistent_snapshot.has_value()) {
+                    auto persisted_readings = BuildXiaomiBatteryReadings(*persistent_snapshot);
+                    if (HasUsefulXiaomiTwsReadings(persisted_readings, 2U) &&
+                        XiaomiReadingsRichnessScore(persisted_readings) > XiaomiReadingsRichnessScore(resolved_readings)) {
+                        resolved_readings = std::move(persisted_readings);
+                        resolved_from_persistent_cache = true;
+                        DebugLog("BLE Xiaomi fallback: persisted TWS snapshot accepted for '" + device_name + "'");
+                    }
                 }
             }
 
@@ -3047,6 +5239,12 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetConnectedDevicesBattery(
                     try_add_entry(std::move(unknown_entry));
                 }
                 continue;
+            }
+            if (likely_xiaomi_tws &&
+                resolved_address_for_fallback.has_value() &&
+                !resolved_from_persistent_cache &&
+                HasUsefulXiaomiTwsReadings(resolved_readings, 2U)) {
+                PutPersistentXiaomiSnapshot(*resolved_address_for_fallback, SnapshotFromBatteryReadings(resolved_readings));
             }
 
             for (const auto& battery_reading : resolved_readings) {
@@ -3103,13 +5301,26 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetConnectedDevicesBattery(
             }
 
             const bool likely_xiaomi_tws = IsLikelyXiaomiEarbuds(candidate.endpoint_name, candidate.endpoint_name, candidate.endpoint_id);
+            const bool likely_zmi_family =
+                IsLikelyZmiPurPods(candidate.endpoint_name, candidate.endpoint_name, candidate.endpoint_id);
             const bool aggressive_xiaomi_retry =
                 candidate.from_connected_scan &&
                 ShouldAggressiveXiaomiClassicRetry(candidate.endpoint_name, candidate.endpoint_name, candidate.endpoint_id);
+            std::vector<BatteryReading> partial_classic_readings;
+            bool partial_classic_from_cache = false;
             if (likely_xiaomi_tws) {
                 const auto& classic_result =
-                    read_xiaomi_classic_cached(candidate.bluetooth_address, aggressive_xiaomi_retry);
+                    read_xiaomi_classic_cached(candidate.bluetooth_address,
+                                               aggressive_xiaomi_retry,
+                                               likely_zmi_family,
+                                               2U);
                 if (!classic_result.readings.empty()) {
+                    if (!HasUsefulXiaomiTwsReadings(classic_result.readings)) {
+                        partial_classic_readings = classic_result.readings;
+                        partial_classic_from_cache = classic_result.from_persistent_cache;
+                        DebugLog("AEP Xiaomi classic result is partial for '" + candidate.endpoint_name +
+                                 "', continue BLE/vendor fallbacks");
+                    } else {
                     const std::string device_id =
                         candidate.endpoint_id.empty() ? ("BluetoothAddress#" + std::to_string(candidate.bluetooth_address))
                                                       : candidate.endpoint_id;
@@ -3125,6 +5336,7 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetConnectedDevicesBattery(
                         try_add_entry(std::move(entry));
                     }
                     continue;
+                    }
                 }
             }
 
@@ -3142,6 +5354,72 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetConnectedDevicesBattery(
                     }
                 }
 
+                if (likely_xiaomi_tws) {
+                    const auto advertisement_readings =
+                        read_xiaomi_advertisement_cached(candidate.bluetooth_address,
+                                                         candidate.endpoint_name,
+                                                         likely_zmi_family);
+                    if (advertisement_readings.size() >= 2U) {
+                        PutPersistentXiaomiSnapshot(candidate.bluetooth_address,
+                                                    SnapshotFromBatteryReadings(advertisement_readings));
+                        const std::string device_id =
+                            candidate.endpoint_id.empty() ? ("BluetoothAddress#" + std::to_string(candidate.bluetooth_address))
+                                                          : candidate.endpoint_id;
+                        const std::string device_name = candidate.endpoint_name.empty() ? "Unknown" : candidate.endpoint_name;
+
+                        for (const auto& battery_reading : advertisement_readings) {
+                            DeviceBatteryInfo entry;
+                            entry.device_id = device_id;
+                            entry.device_name = device_name;
+                            entry.battery_component = battery_reading.component;
+                            entry.battery_level_percent = battery_reading.percent;
+                            try_add_entry(std::move(entry));
+                        }
+                        DebugLog("AEP advertisement fallback used without BLE open for '" + device_name + "'");
+                        continue;
+                    }
+                }
+
+                if (!partial_classic_readings.empty()) {
+                    const std::string device_id =
+                        candidate.endpoint_id.empty() ? ("BluetoothAddress#" + std::to_string(candidate.bluetooth_address))
+                                                      : candidate.endpoint_id;
+                    const std::string device_name = candidate.endpoint_name.empty() ? "Unknown" : candidate.endpoint_name;
+                    for (const auto& battery_reading : partial_classic_readings) {
+                        DeviceBatteryInfo entry;
+                        entry.device_id = device_id;
+                        entry.device_name = device_name;
+                        entry.battery_component = battery_reading.component;
+                        entry.battery_level_percent = battery_reading.percent;
+                        entry.is_cached = partial_classic_from_cache;
+                        try_add_entry(std::move(entry));
+                    }
+                    continue;
+                }
+                if (likely_xiaomi_tws) {
+                    const auto persistent_snapshot = GetPersistentXiaomiSnapshot(candidate.bluetooth_address);
+                    if (persistent_snapshot.has_value()) {
+                        auto persisted_readings = BuildXiaomiBatteryReadings(*persistent_snapshot);
+                        if (HasUsefulXiaomiTwsReadings(persisted_readings, 2U)) {
+                            const std::string device_id =
+                                candidate.endpoint_id.empty() ? ("BluetoothAddress#" + std::to_string(candidate.bluetooth_address))
+                                                              : candidate.endpoint_id;
+                            const std::string device_name = candidate.endpoint_name.empty() ? "Unknown" : candidate.endpoint_name;
+                            for (const auto& battery_reading : persisted_readings) {
+                                DeviceBatteryInfo entry;
+                                entry.device_id = device_id;
+                                entry.device_name = device_name;
+                                entry.battery_component = battery_reading.component;
+                                entry.battery_level_percent = battery_reading.percent;
+                                entry.is_cached = true;
+                                try_add_entry(std::move(entry));
+                            }
+                            DebugLog("AEP fallback: persisted TWS snapshot used for '" + device_name + "'");
+                            continue;
+                        }
+                    }
+                }
+
                 DeviceBatteryInfo unknown_entry;
                 unknown_entry.device_id =
                     candidate.endpoint_id.empty() ? ("BluetoothAddress#" + std::to_string(candidate.bluetooth_address))
@@ -3155,15 +5433,18 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetConnectedDevicesBattery(
             const auto ble_device = *maybe_ble_device;
 
             std::vector<BatteryReading> resolved_readings;
-            if (!likely_xiaomi_tws) {
+            if (!likely_xiaomi_tws || likely_zmi_family) {
                 resolved_readings = ReadBatteryReadings(ble_device, true);
             } else {
                 DebugLog("AEP candidate: Xiaomi-family TWS, skip standard battery service read");
             }
             bool resolved_from_persistent_cache = false;
-            if (likely_xiaomi_tws && resolved_readings.size() <= 1U) {
+            if (likely_xiaomi_tws && !HasUsefulXiaomiTwsReadings(resolved_readings)) {
                 const auto& classic_result =
-                    read_xiaomi_classic_cached(candidate.bluetooth_address, aggressive_xiaomi_retry);
+                    read_xiaomi_classic_cached(candidate.bluetooth_address,
+                                               aggressive_xiaomi_retry,
+                                               likely_zmi_family,
+                                               2U);
                 if (!classic_result.readings.empty()) {
                     resolved_readings = classic_result.readings;
                     resolved_from_persistent_cache = classic_result.from_persistent_cache;
@@ -3175,6 +5456,52 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetConnectedDevicesBattery(
                     resolved_readings = vendor_triplet;
                     resolved_from_persistent_cache = false;
                     DebugLog("AEP vendor triplet fallback accepted for '" + candidate.endpoint_name + "'");
+                }
+            }
+            if (likely_xiaomi_tws && !HasUsefulXiaomiTwsReadings(resolved_readings)) {
+                const auto advertisement_readings =
+                    read_xiaomi_advertisement_cached(candidate.bluetooth_address,
+                                                     candidate.endpoint_name,
+                                                     likely_zmi_family);
+                if (advertisement_readings.size() >= 2U) {
+                    resolved_readings = advertisement_readings;
+                    resolved_from_persistent_cache = false;
+                    DebugLog("AEP advertisement fallback accepted for '" + candidate.endpoint_name + "'");
+                }
+            }
+            if (likely_xiaomi_tws &&
+                !HasUsefulXiaomiTwsReadings(resolved_readings) &&
+                !partial_classic_readings.empty() &&
+                XiaomiReadingsRichnessScore(partial_classic_readings) > XiaomiReadingsRichnessScore(resolved_readings)) {
+                resolved_readings = partial_classic_readings;
+                resolved_from_persistent_cache = partial_classic_from_cache;
+            }
+            if (likely_xiaomi_tws &&
+                !likely_zmi_family &&
+                !HasUsefulXiaomiTwsReadings(resolved_readings)) {
+                const auto late_standard_readings = ReadBatteryReadings(ble_device, true);
+                if (XiaomiReadingsRichnessScore(late_standard_readings) >
+                    XiaomiReadingsRichnessScore(resolved_readings)) {
+                    resolved_readings = late_standard_readings;
+                    resolved_from_persistent_cache = false;
+                    if (!resolved_readings.empty()) {
+                        DebugLog("AEP Xiaomi fallback: standard battery service yielded " +
+                                 std::to_string(resolved_readings.size()) +
+                                 " entries for '" + candidate.endpoint_name + "'");
+                    }
+                }
+            }
+            if (likely_xiaomi_tws && !HasUsefulXiaomiTwsReadings(resolved_readings)) {
+                const auto persistent_snapshot = GetPersistentXiaomiSnapshot(candidate.bluetooth_address);
+                if (persistent_snapshot.has_value()) {
+                    auto persisted_readings = BuildXiaomiBatteryReadings(*persistent_snapshot);
+                    if (HasUsefulXiaomiTwsReadings(persisted_readings, 2U) &&
+                        XiaomiReadingsRichnessScore(persisted_readings) > XiaomiReadingsRichnessScore(resolved_readings)) {
+                        resolved_readings = std::move(persisted_readings);
+                        resolved_from_persistent_cache = true;
+                        DebugLog("AEP Xiaomi fallback: persisted TWS snapshot accepted for '" +
+                                 candidate.endpoint_name + "'");
+                    }
                 }
             }
             if (resolved_readings.empty()) {
@@ -3197,6 +5524,11 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetConnectedDevicesBattery(
                 unknown_entry.battery_level_percent = std::nullopt;
                 try_add_entry(std::move(unknown_entry));
                 continue;
+            }
+            if (likely_xiaomi_tws &&
+                !resolved_from_persistent_cache &&
+                HasUsefulXiaomiTwsReadings(resolved_readings, 2U)) {
+                PutPersistentXiaomiSnapshot(candidate.bluetooth_address, SnapshotFromBatteryReadings(resolved_readings));
             }
 
             std::string device_name = candidate.endpoint_name;
@@ -3248,6 +5580,8 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetConnectedDevicesBattery(
     std::unordered_set<std::string> devices_with_live_battery;
     std::unordered_set<std::uint64_t> addresses_with_live_battery;
     std::unordered_set<std::uint64_t> addresses_with_any_real_battery;
+    std::unordered_set<std::string> devices_with_tws_components;
+    std::unordered_set<std::uint64_t> addresses_with_tws_components;
     for (const auto& entry : devices_with_battery) {
         if (entry.battery_level_percent.has_value()) {
             devices_with_real_battery.insert(entry.device_id);
@@ -3262,6 +5596,18 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetConnectedDevicesBattery(
                 }
             }
         }
+
+        if (entry.battery_level_percent.has_value()) {
+            const std::string component = ToLowerAscii(entry.battery_component);
+            if (component == "left" || component == "right" || component == "case") {
+                const auto parsed_address = ParseBluetoothAddressFromDeviceId(entry.device_id);
+                if (parsed_address.has_value()) {
+                    addresses_with_tws_components.insert(*parsed_address);
+                } else {
+                    devices_with_tws_components.insert(entry.device_id);
+                }
+            }
+        }
     }
 
     std::vector<DeviceBatteryInfo> filtered_entries;
@@ -3269,6 +5615,13 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetConnectedDevicesBattery(
     std::unordered_set<std::string> final_dedup;
     for (auto& entry : devices_with_battery) {
         const auto parsed_address = ParseBluetoothAddressFromDeviceId(entry.device_id);
+        const std::string normalized_component = ToLowerAscii(entry.battery_component);
+
+        if (normalized_component == "main" &&
+            (devices_with_tws_components.contains(entry.device_id) ||
+             (parsed_address.has_value() && addresses_with_tws_components.contains(*parsed_address)))) {
+            continue;
+        }
 
         if (!entry.battery_level_percent.has_value() &&
             (devices_with_real_battery.contains(entry.device_id) ||
@@ -3289,7 +5642,13 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetConnectedDevicesBattery(
                 key = "unknown|" + entry.device_id + "|" + entry.battery_component;
             }
         } else {
-            key = MakeEntryKey(entry);
+            if (parsed_address.has_value()) {
+                key = "resolved|" + std::to_string(*parsed_address) + "|" + entry.battery_component +
+                      "|" + (entry.is_cached ? "cached" : "live");
+            } else {
+                key = "resolved|" + entry.device_id + "|" + entry.battery_component +
+                      "|" + (entry.is_cached ? "cached" : "live");
+            }
         }
         if (!final_dedup.insert(key).second) {
             continue;
