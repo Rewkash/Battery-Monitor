@@ -34,3 +34,21 @@
 # VS Code/Cursor local transient files
 /.cursor/
 /.vscode/
+
+# Runtime/debug artifacts
+*.log
+*.tmp
+*.dmp
+tmp_*.log
+poco-debug*.log
+zmi-debug.log
+
+# Patch/merge leftovers
+*.bak
+*.orig
+*.rej
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+Desktop.ini
