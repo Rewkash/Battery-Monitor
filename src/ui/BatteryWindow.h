@@ -53,6 +53,7 @@ class BatteryWindow : public QWidget {
     void UpdateToggleActionText();
     void UpdateTrayTooltip(const std::vector<DeviceBatteryInfo>& devices);
     void AdjustWindowHeightForRows(int visible_rows);
+    void SetDeviceDragActive(bool active);
     static std::string FormatError(const std::exception& ex);
 
     std::unique_ptr<IBluetoothBatteryProvider> provider_;
@@ -72,9 +73,13 @@ class BatteryWindow : public QWidget {
     QTimer* refresh_timer_ = nullptr;
     std::unordered_set<std::string> hidden_device_ids_;
     std::unordered_map<std::string, QDateTime> last_live_update_;
+    std::vector<std::string> connected_device_order_;
+    std::vector<std::string> disconnected_device_order_;
+    std::vector<DeviceBatteryInfo> last_devices_snapshot_;
     std::thread refresh_worker_;
     std::atomic<bool> refresh_in_progress_{false};
     bool refresh_pending_ = false;
+    bool drag_in_progress_ = false;
     bool quitting_ = false;
 };
 

@@ -71,6 +71,9 @@ void PrintTable(const std::vector<DeviceBatteryInfo>& devices) {
         if (device.is_cached && device.battery_level_percent.has_value()) {
             battery_text += " (cached)";
         }
+        if (!device.is_connected) {
+            battery_text += " (offline)";
+        }
         std::cout << device.device_name << " | " << device.battery_component << " | "
                   << battery_text << " | " << device.device_id << '\n';
     }
@@ -86,7 +89,8 @@ void PrintJson(const std::vector<DeviceBatteryInfo>& devices) {
                   << "\"deviceName\":\"" << EscapeJson(device.device_name) << "\","
                   << "\"component\":\"" << EscapeJson(device.battery_component) << "\","
                   << "\"batteryLevelPercent\":" << battery_json << ","
-                  << "\"isCached\":" << (device.is_cached ? "true" : "false") << "}";
+                  << "\"isCached\":" << (device.is_cached ? "true" : "false") << ","
+                  << "\"isConnected\":" << (device.is_connected ? "true" : "false") << "}";
         if (i + 1 < devices.size()) {
             std::cout << ",";
         }
@@ -103,6 +107,7 @@ int main(int argc, char** argv) {
     bool json_output = false;
     bool cli_output = false;
     bool gui_forced = false;
+    bool include_offline = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--json") {
@@ -115,6 +120,10 @@ int main(int argc, char** argv) {
         }
         if (arg == "--gui") {
             gui_forced = true;
+            continue;
+        }
+        if (arg == "--all" || arg == "--include-offline") {
+            include_offline = true;
         }
     }
 
@@ -129,7 +138,9 @@ int main(int argc, char** argv) {
         }
 #endif
         auto provider = battery_monitor::CreateBatteryProvider();
-        const auto devices = provider->GetConnectedDevicesBattery();
+        battery_monitor::BatteryQueryOptions query_options;
+        query_options.include_disconnected = include_offline;
+        const auto devices = provider->GetDevicesBattery(query_options);
 
         if (json_output) {
             battery_monitor::PrintJson(devices);

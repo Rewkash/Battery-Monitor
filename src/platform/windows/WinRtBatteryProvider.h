@@ -6,8 +6,7 @@ namespace battery_monitor {
 
 class WinRtBatteryProvider final : public IBluetoothBatteryProvider {
    public:
-    std::vector<DeviceBatteryInfo> GetConnectedDevicesBattery() override;
+    std::vector<DeviceBatteryInfo> GetDevicesBattery(const BatteryQueryOptions& options) override;
 };
 
 }  // namespace battery_monitor
-

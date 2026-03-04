@@ -4,10 +4,12 @@
 #include <cctype>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -15,13 +17,19 @@
 #include <QApplication>
 #include <QCloseEvent>
 #include <QCursor>
+#include <QDataStream>
 #include <QDateTime>
+#include <QDrag>
+#include <QDragEnterEvent>
+#include <QDropEvent>
 #include <QFrame>
 #include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMetaObject>
 #include <QMenu>
+#include <QMimeData>
+#include <QMouseEvent>
 #include <QPaintEvent>
 #include <QPainter>
 #include <QPainterPath>
@@ -29,6 +37,7 @@
 #include <QPushButton>
 #include <QScrollArea>
 #include <QScreen>
+#include <QSettings>
 #include <QSizePolicy>
 #include <QStyle>
 #include <QSystemTrayIcon>
@@ -49,12 +58,14 @@ struct ComponentEntry {
     std::string component;
     std::optional<std::uint8_t> battery_level_percent;
     bool is_cached = false;
+    bool is_connected = true;
 };
 
 struct DeviceEntry {
     std::string device_id;
     std::string device_name;
     std::vector<ComponentEntry> components;
+    bool is_connected = false;
 };
 
 struct PrimaryBattery {
@@ -81,6 +92,242 @@ constexpr int kCollapsedRowHeight = 88;
 constexpr int kListPadding = 12;
 constexpr int kListSpacing = 10;
 constexpr int kListHeightSlack = 28;
+constexpr const char* kDeviceRowMimeType = "application/x-chargeview-device-row";
+constexpr const char* kSettingsGroupUi = "ui";
+constexpr const char* kSettingsConnectedOrderKey = "connected_order";
+constexpr const char* kSettingsDisconnectedOrderKey = "disconnected_order";
+
+QSettings CreateUiSettings() {
+    return QSettings(QSettings::IniFormat, QSettings::UserScope, QStringLiteral("BatteryMonitor"),
+                     QStringLiteral("BatteryMonitor"));
+}
+
+std::vector<std::string> ReadOrderFromSettings(QSettings* settings, const char* key) {
+    if (settings == nullptr || key == nullptr) {
+        return {};
+    }
+
+    const QStringList saved_values = settings->value(QString::fromLatin1(key)).toStringList();
+    std::vector<std::string> order;
+    order.reserve(static_cast<std::size_t>(saved_values.size()));
+    std::unordered_set<std::string> seen;
+    for (const auto& value : saved_values) {
+        const std::string device_id = value.toUtf8().toStdString();
+        if (device_id.empty() || !seen.emplace(device_id).second) {
+            continue;
+        }
+        order.push_back(device_id);
+    }
+    return order;
+}
+
+void WriteOrderToSettings(QSettings* settings, const char* key, const std::vector<std::string>& order) {
+    if (settings == nullptr || key == nullptr) {
+        return;
+    }
+
+    QStringList values;
+    values.reserve(static_cast<qsizetype>(order.size()));
+    for (const auto& device_id : order) {
+        if (device_id.empty()) {
+            continue;
+        }
+        values.push_back(QString::fromUtf8(device_id.c_str()));
+    }
+    settings->setValue(QString::fromLatin1(key), values);
+}
+
+void LoadPersistedDeviceOrder(std::vector<std::string>* connected_order,
+                              std::vector<std::string>* disconnected_order) {
+    QSettings settings = CreateUiSettings();
+    settings.beginGroup(QString::fromLatin1(kSettingsGroupUi));
+    if (connected_order != nullptr) {
+        *connected_order = ReadOrderFromSettings(&settings, kSettingsConnectedOrderKey);
+    }
+    if (disconnected_order != nullptr) {
+        *disconnected_order = ReadOrderFromSettings(&settings, kSettingsDisconnectedOrderKey);
+    }
+    settings.endGroup();
+}
+
+void SavePersistedDeviceOrder(const std::vector<std::string>& connected_order,
+                              const std::vector<std::string>& disconnected_order) {
+    QSettings settings = CreateUiSettings();
+    settings.beginGroup(QString::fromLatin1(kSettingsGroupUi));
+    WriteOrderToSettings(&settings, kSettingsConnectedOrderKey, connected_order);
+    WriteOrderToSettings(&settings, kSettingsDisconnectedOrderKey, disconnected_order);
+    settings.endGroup();
+    settings.sync();
+}
+
+class DraggableDeviceRow final : public QFrame {
+   public:
+    using ReorderCallback = std::function<void(const std::string& dragged_device_id,
+                                               const std::string& target_device_id,
+                                               bool connected_queue,
+                                               bool insert_before_target)>;
+    using DragStateCallback = std::function<void(bool active)>;
+
+    DraggableDeviceRow(std::string device_id, bool is_connected, QWidget* parent = nullptr)
+        : QFrame(parent), device_id_(std::move(device_id)), is_connected_(is_connected) {
+        setAcceptDrops(true);
+        setCursor(Qt::OpenHandCursor);
+        setProperty("dragOver", false);
+    }
+
+    void SetReorderCallback(ReorderCallback callback) {
+        reorder_callback_ = std::move(callback);
+    }
+
+    void SetDragStateCallback(DragStateCallback callback) {
+        drag_state_callback_ = std::move(callback);
+    }
+
+   protected:
+    void mousePressEvent(QMouseEvent* event) override {
+        if (event != nullptr && event->button() == Qt::LeftButton) {
+            drag_start_pos_ = event->position().toPoint();
+            setCursor(Qt::ClosedHandCursor);
+        }
+        QFrame::mousePressEvent(event);
+    }
+
+    void mouseMoveEvent(QMouseEvent* event) override {
+        if (event == nullptr || !(event->buttons() & Qt::LeftButton)) {
+            QFrame::mouseMoveEvent(event);
+            return;
+        }
+        if ((event->position().toPoint() - drag_start_pos_).manhattanLength() < QApplication::startDragDistance()) {
+            QFrame::mouseMoveEvent(event);
+            return;
+        }
+
+        StartDrag();
+        event->accept();
+    }
+
+    void mouseReleaseEvent(QMouseEvent* event) override {
+        setCursor(Qt::OpenHandCursor);
+        QFrame::mouseReleaseEvent(event);
+    }
+
+    void dragEnterEvent(QDragEnterEvent* event) override {
+        if (CanAccept(event != nullptr ? event->mimeData() : nullptr)) {
+            event->acceptProposedAction();
+            SetDragOver(true);
+            return;
+        }
+        if (event != nullptr) {
+            event->ignore();
+        }
+    }
+
+    void dragMoveEvent(QDragMoveEvent* event) override {
+        if (CanAccept(event != nullptr ? event->mimeData() : nullptr)) {
+            event->acceptProposedAction();
+            return;
+        }
+        if (event != nullptr) {
+            event->ignore();
+        }
+    }
+
+    void dragLeaveEvent(QDragLeaveEvent* event) override {
+        Q_UNUSED(event);
+        SetDragOver(false);
+    }
+
+    void dropEvent(QDropEvent* event) override {
+        std::string dragged_device_id;
+        bool dragged_connected = false;
+        if (event == nullptr ||
+            !DecodePayload(event->mimeData(), &dragged_device_id, &dragged_connected) ||
+            dragged_device_id == device_id_ || dragged_connected != is_connected_) {
+            if (event != nullptr) {
+                event->ignore();
+            }
+            SetDragOver(false);
+            return;
+        }
+
+        SetDragOver(false);
+        const bool insert_before_target = event->position().y() < (static_cast<double>(height()) / 2.0);
+        if (reorder_callback_) {
+            reorder_callback_(dragged_device_id, device_id_, is_connected_, insert_before_target);
+        }
+        event->acceptProposedAction();
+    }
+
+   private:
+    static QByteArray BuildPayload(const std::string& device_id, bool is_connected) {
+        QByteArray payload;
+        QDataStream stream(&payload, QIODevice::WriteOnly);
+        stream << QString::fromUtf8(device_id.c_str()) << is_connected;
+        return payload;
+    }
+
+    static bool DecodePayload(const QMimeData* mime_data, std::string* device_id, bool* is_connected) {
+        if (mime_data == nullptr || device_id == nullptr || is_connected == nullptr ||
+            !mime_data->hasFormat(kDeviceRowMimeType)) {
+            return false;
+        }
+
+        QByteArray payload = mime_data->data(kDeviceRowMimeType);
+        QDataStream stream(&payload, QIODevice::ReadOnly);
+        QString decoded_id;
+        bool decoded_connected = false;
+        stream >> decoded_id >> decoded_connected;
+        if (stream.status() != QDataStream::Ok || decoded_id.isEmpty()) {
+            return false;
+        }
+
+        *device_id = decoded_id.toUtf8().toStdString();
+        *is_connected = decoded_connected;
+        return true;
+    }
+
+    bool CanAccept(const QMimeData* mime_data) const {
+        std::string dragged_device_id;
+        bool dragged_connected = false;
+        return DecodePayload(mime_data, &dragged_device_id, &dragged_connected) &&
+               dragged_connected == is_connected_ &&
+               dragged_device_id != device_id_;
+    }
+
+    void SetDragOver(bool enabled) {
+        if (property("dragOver").toBool() == enabled) {
+            return;
+        }
+        setProperty("dragOver", enabled);
+        if (auto* widget_style = style(); widget_style != nullptr) {
+            widget_style->unpolish(this);
+            widget_style->polish(this);
+        }
+        update();
+    }
+
+    void StartDrag() {
+        auto* drag = new QDrag(this);
+        auto* mime_data = new QMimeData();
+        mime_data->setData(kDeviceRowMimeType, BuildPayload(device_id_, is_connected_));
+        drag->setMimeData(mime_data);
+        drag->setHotSpot(rect().center());
+        if (drag_state_callback_) {
+            drag_state_callback_(true);
+        }
+        drag->exec(Qt::MoveAction);
+        if (drag_state_callback_) {
+            drag_state_callback_(false);
+        }
+        setCursor(Qt::OpenHandCursor);
+    }
+
+    std::string device_id_;
+    bool is_connected_ = false;
+    QPoint drag_start_pos_;
+    ReorderCallback reorder_callback_;
+    DragStateCallback drag_state_callback_;
+};
 
 QString ToQString(const std::string& value) {
     return QString::fromUtf8(value.c_str());
@@ -97,6 +344,13 @@ std::string NormalizeComponentName(const std::string& component) {
         return "main";
     }
     return ToLowerAscii(component);
+}
+
+bool IsDisconnectedEarbudLevel(const std::string& component, const std::optional<std::uint8_t>& level) {
+    if (!level.has_value()) {
+        return false;
+    }
+    return (component == "left" || component == "right") && *level == 0;
 }
 
 int ComponentRank(const std::string& component) {
@@ -141,14 +395,51 @@ bool HasLiveData(const DeviceEntry& device) {
     });
 }
 
+bool IsDeviceConnected(const DeviceEntry& device) {
+    return device.is_connected;
+}
+
 bool HasAnyData(const DeviceEntry& device) {
     return std::any_of(device.components.begin(), device.components.end(), [](const ComponentEntry& component) {
         return component.battery_level_percent.has_value();
     });
 }
 
+PrimaryBattery ComputeAveragePrimary(const std::vector<const ComponentEntry*>& components) {
+    PrimaryBattery result;
+    if (components.empty()) {
+        return result;
+    }
+
+    int sum = 0;
+    bool all_cached = true;
+    for (const auto* component : components) {
+        sum += static_cast<int>(*component->battery_level_percent);
+        all_cached = all_cached && component->is_cached;
+    }
+
+    const int rounded_average = (sum + static_cast<int>(components.size()) / 2) /
+                                static_cast<int>(components.size());
+    result.level = static_cast<std::uint8_t>(std::clamp(rounded_average, 0, 100));
+    result.cached = all_cached;
+    return result;
+}
+
 PrimaryBattery ComputePrimaryBattery(const DeviceEntry& device) {
     PrimaryBattery result;
+
+    const auto* left = FindComponent(device, "left");
+    const auto* right = FindComponent(device, "right");
+    const auto* case_level = FindComponent(device, "case");
+
+    const bool has_left = left != nullptr && left->battery_level_percent.has_value();
+    const bool has_right = right != nullptr && right->battery_level_percent.has_value();
+    const bool has_case = case_level != nullptr && case_level->battery_level_percent.has_value();
+
+    // For TWS, primary level should represent earbuds. Ignore case when both earbuds are available.
+    if (has_left && has_right) {
+        return ComputeAveragePrimary({left, right});
+    }
 
     if (const auto* main = FindComponent(device, "main"); main != nullptr && main->battery_level_percent.has_value()) {
         result.level = main->battery_level_percent;
@@ -156,14 +447,25 @@ PrimaryBattery ComputePrimaryBattery(const DeviceEntry& device) {
         return result;
     }
 
-    std::vector<const ComponentEntry*> candidates;
-    for (const char* name : {"left", "right", "case"}) {
-        const auto* component = FindComponent(device, name);
-        if (component != nullptr && component->battery_level_percent.has_value()) {
-            candidates.push_back(component);
-        }
+    if (has_left) {
+        result.level = left->battery_level_percent;
+        result.cached = left->is_cached;
+        return result;
     }
 
+    if (has_right) {
+        result.level = right->battery_level_percent;
+        result.cached = right->is_cached;
+        return result;
+    }
+
+    if (has_case) {
+        result.level = case_level->battery_level_percent;
+        result.cached = case_level->is_cached;
+        return result;
+    }
+
+    std::vector<const ComponentEntry*> candidates;
     if (candidates.empty()) {
         for (const auto& component : device.components) {
             if (component.battery_level_percent.has_value()) {
@@ -176,18 +478,7 @@ PrimaryBattery ComputePrimaryBattery(const DeviceEntry& device) {
         return result;
     }
 
-    int sum = 0;
-    bool all_cached = true;
-    for (const auto* candidate : candidates) {
-        sum += static_cast<int>(*candidate->battery_level_percent);
-        all_cached = all_cached && candidate->is_cached;
-    }
-
-    const int rounded_average = (sum + static_cast<int>(candidates.size()) / 2) /
-                                static_cast<int>(candidates.size());
-    result.level = static_cast<std::uint8_t>(std::clamp(rounded_average, 0, 100));
-    result.cached = all_cached;
-    return result;
+    return ComputeAveragePrimary(candidates);
 }
 
 QString FormatOptionalPercent(const std::optional<std::uint8_t>& value) {
@@ -297,6 +588,15 @@ QString RelativeTimeText(const QDateTime& from_time, const QDateTime& to_time) {
 QString DeviceStatusText(const DeviceEntry& device,
                          const std::unordered_map<std::string, QDateTime>& last_live_update,
                          const QDateTime& now) {
+    if (!IsDeviceConnected(device)) {
+        const auto it = last_live_update.find(device.device_id);
+        if (it != last_live_update.end()) {
+            return QString::fromUtf8(u8"\u041D\u0435 \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u043E \u00B7 ") +
+                   RelativeTimeText(it->second, now);
+        }
+        return QString::fromUtf8(u8"\u041D\u0435 \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u043E");
+    }
+
     if (HasLiveData(device)) {
         const auto it = last_live_update.find(device.device_id);
         if (it != last_live_update.end()) {
@@ -309,14 +609,17 @@ QString DeviceStatusText(const DeviceEntry& device,
     if (HasAnyData(device)) {
         const auto it = last_live_update.find(device.device_id);
         if (it != last_live_update.end()) {
-            return RelativeTimeText(it->second, now) +
+            return QString::fromUtf8(u8"\u041F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u043E \u00B7 ") +
+                   RelativeTimeText(it->second, now) +
                    QString::fromUtf8(u8" (\u043A\u044D\u0448)");
         }
-        return QString::fromUtf8(u8"\u041A\u044D\u0448\u0438\u0440\u043E\u0432\u0430\u043D\u043D\u043E\u0435 "
+        return QString::fromUtf8(u8"\u041F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u043E \u00B7 "
+                                 u8"\u041A\u044D\u0448\u0438\u0440\u043E\u0432\u0430\u043D\u043D\u043E\u0435 "
                                  u8"\u0437\u043D\u0430\u0447\u0435\u043D\u0438\u0435");
     }
 
-    return QString::fromUtf8(u8"\u041D\u0435\u0442 \u0434\u0430\u043D\u043D\u044B\u0445 \u043E "
+    return QString::fromUtf8(u8"\u041F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u043E \u00B7 "
+                             u8"\u041D\u0435\u0442 \u0434\u0430\u043D\u043D\u044B\u0445 \u043E "
                              u8"\u0437\u0430\u0440\u044F\u0434\u0435");
 }
 
@@ -377,18 +680,24 @@ std::vector<DeviceEntry> GroupDevices(const std::vector<DeviceBatteryInfo>& devi
             DeviceEntry device;
             device.device_id = device_id;
             device.device_name = device_name;
+            device.is_connected = item.is_connected;
             grouped.push_back(std::move(device));
         } else {
             index = found->second;
             if (grouped[index].device_name == "Unknown device" && device_name != "Unknown device") {
                 grouped[index].device_name = device_name;
             }
+            grouped[index].is_connected = grouped[index].is_connected || item.is_connected;
         }
 
         ComponentEntry incoming;
         incoming.component = NormalizeComponentName(item.battery_component);
         incoming.battery_level_percent = item.battery_level_percent;
         incoming.is_cached = item.is_cached;
+        incoming.is_connected = item.is_connected;
+        if (IsDisconnectedEarbudLevel(incoming.component, incoming.battery_level_percent)) {
+            incoming.battery_level_percent = std::nullopt;
+        }
 
         auto& target = grouped[index].components;
         const auto existing = std::find_if(target.begin(), target.end(), [&incoming](const ComponentEntry& current) {
@@ -415,6 +724,12 @@ std::vector<DeviceEntry> GroupDevices(const std::vector<DeviceBatteryInfo>& devi
     }
 
     std::sort(grouped.begin(), grouped.end(), [](const DeviceEntry& lhs, const DeviceEntry& rhs) {
+        const bool lhs_active = IsDeviceConnected(lhs);
+        const bool rhs_active = IsDeviceConnected(rhs);
+        if (lhs_active != rhs_active) {
+            return lhs_active > rhs_active;
+        }
+
         const auto lhs_name = ToLowerAscii(lhs.device_name);
         const auto rhs_name = ToLowerAscii(rhs.device_name);
         if (lhs_name != rhs_name) {
@@ -424,6 +739,107 @@ std::vector<DeviceEntry> GroupDevices(const std::vector<DeviceBatteryInfo>& devi
     });
 
     return grouped;
+}
+
+void SyncOrderQueue(const std::vector<DeviceEntry>& grouped, bool connected_queue, std::vector<std::string>* order) {
+    if (order == nullptr) {
+        return;
+    }
+
+    std::unordered_set<std::string> present_ids;
+    for (const auto& device : grouped) {
+        if (device.is_connected == connected_queue) {
+            present_ids.insert(device.device_id);
+        }
+    }
+
+    order->erase(std::remove_if(order->begin(), order->end(),
+                                [&present_ids](const std::string& device_id) {
+                                    return !present_ids.contains(device_id);
+                                }),
+                 order->end());
+
+    std::unordered_set<std::string> ordered_ids(order->begin(), order->end());
+    for (const auto& device : grouped) {
+        if (device.is_connected == connected_queue && !ordered_ids.contains(device.device_id)) {
+            order->push_back(device.device_id);
+            ordered_ids.insert(device.device_id);
+        }
+    }
+}
+
+std::vector<DeviceEntry> ApplyCustomOrder(const std::vector<DeviceEntry>& grouped,
+                                          const std::vector<std::string>& connected_order,
+                                          const std::vector<std::string>& disconnected_order) {
+    std::vector<DeviceEntry> ordered;
+    ordered.reserve(grouped.size());
+
+    std::unordered_map<std::string, const DeviceEntry*> by_id;
+    by_id.reserve(grouped.size());
+    for (const auto& device : grouped) {
+        by_id.emplace(device.device_id, &device);
+    }
+
+    std::unordered_set<std::string> emitted;
+    emitted.reserve(grouped.size());
+
+    auto append_queue = [&](const std::vector<std::string>& queue, bool connected_queue) {
+        for (const auto& device_id : queue) {
+            const auto it = by_id.find(device_id);
+            if (it == by_id.end()) {
+                continue;
+            }
+            const DeviceEntry* device = it->second;
+            if (device == nullptr || device->is_connected != connected_queue || emitted.contains(device->device_id)) {
+                continue;
+            }
+            ordered.push_back(*device);
+            emitted.insert(device->device_id);
+        }
+    };
+
+    append_queue(connected_order, true);
+    append_queue(disconnected_order, false);
+
+    for (const auto& device : grouped) {
+        if (emitted.contains(device.device_id)) {
+            continue;
+        }
+        ordered.push_back(device);
+        emitted.insert(device.device_id);
+    }
+
+    return ordered;
+}
+
+bool ReorderQueueItems(std::vector<std::string>* order,
+                       const std::string& dragged_device_id,
+                       const std::string& target_device_id,
+                       bool insert_before_target) {
+    if (order == nullptr || dragged_device_id.empty() || target_device_id.empty() ||
+        dragged_device_id == target_device_id) {
+        return false;
+    }
+
+    const auto dragged_it = std::find(order->begin(), order->end(), dragged_device_id);
+    const auto target_it = std::find(order->begin(), order->end(), target_device_id);
+    if (dragged_it == order->end() || target_it == order->end()) {
+        return false;
+    }
+
+    const auto dragged_index = static_cast<std::ptrdiff_t>(std::distance(order->begin(), dragged_it));
+    const auto target_index = static_cast<std::ptrdiff_t>(std::distance(order->begin(), target_it));
+    const auto requested_index = insert_before_target ? target_index : target_index + 1;
+    const auto normalized_index = (dragged_index < requested_index) ? requested_index - 1 : requested_index;
+    if (dragged_index == normalized_index) {
+        return false;
+    }
+
+    const std::string moved_id = *dragged_it;
+    order->erase(dragged_it);
+    const auto insert_position = order->begin() + normalized_index;
+    order->insert(insert_position, moved_id);
+    return true;
 }
 
 #ifdef _WIN32
@@ -490,8 +906,15 @@ QFrame#deviceRow {
     border: 1px solid rgba(255, 255, 255, 0.09);
     border-radius: 14px;
 }
+QFrame#deviceRow[activeState="inactive"] {
+    background: #32363D;
+    border-color: rgba(255, 255, 255, 0.06);
+}
 QFrame#deviceRow:hover {
     border-color: rgba(255, 255, 255, 0.16);
+}
+QFrame#deviceRow[dragOver="true"] {
+    border-color: rgba(116, 190, 255, 0.85);
 }
 QLabel#deviceIcon {
     background: #2B2F36;
@@ -506,10 +929,16 @@ QLabel#deviceName {
     font-size: 15px;
     font-weight: 600;
 }
+QLabel#deviceName[activeState="inactive"] {
+    color: #C5CCD8;
+}
 QLabel#technicalMeta {
     color: #8892A2;
     font-size: 11px;
     font-weight: 400;
+}
+QLabel#technicalMeta[activeState="inactive"] {
+    color: #7F8795;
 }
 QLabel#percentChip {
     background: #2A2F37;
@@ -524,6 +953,11 @@ QLabel#percentChip[levelState="low"] {
     background: #41242A;
     border-color: #8E404A;
     color: #FFD0D5;
+}
+QLabel#percentChip[activeState="inactive"] {
+    background: #262B33;
+    border-color: rgba(255, 255, 255, 0.10);
+    color: #B7BFCD;
 }
 QProgressBar#deviceProgress {
     background: #171A20;
@@ -546,6 +980,12 @@ QProgressBar#deviceProgress[levelState="low"]::chunk {
     background: #E06767;
 }
 QProgressBar#deviceProgress[levelState="na"]::chunk {
+    background: #5F6876;
+}
+QProgressBar#deviceProgress[activeState="inactive"] {
+    border-color: rgba(255, 255, 255, 0.05);
+}
+QProgressBar#deviceProgress[activeState="inactive"]::chunk {
     background: #5F6876;
 }
 QToolButton#inlineMenuButton {
@@ -649,6 +1089,8 @@ QWidget#listContainer {
     refresh_timer_->setInterval(15000);
     connect(refresh_timer_, &QTimer::timeout, this, [this]() { RefreshBatteryData(); });
     refresh_timer_->start();
+
+    LoadPersistedDeviceOrder(&connected_device_order_, &disconnected_device_order_);
 
     AdjustWindowHeightForRows(kMaxVisibleRows);
     InitializeTray();
@@ -838,12 +1280,13 @@ void BatteryWindow::UpdateTrayTooltip(const std::vector<DeviceBatteryInfo>& devi
     }
 
     const auto grouped = GroupDevices(devices, hidden_device_ids_);
+    const auto ordered = ApplyCustomOrder(grouped, connected_device_order_, disconnected_device_order_);
     QString tooltip = QString::fromUtf8(u8"ChargeView\n"
                                        u8"\u0423\u0441\u0442\u0440\u043E\u0439\u0441\u0442\u0432: %1")
-                          .arg(grouped.size());
+                          .arg(ordered.size());
 
     int shown = 0;
-    for (const auto& device : grouped) {
+    for (const auto& device : ordered) {
         if (shown >= 4) {
             break;
         }
@@ -894,7 +1337,31 @@ void BatteryWindow::AdjustWindowHeightForRows(int visible_rows) {
     setFixedHeight(layout()->sizeHint().height());
 }
 
+void BatteryWindow::SetDeviceDragActive(bool active) {
+    if (drag_in_progress_ == active) {
+        return;
+    }
+
+    drag_in_progress_ = active;
+    if (drag_in_progress_) {
+        return;
+    }
+
+    if (refresh_pending_ && !refresh_in_progress_.load(std::memory_order_acquire)) {
+        refresh_pending_ = false;
+        QMetaObject::invokeMethod(this, [this]() { RefreshBatteryData(); }, Qt::QueuedConnection);
+    }
+}
+
 void BatteryWindow::RefreshBatteryData() {
+    if (drag_in_progress_) {
+        refresh_pending_ = true;
+        status_label_->setText(QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435 "
+                                                 u8"\u043E\u0442\u043B\u043E\u0436\u0435\u043D\u043E: "
+                                                 u8"\u0438\u0434\u0451\u0442 \u043F\u0435\u0440\u0435\u0442\u0430\u0441\u043A\u0438\u0432\u0430\u043D\u0438\u0435"));
+        return;
+    }
+
     if (refresh_in_progress_.load(std::memory_order_acquire)) {
         refresh_pending_ = true;
         status_label_->setText(QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435..."));
@@ -913,7 +1380,9 @@ void BatteryWindow::RefreshBatteryData() {
     refresh_worker_ = std::thread([this]() {
         RefreshTaskResult result;
         try {
-            result.devices = provider_->GetConnectedDevicesBattery();
+            BatteryQueryOptions query_options;
+            query_options.include_disconnected = true;
+            result.devices = provider_->GetDevicesBattery(query_options);
 #ifdef _WIN32
         } catch (const winrt::hresult_error& error) {
             result.error_text = QString::fromUtf8(u8"\u041E\u0448\u0438\u0431\u043A\u0430: %1").arg(FormatWinRtError(error));
@@ -934,7 +1403,20 @@ void BatteryWindow::RefreshBatteryData() {
                     return;
                 }
 
+                if (drag_in_progress_) {
+                    refresh_button_->setEnabled(true);
+                    show_all_button_->setEnabled(!hidden_device_ids_.empty());
+                    UpdateToggleActionText();
+                    refresh_pending_ = true;
+                    status_label_->setText(
+                        QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435 "
+                                          u8"\u043E\u0442\u043B\u043E\u0436\u0435\u043D\u043E: "
+                                          u8"\u0438\u0434\u0451\u0442 \u043F\u0435\u0440\u0435\u0442\u0430\u0441\u043A\u0438\u0432\u0430\u043D\u0438\u0435"));
+                    return;
+                }
+
                 if (result.error_text.isEmpty()) {
+                    last_devices_snapshot_ = result.devices;
                     PopulateDeviceCards(result.devices);
                     UpdateTrayTooltip(result.devices);
 
@@ -981,21 +1463,25 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
     ClearDeviceCards();
 
     const auto grouped = GroupDevices(devices, hidden_device_ids_);
+    SyncOrderQueue(grouped, true, &connected_device_order_);
+    SyncOrderQueue(grouped, false, &disconnected_device_order_);
+    const auto ordered = ApplyCustomOrder(grouped, connected_device_order_, disconnected_device_order_);
+
     const auto now = QDateTime::currentDateTime();
-    const int device_count = static_cast<int>(grouped.size());
+    const int device_count = static_cast<int>(ordered.size());
 
     scroll_area_->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
 
-    for (const auto& device : grouped) {
+    for (const auto& device : ordered) {
         if (HasLiveData(device)) {
             last_live_update_[device.device_id] = now;
         }
     }
 
-    const auto counts = ComputeSummaryCounts(grouped);
+    const auto counts = ComputeSummaryCounts(ordered);
     summary_label_->setText(BuildSummaryLine(counts, static_cast<int>(hidden_device_ids_.size()), now));
 
-    if (grouped.empty()) {
+    if (ordered.empty()) {
         auto* empty_label = new QLabel(
             QString::fromUtf8(u8"\u041D\u0435\u0442 \u0432\u0438\u0434\u0438\u043C\u044B\u0445 "
                               u8"\u0443\u0441\u0442\u0440\u043E\u0439\u0441\u0442\u0432. \u041D\u0430\u0436\u043C\u0438\u0442\u0435 "
@@ -1009,13 +1495,50 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
         return;
     }
 
-    for (const auto& device : grouped) {
-        auto* row = new QFrame(cards_container_);
+    for (const auto& device : ordered) {
+        auto* row = new DraggableDeviceRow(device.device_id, IsDeviceConnected(device), cards_container_);
         row->setObjectName(QStringLiteral("deviceRow"));
         row->setFixedHeight(kCollapsedRowHeight);
         row->setMinimumHeight(kCollapsedRowHeight);
         row->setMaximumHeight(kCollapsedRowHeight);
         row->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        row->SetDragStateCallback([this](bool active) { SetDeviceDragActive(active); });
+        row->SetReorderCallback([this](const std::string& dragged_device_id,
+                                       const std::string& target_device_id,
+                                       bool connected_queue,
+                                       bool insert_before_target) {
+            auto& queue = connected_queue ? connected_device_order_ : disconnected_device_order_;
+            if (!ReorderQueueItems(&queue, dragged_device_id, target_device_id, insert_before_target)) {
+                return;
+            }
+            SavePersistedDeviceOrder(connected_device_order_, disconnected_device_order_);
+            if (last_devices_snapshot_.empty()) {
+                return;
+            }
+            auto devices_snapshot = last_devices_snapshot_;
+            QMetaObject::invokeMethod(
+                this,
+                [this, devices_snapshot = std::move(devices_snapshot)]() {
+                    if (quitting_) {
+                        return;
+                    }
+                    if (drag_in_progress_) {
+                        refresh_pending_ = true;
+                        status_label_->setText(
+                            QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435 "
+                                              u8"\u043E\u0442\u043B\u043E\u0436\u0435\u043D\u043E: "
+                                              u8"\u0438\u0434\u0451\u0442 \u043F\u0435\u0440\u0435\u0442\u0430\u0441\u043A\u0438\u0432\u0430\u043D\u0438\u0435"));
+                        return;
+                    }
+                    PopulateDeviceCards(devices_snapshot);
+                    UpdateTrayTooltip(devices_snapshot);
+                    status_label_->setText(
+                        QString::fromUtf8(u8"\u041F\u043E\u0440\u044F\u0434\u043E\u043A "
+                                          u8"\u0443\u0441\u0442\u0440\u043E\u0439\u0441\u0442\u0432 "
+                                          u8"\u043E\u0431\u043D\u043E\u0432\u043B\u0451\u043D"));
+                },
+                Qt::QueuedConnection);
+        });
 
         auto* row_layout = new QHBoxLayout(row);
         row_layout->setContentsMargins(12, 10, 10, 10);
@@ -1031,8 +1554,13 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
         center_layout->setContentsMargins(0, 0, 0, 0);
         center_layout->setSpacing(4);
 
+        const bool is_active = IsDeviceConnected(device);
+        const QString active_state = is_active ? QStringLiteral("active") : QStringLiteral("inactive");
+        row->setProperty("activeState", active_state);
+
         auto* name_label = new QLabel(ToQString(device.device_name), center_widget);
         name_label->setObjectName(QStringLiteral("deviceName"));
+        name_label->setProperty("activeState", active_state);
         name_label->setWordWrap(false);
         name_label->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
         name_label->setMinimumHeight(20);
@@ -1047,6 +1575,7 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
         progress->setRange(0, 100);
         progress->setTextVisible(false);
         progress->setProperty("levelState", level_state);
+        progress->setProperty("activeState", active_state);
         progress->setValue(primary.level.has_value() ? *primary.level : 0);
 
         const QString percent_text = primary.level.has_value()
@@ -1057,10 +1586,19 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
         percent_chip->setAlignment(Qt::AlignCenter);
         percent_chip->setMinimumWidth(44);
         percent_chip->setProperty("levelState", level_state);
+        percent_chip->setProperty("activeState", active_state);
+
+        QString technical_text = triplet_text;
+        if (!is_active) {
+            const QString inactive_marker = QString::fromUtf8(u8"\u041D\u0435 \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u043E");
+            technical_text = technical_text.isEmpty() ? inactive_marker
+                                                      : technical_text + QStringLiteral("  \u00B7  ") + inactive_marker;
+        }
 
         auto* technical_label =
-            new QLabel(triplet_text.isEmpty() ? QStringLiteral(" ") : triplet_text, center_widget);
+            new QLabel(technical_text.isEmpty() ? QStringLiteral(" ") : technical_text, center_widget);
         technical_label->setObjectName(QStringLiteral("technicalMeta"));
+        technical_label->setProperty("activeState", active_state);
         technical_label->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
         technical_label->setFixedHeight(14);
 

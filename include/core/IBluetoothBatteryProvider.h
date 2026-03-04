@@ -10,8 +10,11 @@ class IBluetoothBatteryProvider {
    public:
     virtual ~IBluetoothBatteryProvider() = default;
 
-    virtual std::vector<DeviceBatteryInfo> GetConnectedDevicesBattery() = 0;
+    virtual std::vector<DeviceBatteryInfo> GetDevicesBattery(const BatteryQueryOptions& options) = 0;
+
+    std::vector<DeviceBatteryInfo> GetConnectedDevicesBattery() {
+        return GetDevicesBattery(BatteryQueryOptions{});
+    }
 };
 
 }  // namespace battery_monitor
-

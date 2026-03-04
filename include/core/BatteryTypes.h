@@ -12,6 +12,11 @@ struct DeviceBatteryInfo {
     std::string battery_component = "main";
     std::optional<std::uint8_t> battery_level_percent;
     bool is_cached = false;
+    bool is_connected = true;
+};
+
+struct BatteryQueryOptions {
+    bool include_disconnected = false;
 };
 
 }  // namespace battery_monitor
