@@ -6,8 +6,7 @@ namespace battery_monitor {
 
 class BluezBatteryProvider final : public IBluetoothBatteryProvider {
    public:
-    std::vector<DeviceBatteryInfo> GetConnectedDevicesBattery() override;
+    std::vector<DeviceBatteryInfo> GetDevicesBattery(const BatteryQueryOptions& options) override;
 };
 
 }  // namespace battery_monitor
-

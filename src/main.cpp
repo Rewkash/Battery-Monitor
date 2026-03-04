@@ -1,9 +1,20 @@
+#include <cstdint>
 #include <exception>
-#include <iomanip>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
+
+#ifdef BATTERY_MONITOR_WITH_QT
+#include <QApplication>
+
+#include "ui/BatteryWindow.h"
+#endif
+
+#ifdef _WIN32
+#include <winrt/base.h>
+#endif
 
 #include "core/BatteryTypes.h"
 #include "core/ProviderFactory.h"
@@ -51,12 +62,20 @@ void PrintTable(const std::vector<DeviceBatteryInfo>& devices) {
         return;
     }
 
-    std::cout << std::left << std::setw(32) << "Device Name" << std::setw(48) << "Device ID" << "Battery\n";
-    std::cout << std::string(92, '-') << '\n';
+    std::cout << "Device Name | Component | Battery | Device ID\n";
+    std::cout << "-------------------------------------------------------------\n";
 
     for (const auto& device : devices) {
-        std::cout << std::left << std::setw(32) << device.device_name << std::setw(48) << device.device_id
-                  << static_cast<int>(device.battery_level_percent) << "%\n";
+        std::string battery_text =
+            device.battery_level_percent.has_value() ? (std::to_string(*device.battery_level_percent) + "%") : "N/A";
+        if (device.is_cached && device.battery_level_percent.has_value()) {
+            battery_text += " (cached)";
+        }
+        if (!device.is_connected) {
+            battery_text += " (offline)";
+        }
+        std::cout << device.device_name << " | " << device.battery_component << " | "
+                  << battery_text << " | " << device.device_id << '\n';
     }
 }
 
@@ -64,9 +83,14 @@ void PrintJson(const std::vector<DeviceBatteryInfo>& devices) {
     std::cout << "[\n";
     for (std::size_t i = 0; i < devices.size(); ++i) {
         const auto& device = devices[i];
+        const std::string battery_json =
+            device.battery_level_percent.has_value() ? std::to_string(*device.battery_level_percent) : "null";
         std::cout << "  {\"deviceId\":\"" << EscapeJson(device.device_id) << "\","
                   << "\"deviceName\":\"" << EscapeJson(device.device_name) << "\","
-                  << "\"batteryLevelPercent\":" << static_cast<int>(device.battery_level_percent) << "}";
+                  << "\"component\":\"" << EscapeJson(device.battery_component) << "\","
+                  << "\"batteryLevelPercent\":" << battery_json << ","
+                  << "\"isCached\":" << (device.is_cached ? "true" : "false") << ","
+                  << "\"isConnected\":" << (device.is_connected ? "true" : "false") << "}";
         if (i + 1 < devices.size()) {
             std::cout << ",";
         }
@@ -81,15 +105,42 @@ void PrintJson(const std::vector<DeviceBatteryInfo>& devices) {
 
 int main(int argc, char** argv) {
     bool json_output = false;
+    bool cli_output = false;
+    bool gui_forced = false;
+    bool include_offline = false;
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--json") {
+        const std::string arg = argv[i];
+        if (arg == "--json") {
             json_output = true;
+            continue;
+        }
+        if (arg == "--cli") {
+            cli_output = true;
+            continue;
+        }
+        if (arg == "--gui") {
+            gui_forced = true;
+            continue;
+        }
+        if (arg == "--all" || arg == "--include-offline") {
+            include_offline = true;
         }
     }
 
     try {
+#ifdef BATTERY_MONITOR_WITH_QT
+        if (!json_output && (!cli_output || gui_forced)) {
+            QApplication app(argc, argv);
+            auto provider = battery_monitor::CreateBatteryProvider();
+            battery_monitor::BatteryWindow window(std::move(provider));
+            window.Launch();
+            return app.exec();
+        }
+#endif
         auto provider = battery_monitor::CreateBatteryProvider();
-        const auto devices = provider->GetConnectedDevicesBattery();
+        battery_monitor::BatteryQueryOptions query_options;
+        query_options.include_disconnected = include_offline;
+        const auto devices = provider->GetDevicesBattery(query_options);
 
         if (json_output) {
             battery_monitor::PrintJson(devices);
@@ -98,9 +149,18 @@ int main(int argc, char** argv) {
         }
 
         return 0;
+#ifdef _WIN32
+    } catch (const winrt::hresult_error& ex) {
+        std::cerr << "Error: WinRT HRESULT=0x" << std::hex << std::uppercase
+                  << static_cast<std::uint32_t>(ex.code().value)
+                  << " message=" << winrt::to_string(ex.message()) << '\n';
+        return 1;
+#endif
     } catch (const std::exception& ex) {
         std::cerr << "Error: " << ex.what() << '\n';
         return 1;
+    } catch (...) {
+        std::cerr << "Error: unknown exception\n";
+        return 1;
     }
 }
-

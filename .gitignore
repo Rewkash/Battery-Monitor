@@ -1,4 +1,4 @@
-# Build directories
+# Build artifacts
 /build/
 /build-*/
 /cmake-build-*/
@@ -13,6 +13,17 @@
 /Testing/
 /Makefile
 
+# Compiled binaries and objects
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+*.exe
+*.pdb
+
 # Visual Studio
 /.vs/
 *.VC.db
@@ -20,7 +31,26 @@
 *.user
 *.suo
 
-# VS Code / Cursor transient files
-/.vscode/ipch/
+# VS Code/Cursor local transient files
 /.cursor/
 /.vscode/
+
+# Runtime/debug artifacts
+*.log
+*.tmp
+*.dmp
+tmp_*.log
+debug*.txt
+logs/
+poco-debug*.log
+zmi-debug.log
+
+# Patch/merge leftovers
+*.bak
+*.orig
+*.rej
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+Desktop.ini

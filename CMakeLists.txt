@@ -5,6 +5,18 @@ project(BatteryMonitor VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+option(BATTERY_MONITOR_ENABLE_QT "Enable Qt6 test GUI" ON)
+
+set(BATTERY_MONITOR_QT_ENABLED OFF)
+if(BATTERY_MONITOR_ENABLE_QT)
+    find_package(Qt6 COMPONENTS Widgets QUIET)
+    if(Qt6Widgets_FOUND)
+        set(BATTERY_MONITOR_QT_ENABLED ON)
+        message(STATUS "Qt6 Widgets found. GUI mode enabled.")
+    else()
+        message(WARNING "Qt6 Widgets not found. Building CLI-only binary.")
+    endif()
+endif()
 
 add_executable(
     battery-monitor
@@ -26,6 +38,7 @@ if(MSVC)
             /W4
             /permissive-
             /EHsc
+            /utf-8
     )
 else()
     target_compile_options(
@@ -55,6 +68,7 @@ if(WIN32)
         battery-monitor
         PRIVATE
             windowsapp
+            Ws2_32
     )
 elseif(UNIX AND NOT APPLE)
     find_package(PkgConfig REQUIRED)
@@ -87,3 +101,44 @@ else()
     message(FATAL_ERROR "This project currently supports only Windows and Linux.")
 endif()
 
+if(BATTERY_MONITOR_QT_ENABLED)
+    target_sources(
+        battery-monitor
+        PRIVATE
+            src/ui/BatteryWindow.cpp
+            src/ui/BatteryWindow.h
+    )
+
+    target_compile_definitions(
+        battery-monitor
+        PRIVATE
+            BATTERY_MONITOR_WITH_QT
+    )
+
+    target_link_libraries(
+        battery-monitor
+        PRIVATE
+            Qt6::Widgets
+    )
+
+    if(WIN32)
+        get_target_property(_qt_qmake_executable Qt6::qmake IMPORTED_LOCATION)
+        get_filename_component(_qt_bin_dir "${_qt_qmake_executable}" DIRECTORY)
+        find_program(WINDEPLOYQT_EXECUTABLE
+            NAMES windeployqt windeployqt.exe
+            HINTS "${_qt_bin_dir}"
+            REQUIRED
+        )
+
+        add_custom_command(
+            TARGET battery-monitor
+            POST_BUILD
+            COMMAND "${WINDEPLOYQT_EXECUTABLE}"
+                    --no-compiler-runtime
+                    --no-translations
+                    "$<TARGET_FILE:battery-monitor>"
+            COMMENT "Deploying Qt runtime for battery-monitor.exe"
+            VERBATIM
+        )
+    endif()
+endif()

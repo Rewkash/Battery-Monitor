@@ -13,6 +13,7 @@ Current scope is a minimal native CLI that lists connected devices with battery 
 - Native Windows implementation using WinRT GATT Battery Service.
 - Native Linux implementation using D-Bus calls to BlueZ.
 - JSON output mode for easy integration with scripts.
+- Component-aware battery output (`main`, `left`, `right`, `case` when exposed by device/API).
 
 ## Requirements
 

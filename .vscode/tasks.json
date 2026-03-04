@@ -1,39 +1,38 @@
 {
-  "version": "2.0.0",
-  "tasks": [
-    {
-      "label": "CMake: configure (Debug)",
-      "type": "shell",
-      "command": "cmake",
-      "args": [
-        "--fresh",
-        "-S",
-        ".",
-        "-B",
-        "build",
-        "-A",
-        "x64"
-      ],
-      "problemMatcher": []
-    },
-    {
-      "label": "CMake: build (Debug)",
-      "type": "shell",
-      "command": "cmake",
-      "args": [
-        "--build",
-        "build",
-        "--config",
-        "Debug"
-      ],
-      "group": {
-        "kind": "build",
-        "isDefault": true
-      },
-      "dependsOn": "CMake: configure (Debug)",
-      "problemMatcher": [
-        "$msCompile"
-      ]
-    }
-  ]
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "CMake: configure (Debug)",
+            "type": "shell",
+            "command": "cmake --fresh -S . -B build -DCMAKE_BUILD_TYPE=Debug",
+            "windows": {
+                "command": "cmake --fresh -S . -B build -A x64 -DCMAKE_PREFIX_PATH=\"${config:batteryMonitor.qtMsvcDir}\""
+            },
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "CMake: build (Debug)",
+            "type": "shell",
+            "command": "cmake --build build -j",
+            "windows": {
+                "command": "cmake --build build --config Debug"
+            },
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "dependsOn": [
+                "CMake: configure (Debug)"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        }
+    ]
 }

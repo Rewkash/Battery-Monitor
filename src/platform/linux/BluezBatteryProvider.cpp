@@ -263,7 +263,7 @@ bool GetStringProperty(DBusConnection* connection, const std::string& path, cons
 
 }  // namespace
 
-std::vector<DeviceBatteryInfo> BluezBatteryProvider::GetConnectedDevicesBattery() {
+std::vector<DeviceBatteryInfo> BluezBatteryProvider::GetDevicesBattery(const BatteryQueryOptions& options) {
     ScopedError error;
     DBusConnection* raw_connection = dbus_bus_get(DBUS_BUS_SYSTEM, error.get());
     if (raw_connection == nullptr) {
@@ -278,12 +278,22 @@ std::vector<DeviceBatteryInfo> BluezBatteryProvider::GetConnectedDevicesBattery(
 
     for (const auto& path : paths) {
         bool is_connected = false;
-        if (!GetBooleanProperty(connection.get(), path, kDeviceInterface, "Connected", &is_connected) || !is_connected) {
-            continue;
+        const bool has_connected_flag =
+            GetBooleanProperty(connection.get(), path, kDeviceInterface, "Connected", &is_connected);
+        if (!options.include_disconnected) {
+            if (!has_connected_flag || !is_connected) {
+                continue;
+            }
+        } else if (!has_connected_flag) {
+            is_connected = false;
         }
 
         std::uint8_t battery_percent = 0;
-        if (!GetByteProperty(connection.get(), path, kBatteryInterface, "Percentage", &battery_percent)) {
+        bool has_battery = false;
+        if (is_connected) {
+            has_battery = GetByteProperty(connection.get(), path, kBatteryInterface, "Percentage", &battery_percent);
+        }
+        if (!has_battery && !options.include_disconnected) {
             continue;
         }
 
@@ -293,7 +303,11 @@ std::vector<DeviceBatteryInfo> BluezBatteryProvider::GetConnectedDevicesBattery(
         DeviceBatteryInfo entry;
         entry.device_id = path;
         entry.device_name = alias;
-        entry.battery_level_percent = battery_percent;
+        entry.battery_component = "main";
+        if (has_battery && is_connected) {
+            entry.battery_level_percent = battery_percent;
+        }
+        entry.is_connected = is_connected;
         devices.push_back(std::move(entry));
     }
 
