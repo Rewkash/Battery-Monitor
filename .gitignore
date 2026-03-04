@@ -40,6 +40,8 @@
 *.tmp
 *.dmp
 tmp_*.log
+debug*.txt
+logs/
 poco-debug*.log
 zmi-debug.log
 
