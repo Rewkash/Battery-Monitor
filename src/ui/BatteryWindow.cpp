@@ -19,6 +19,7 @@
 #include <QCursor>
 #include <QDataStream>
 #include <QDateTime>
+#include <QDebug>
 #include <QDrag>
 #include <QDragEnterEvent>
 #include <QDropEvent>
@@ -33,6 +34,7 @@
 #include <QPaintEvent>
 #include <QPainter>
 #include <QPainterPath>
+#include <QPointer>
 #include <QPropertyAnimation>
 #include <QProgressBar>
 #include <QPushButton>
@@ -99,9 +101,17 @@ constexpr const char* kSettingsGroupUi = "ui";
 constexpr const char* kSettingsConnectedOrderKey = "connected_order";
 constexpr const char* kSettingsDisconnectedOrderKey = "disconnected_order";
 constexpr const char* kSettingsRefreshIntervalMsKey = "refresh_interval_ms";
+constexpr const char* kSettingsLowBatteryThresholdPercentKey = "low_battery_threshold_percent";
+constexpr const char* kSettingsLowBatteryRepeatMinutesKey = "low_battery_repeat_minutes";
 constexpr int kDefaultRefreshIntervalMs = 15000;
 constexpr int kMinRefreshIntervalSeconds = 5;
 constexpr int kMaxRefreshIntervalSeconds = 600;
+constexpr int kDefaultLowBatteryThresholdPercent = 10;
+constexpr int kMinLowBatteryThresholdPercent = 1;
+constexpr int kMaxLowBatteryThresholdPercent = 100;
+constexpr int kDefaultLowBatteryRepeatMinutes = 10;
+constexpr int kMinLowBatteryRepeatMinutes = 1;
+constexpr int kMaxLowBatteryRepeatMinutes = 180;
 
 QSettings CreateUiSettings() {
     return QSettings(QSettings::IniFormat, QSettings::UserScope, QStringLiteral("BatteryMonitor"),
@@ -112,6 +122,14 @@ int ClampRefreshIntervalMs(int interval_ms) {
     const int min_ms = kMinRefreshIntervalSeconds * 1000;
     const int max_ms = kMaxRefreshIntervalSeconds * 1000;
     return std::clamp(interval_ms, min_ms, max_ms);
+}
+
+int ClampLowBatteryThresholdPercent(int percent) {
+    return std::clamp(percent, kMinLowBatteryThresholdPercent, kMaxLowBatteryThresholdPercent);
+}
+
+int ClampLowBatteryRepeatMinutes(int minutes) {
+    return std::clamp(minutes, kMinLowBatteryRepeatMinutes, kMaxLowBatteryRepeatMinutes);
 }
 
 int LoadRefreshIntervalMs() {
@@ -127,6 +145,46 @@ void SaveRefreshIntervalMs(int interval_ms) {
     QSettings settings = CreateUiSettings();
     settings.beginGroup(QString::fromLatin1(kSettingsGroupUi));
     settings.setValue(QString::fromLatin1(kSettingsRefreshIntervalMsKey), ClampRefreshIntervalMs(interval_ms));
+    settings.endGroup();
+    settings.sync();
+}
+
+int LoadLowBatteryThresholdPercent() {
+    QSettings settings = CreateUiSettings();
+    settings.beginGroup(QString::fromLatin1(kSettingsGroupUi));
+    const int saved = settings
+                          .value(QString::fromLatin1(kSettingsLowBatteryThresholdPercentKey),
+                                 kDefaultLowBatteryThresholdPercent)
+                          .toInt();
+    settings.endGroup();
+    return ClampLowBatteryThresholdPercent(saved);
+}
+
+void SaveLowBatteryThresholdPercent(int percent) {
+    QSettings settings = CreateUiSettings();
+    settings.beginGroup(QString::fromLatin1(kSettingsGroupUi));
+    settings.setValue(QString::fromLatin1(kSettingsLowBatteryThresholdPercentKey),
+                      ClampLowBatteryThresholdPercent(percent));
+    settings.endGroup();
+    settings.sync();
+}
+
+int LoadLowBatteryRepeatMinutes() {
+    QSettings settings = CreateUiSettings();
+    settings.beginGroup(QString::fromLatin1(kSettingsGroupUi));
+    const int saved = settings
+                          .value(QString::fromLatin1(kSettingsLowBatteryRepeatMinutesKey),
+                                 kDefaultLowBatteryRepeatMinutes)
+                          .toInt();
+    settings.endGroup();
+    return ClampLowBatteryRepeatMinutes(saved);
+}
+
+void SaveLowBatteryRepeatMinutes(int minutes) {
+    QSettings settings = CreateUiSettings();
+    settings.beginGroup(QString::fromLatin1(kSettingsGroupUi));
+    settings.setValue(QString::fromLatin1(kSettingsLowBatteryRepeatMinutesKey),
+                      ClampLowBatteryRepeatMinutes(minutes));
     settings.endGroup();
     settings.sync();
 }
@@ -871,6 +929,358 @@ bool ReorderQueueItems(std::vector<std::string>* order,
     return true;
 }
 
+struct LowBatteryComponentState {
+    std::string component;
+    std::uint8_t level = 0;
+    bool below_threshold = false;
+    bool triggered = false;
+};
+
+struct LowBatteryDeviceState {
+    QString device_name;
+    std::vector<LowBatteryComponentState> components;
+};
+
+struct LowBatteryNotificationText {
+    QString title;
+    QString line1;
+    QString line2;
+    std::uint8_t critical_level = 100;
+};
+
+int ComponentShortRank(const std::string& component_name) {
+    if (component_name == "left") {
+        return 0;
+    }
+    if (component_name == "right") {
+        return 1;
+    }
+    if (component_name == "case") {
+        return 2;
+    }
+    if (component_name == "main") {
+        return 3;
+    }
+    return 10;
+}
+
+QString ComponentDisplayLabel(const std::string& component_name) {
+    if (component_name == "left") {
+        return QString::fromUtf8(u8"\u041B\u0435\u0432\u044B\u0439");
+    }
+    if (component_name == "right") {
+        return QString::fromUtf8(u8"\u041F\u0440\u0430\u0432\u044B\u0439");
+    }
+    if (component_name == "case") {
+        return QString::fromUtf8(u8"\u041A\u0435\u0439\u0441");
+    }
+    return QString::fromUtf8(u8"\u0417\u0430\u0440\u044F\u0434");
+}
+
+LowBatteryNotificationText FormatLowBatteryNotification(const LowBatteryDeviceState& device_state) {
+    LowBatteryNotificationText result;
+    result.title = device_state.device_name.isEmpty()
+                       ? QString::fromUtf8(u8"\u0423\u0441\u0442\u0440\u043E\u0439\u0441\u0442\u0432\u043E")
+                       : device_state.device_name;
+    if (device_state.components.empty()) {
+        return result;
+    }
+
+    std::vector<std::size_t> below_indices;
+    for (std::size_t i = 0; i < device_state.components.size(); ++i) {
+        if (device_state.components[i].below_threshold) {
+            below_indices.push_back(i);
+        }
+    }
+
+    const auto choose_more_critical = [&](std::size_t lhs, std::size_t rhs) {
+        const auto& a = device_state.components[lhs];
+        const auto& b = device_state.components[rhs];
+        if (a.level != b.level) {
+            return a.level < b.level;
+        }
+        return ComponentShortRank(a.component) < ComponentShortRank(b.component);
+    };
+
+    std::size_t primary_index = 0;
+    if (!below_indices.empty()) {
+        primary_index = below_indices.front();
+        for (std::size_t i = 1; i < below_indices.size(); ++i) {
+            if (choose_more_critical(below_indices[i], primary_index)) {
+                primary_index = below_indices[i];
+            }
+        }
+    } else {
+        for (std::size_t i = 1; i < device_state.components.size(); ++i) {
+            if (choose_more_critical(i, primary_index)) {
+                primary_index = i;
+            }
+        }
+    }
+
+    const auto& primary = device_state.components[primary_index];
+    const QString primary_label = ComponentDisplayLabel(primary.component);
+    result.critical_level = primary.level;
+    result.line1 = QString::fromUtf8(u8"%1: %2% \u2014 \u0437\u0430\u0440\u044F\u0434\u0438\u0442\u0435")
+                       .arg(primary_label)
+                       .arg(static_cast<int>(primary.level));
+
+    std::vector<std::size_t> other_indices;
+    for (std::size_t i = 0; i < device_state.components.size(); ++i) {
+        if (i == primary_index) {
+            continue;
+        }
+        other_indices.push_back(i);
+    }
+    std::sort(other_indices.begin(), other_indices.end(), [&](std::size_t lhs, std::size_t rhs) {
+        const auto& a = device_state.components[lhs];
+        const auto& b = device_state.components[rhs];
+        const int rank_a = ComponentShortRank(a.component);
+        const int rank_b = ComponentShortRank(b.component);
+        if (rank_a != rank_b) {
+            return rank_a < rank_b;
+        }
+        return a.level < b.level;
+    });
+
+    QStringList other_values;
+    other_values.reserve(static_cast<qsizetype>(other_indices.size()));
+    for (const std::size_t i : other_indices) {
+        const auto& component = device_state.components[i];
+        other_values.push_back(QString::fromUtf8(u8"%1: %2%")
+                                   .arg(ComponentDisplayLabel(component.component))
+                                   .arg(static_cast<int>(component.level)));
+    }
+    result.line2 = other_values.join(QString::fromUtf8(u8" \u00B7 "));
+    return result;
+}
+
+void RunLowBatteryNotificationSelfCheck() {
+#ifndef NDEBUG
+    static const bool ran_once = []() {
+        auto assert_match = [](const LowBatteryDeviceState& input,
+                               const QString& exp_title,
+                               const QString& exp_line1,
+                               const QString& exp_line2) {
+            const auto out = FormatLowBatteryNotification(input);
+            if (out.title != exp_title || out.line1 != exp_line1 || out.line2 != exp_line2) {
+                qWarning().noquote()
+                    << "LowBattery format mismatch:"
+                    << "title='" << out.title << "'"
+                    << "line1='" << out.line1 << "'"
+                    << "line2='" << out.line2 << "'";
+            }
+        };
+
+        assert_match(
+            LowBatteryDeviceState{
+                QString::fromUtf8(u8"Redmi Buds 4 Pro"),
+                {LowBatteryComponentState{"right", 19, true, true},
+                 LowBatteryComponentState{"left", 90, false, false},
+                 LowBatteryComponentState{"case", 39, false, false}}},
+            QString::fromUtf8(u8"Redmi Buds 4 Pro"),
+            QString::fromUtf8(u8"\u041F\u0440\u0430\u0432\u044B\u0439: 19% \u2014 \u0437\u0430\u0440\u044F\u0434\u0438\u0442\u0435"),
+            QString::fromUtf8(u8"\u041B\u0435\u0432\u044B\u0439: 90% \u00B7 \u041A\u0435\u0439\u0441: 39%"));
+
+        assert_match(
+            LowBatteryDeviceState{
+                QString::fromUtf8(u8"Redmi Buds 4 Pro"),
+                {LowBatteryComponentState{"left", 15, true, true}}},
+            QString::fromUtf8(u8"Redmi Buds 4 Pro"),
+            QString::fromUtf8(u8"\u041B\u0435\u0432\u044B\u0439: 15% \u2014 \u0437\u0430\u0440\u044F\u0434\u0438\u0442\u0435"),
+            QString());
+
+        assert_match(
+            LowBatteryDeviceState{
+                QString::fromUtf8(u8"Redmi Buds 4 Pro"),
+                {LowBatteryComponentState{"case", 8, true, true}}},
+            QString::fromUtf8(u8"Redmi Buds 4 Pro"),
+            QString::fromUtf8(u8"\u041A\u0435\u0439\u0441: 8% \u2014 \u0437\u0430\u0440\u044F\u0434\u0438\u0442\u0435"),
+            QString());
+
+        assert_match(
+            LowBatteryDeviceState{
+                QString::fromUtf8(u8"POCO F3"),
+                {LowBatteryComponentState{"main", 22, true, true}}},
+            QString::fromUtf8(u8"POCO F3"),
+            QString::fromUtf8(u8"\u0417\u0430\u0440\u044F\u0434: 22% \u2014 \u0437\u0430\u0440\u044F\u0434\u0438\u0442\u0435"),
+            QString());
+        return true;
+    }();
+    Q_UNUSED(ran_once);
+#endif
+}
+
+class LowBatteryToast final : public QFrame {
+   public:
+    LowBatteryToast()
+        : QFrame(nullptr),
+          title_label_(new QLabel(this)),
+          line1_dot_label_(new QLabel(this)),
+          line1_label_(new QLabel(this)),
+          line2_label_(new QLabel(this)),
+          slide_in_animation_(new QPropertyAnimation(this, "pos", this)),
+          slide_out_animation_(new QPropertyAnimation(this, "pos", this)),
+          hide_timer_(new QTimer(this)) {
+        setObjectName(QStringLiteral("lowBatteryToast"));
+        setWindowFlag(Qt::Tool, true);
+        setWindowFlag(Qt::FramelessWindowHint, true);
+        setWindowFlag(Qt::WindowStaysOnTopHint, true);
+        setAttribute(Qt::WA_ShowWithoutActivating, true);
+        setAttribute(Qt::WA_TranslucentBackground, false);
+        setAttribute(Qt::WA_StyledBackground, true);
+        setFocusPolicy(Qt::NoFocus);
+        setWindowOpacity(1.0);
+
+        setStyleSheet(R"(
+QFrame#lowBatteryToast {
+    background: #3B3E44;
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    border-radius: 12px;
+}
+QLabel#toastTitle {
+    color: #F8FAFC;
+    font-size: 15px;
+    font-weight: 700;
+}
+QLabel#toastLine1Dot {
+    color: #FF5A5A;
+    font-size: 14px;
+    font-weight: 800;
+}
+QLabel#toastLine1 {
+    color: #F8FAFC;
+    font-size: 14px;
+    font-weight: 700;
+}
+QLabel#toastLine2 {
+    color: #D1D5DB;
+    font-size: 11px;
+    font-weight: 500;
+}
+)");
+
+        auto* layout = new QVBoxLayout(this);
+        layout->setContentsMargins(12, 10, 12, 10);
+        layout->setSpacing(4);
+
+        title_label_->setObjectName(QStringLiteral("toastTitle"));
+        title_label_->setTextInteractionFlags(Qt::NoTextInteraction);
+        title_label_->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+
+        auto* line1_layout = new QHBoxLayout();
+        line1_layout->setContentsMargins(0, 0, 0, 0);
+        line1_layout->setSpacing(6);
+
+        line1_dot_label_->setObjectName(QStringLiteral("toastLine1Dot"));
+        line1_dot_label_->setText(QString::fromUtf8(u8"\u25CF"));
+        line1_dot_label_->setFixedWidth(10);
+        line1_dot_label_->setAlignment(Qt::AlignHCenter | Qt::AlignVCenter);
+
+        line1_label_->setObjectName(QStringLiteral("toastLine1"));
+        line1_label_->setWordWrap(true);
+        line1_label_->setTextInteractionFlags(Qt::NoTextInteraction);
+
+        line2_label_->setObjectName(QStringLiteral("toastLine2"));
+        line2_label_->setWordWrap(true);
+        line2_label_->setTextInteractionFlags(Qt::NoTextInteraction);
+
+        line1_layout->addWidget(line1_dot_label_);
+        line1_layout->addWidget(line1_label_, 1);
+
+        layout->addWidget(title_label_);
+        layout->addLayout(line1_layout);
+        layout->addWidget(line2_label_);
+
+        hide_timer_->setSingleShot(true);
+
+        slide_in_animation_->setDuration(240);
+        slide_in_animation_->setEasingCurve(QEasingCurve::OutCubic);
+        slide_out_animation_->setDuration(220);
+        slide_out_animation_->setEasingCurve(QEasingCurve::InCubic);
+
+        connect(slide_in_animation_, &QPropertyAnimation::finished, this, [this]() {
+            if (isVisible() && visible_duration_ms_ > 0) {
+                hide_timer_->start(visible_duration_ms_);
+            }
+        });
+        connect(hide_timer_, &QTimer::timeout, this, [this]() { StartHideAnimation(); });
+        connect(slide_out_animation_, &QPropertyAnimation::finished, this, [this]() { hide(); });
+    }
+
+    void ShowNotification(const QString& title,
+                          const QString& line1,
+                          const QString& line2,
+                          int visible_ms) {
+        title_label_->setText(title);
+        line1_label_->setText(line1);
+        line2_label_->setText(line2);
+        line2_label_->setVisible(!line2.trimmed().isEmpty());
+        visible_duration_ms_ = std::max(1000, visible_ms);
+
+        hide_timer_->stop();
+        slide_in_animation_->stop();
+        slide_out_animation_->stop();
+
+        UpdateGeometryForCurrentScreen();
+        move(hidden_pos_);
+        show();
+        raise();
+
+        slide_in_animation_->setStartValue(hidden_pos_);
+        slide_in_animation_->setEndValue(visible_pos_);
+        slide_in_animation_->start();
+    }
+
+   private:
+    void StartHideAnimation() {
+        if (!isVisible()) {
+            return;
+        }
+        slide_out_animation_->stop();
+        slide_out_animation_->setStartValue(pos());
+        slide_out_animation_->setEndValue(hidden_pos_);
+        slide_out_animation_->start();
+    }
+
+    void UpdateGeometryForCurrentScreen() {
+        QScreen* screen = QGuiApplication::primaryScreen();
+        QRect available = screen != nullptr ? screen->availableGeometry() : QRect(0, 0, 1920, 1080);
+        const int margin = 16;
+        const int toast_width = std::clamp(available.width() - (margin * 2), 260, 360);
+        setFixedWidth(toast_width);
+        adjustSize();
+        setFixedHeight(sizeHint().height());
+
+        const int x_visible = available.right() - this->width() - margin;
+        const int y_visible = available.top() + margin;
+        visible_pos_ = QPoint(x_visible, y_visible);
+        hidden_pos_ = QPoint(available.right() + margin, y_visible);
+    }
+
+    QLabel* title_label_ = nullptr;
+    QLabel* line1_dot_label_ = nullptr;
+    QLabel* line1_label_ = nullptr;
+    QLabel* line2_label_ = nullptr;
+    QPropertyAnimation* slide_in_animation_ = nullptr;
+    QPropertyAnimation* slide_out_animation_ = nullptr;
+    QTimer* hide_timer_ = nullptr;
+    QPoint visible_pos_;
+    QPoint hidden_pos_;
+    int visible_duration_ms_ = 7000;
+};
+
+void ShowLowBatteryToastMessage(const QString& title,
+                                const QString& line1,
+                                const QString& line2,
+                                int visible_ms) {
+    static QPointer<LowBatteryToast> toast;
+    if (toast.isNull()) {
+        toast = new LowBatteryToast();
+    }
+    toast->ShowNotification(title, line1, line2, visible_ms);
+}
+
 #ifdef _WIN32
 QString FormatWinRtError(const winrt::hresult_error& error) {
     std::ostringstream stream;
@@ -1138,14 +1548,18 @@ QWidget#listContainer {
     settings_panel_->setMaximumHeight(0);
     settings_panel_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
 
-    auto* settings_layout = new QHBoxLayout(settings_panel_);
+    auto* settings_layout = new QVBoxLayout(settings_panel_);
     settings_layout->setContentsMargins(10, 7, 10, 7);
-    settings_layout->setSpacing(8);
+    settings_layout->setSpacing(6);
 
-    auto* settings_label =
+    auto* refresh_row_layout = new QHBoxLayout();
+    refresh_row_layout->setContentsMargins(0, 0, 0, 0);
+    refresh_row_layout->setSpacing(8);
+
+    auto* refresh_settings_label =
         new QLabel(QString::fromUtf8(u8"\u0410\u0432\u0442\u043E\u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435 (сек):"),
                    settings_panel_);
-    settings_label->setObjectName(QStringLiteral("settingsLabel"));
+    refresh_settings_label->setObjectName(QStringLiteral("settingsLabel"));
 
     refresh_interval_spinbox_ = new QSpinBox(settings_panel_);
     refresh_interval_spinbox_->setObjectName(QStringLiteral("settingsSpinBox"));
@@ -1153,9 +1567,51 @@ QWidget#listContainer {
     refresh_interval_spinbox_->setSingleStep(5);
     refresh_interval_spinbox_->setSuffix(QString::fromUtf8(u8" с"));
 
-    settings_layout->addWidget(settings_label);
-    settings_layout->addStretch(1);
-    settings_layout->addWidget(refresh_interval_spinbox_);
+    auto* threshold_row_layout = new QHBoxLayout();
+    threshold_row_layout->setContentsMargins(0, 0, 0, 0);
+    threshold_row_layout->setSpacing(8);
+
+    auto* threshold_settings_label = new QLabel(
+        QString::fromUtf8(u8"\u041F\u043E\u0440\u043E\u0433 \u0443\u0432\u0435\u0434\u043E\u043C\u043B\u0435\u043D\u0438\u044F (%):"),
+        settings_panel_);
+    threshold_settings_label->setObjectName(QStringLiteral("settingsLabel"));
+
+    low_battery_threshold_spinbox_ = new QSpinBox(settings_panel_);
+    low_battery_threshold_spinbox_->setObjectName(QStringLiteral("settingsSpinBox"));
+    low_battery_threshold_spinbox_->setRange(kMinLowBatteryThresholdPercent, kMaxLowBatteryThresholdPercent);
+    low_battery_threshold_spinbox_->setSingleStep(1);
+    low_battery_threshold_spinbox_->setSuffix(QStringLiteral("%"));
+
+    auto* repeat_row_layout = new QHBoxLayout();
+    repeat_row_layout->setContentsMargins(0, 0, 0, 0);
+    repeat_row_layout->setSpacing(8);
+
+    auto* repeat_settings_label = new QLabel(
+        QString::fromUtf8(u8"\u041F\u043E\u0432\u0442\u043E\u0440 \u0443\u0432\u0435\u0434\u043E\u043C\u043B\u0435\u043D\u0438\u044F (мин):"),
+        settings_panel_);
+    repeat_settings_label->setObjectName(QStringLiteral("settingsLabel"));
+
+    low_battery_repeat_spinbox_ = new QSpinBox(settings_panel_);
+    low_battery_repeat_spinbox_->setObjectName(QStringLiteral("settingsSpinBox"));
+    low_battery_repeat_spinbox_->setRange(kMinLowBatteryRepeatMinutes, kMaxLowBatteryRepeatMinutes);
+    low_battery_repeat_spinbox_->setSingleStep(1);
+    low_battery_repeat_spinbox_->setSuffix(QString::fromUtf8(u8" мин"));
+
+    refresh_row_layout->addWidget(refresh_settings_label);
+    refresh_row_layout->addStretch(1);
+    refresh_row_layout->addWidget(refresh_interval_spinbox_);
+
+    threshold_row_layout->addWidget(threshold_settings_label);
+    threshold_row_layout->addStretch(1);
+    threshold_row_layout->addWidget(low_battery_threshold_spinbox_);
+
+    repeat_row_layout->addWidget(repeat_settings_label);
+    repeat_row_layout->addStretch(1);
+    repeat_row_layout->addWidget(low_battery_repeat_spinbox_);
+
+    settings_layout->addLayout(refresh_row_layout);
+    settings_layout->addLayout(threshold_row_layout);
+    settings_layout->addLayout(repeat_row_layout);
 
     settings_panel_animation_ = new QPropertyAnimation(settings_panel_, "maximumHeight", this);
     settings_panel_animation_->setDuration(200);
@@ -1199,18 +1655,37 @@ QWidget#listContainer {
     connect(refresh_interval_spinbox_,
             static_cast<void (QSpinBox::*)(int)>(&QSpinBox::valueChanged),
             this, [this](int seconds) { ApplyRefreshIntervalSeconds(seconds, true); });
+    connect(low_battery_threshold_spinbox_,
+            static_cast<void (QSpinBox::*)(int)>(&QSpinBox::valueChanged),
+            this, [this](int percent) { ApplyLowBatteryThresholdPercent(percent, true); });
+    connect(low_battery_repeat_spinbox_,
+            static_cast<void (QSpinBox::*)(int)>(&QSpinBox::valueChanged),
+            this, [this](int minutes) { ApplyLowBatteryRepeatMinutes(minutes, true); });
 
     refresh_timer_ = new QTimer(this);
     refresh_interval_ms_ = LoadRefreshIntervalMs();
+    low_battery_threshold_percent_ = LoadLowBatteryThresholdPercent();
+    low_battery_repeat_minutes_ = LoadLowBatteryRepeatMinutes();
     refresh_timer_->setInterval(refresh_interval_ms_);
     if (refresh_interval_spinbox_ != nullptr) {
         refresh_interval_spinbox_->blockSignals(true);
         refresh_interval_spinbox_->setValue(std::max(kMinRefreshIntervalSeconds, refresh_interval_ms_ / 1000));
         refresh_interval_spinbox_->blockSignals(false);
     }
+    if (low_battery_threshold_spinbox_ != nullptr) {
+        low_battery_threshold_spinbox_->blockSignals(true);
+        low_battery_threshold_spinbox_->setValue(low_battery_threshold_percent_);
+        low_battery_threshold_spinbox_->blockSignals(false);
+    }
+    if (low_battery_repeat_spinbox_ != nullptr) {
+        low_battery_repeat_spinbox_->blockSignals(true);
+        low_battery_repeat_spinbox_->setValue(low_battery_repeat_minutes_);
+        low_battery_repeat_spinbox_->blockSignals(false);
+    }
     connect(refresh_timer_, &QTimer::timeout, this, [this]() { RefreshBatteryData(); });
     refresh_timer_->start();
     UpdateRefreshSettingsTooltip();
+    RunLowBatteryNotificationSelfCheck();
 
     LoadPersistedDeviceOrder(&connected_device_order_, &disconnected_device_order_);
 
@@ -1367,6 +1842,17 @@ void BatteryWindow::ShowWindowFromTray() {
 }
 
 void BatteryWindow::HideWindowToTray() {
+    settings_panel_expanded_ = false;
+    if (settings_panel_animation_ != nullptr) {
+        settings_panel_animation_->stop();
+    }
+    if (settings_panel_ != nullptr) {
+        settings_panel_->setMaximumHeight(0);
+        settings_panel_->setMinimumHeight(0);
+        settings_panel_->setVisible(false);
+    }
+    AdjustWindowHeightForRows(kMaxVisibleRows);
+
     hide();
     UpdateToggleActionText();
 }
@@ -1424,6 +1910,99 @@ void BatteryWindow::UpdateTrayTooltip(const std::vector<DeviceBatteryInfo>& devi
     tray_icon_->setToolTip(tooltip);
 }
 
+void BatteryWindow::NotifyLowBatteryIfNeeded(const std::vector<DeviceBatteryInfo>& devices) {
+    std::unordered_map<std::string, LowBatteryDeviceState> device_states;
+    const std::uint8_t threshold_percent =
+        static_cast<std::uint8_t>(ClampLowBatteryThresholdPercent(low_battery_threshold_percent_));
+    const std::int64_t repeat_interval_ms =
+        static_cast<std::int64_t>(ClampLowBatteryRepeatMinutes(low_battery_repeat_minutes_)) * 60LL * 1000LL;
+    const std::int64_t now_ms = QDateTime::currentMSecsSinceEpoch();
+
+    for (const auto& entry : devices) {
+        const std::string component = NormalizeComponentName(entry.battery_component);
+        const std::string key = entry.device_id + "|" + component;
+        if (!entry.is_connected) {
+            last_live_component_levels_.erase(key);
+            last_low_battery_alert_ms_.erase(key);
+            continue;
+        }
+        if (entry.is_cached || !entry.battery_level_percent.has_value()) {
+            continue;
+        }
+        const std::uint8_t current_level = *entry.battery_level_percent;
+        const auto previous_it = last_live_component_levels_.find(key);
+        const bool is_below_threshold = current_level < threshold_percent;
+        bool should_alert = false;
+        if (is_below_threshold) {
+            if (previous_it == last_live_component_levels_.end() || previous_it->second >= threshold_percent) {
+                should_alert = true;
+            } else {
+                const auto alert_it = last_low_battery_alert_ms_.find(key);
+                should_alert = (alert_it == last_low_battery_alert_ms_.end()) ||
+                               (now_ms - alert_it->second >= repeat_interval_ms);
+            }
+        } else {
+            last_low_battery_alert_ms_.erase(key);
+        }
+        last_live_component_levels_[key] = current_level;
+        if (!should_alert) {
+            // keep component state for contextual line2 formatting
+        } else {
+            last_low_battery_alert_ms_[key] = now_ms;
+        }
+
+        auto& device_state = device_states[entry.device_id];
+        if (device_state.device_name.isEmpty()) {
+            device_state.device_name = ToQString(entry.device_name);
+        }
+
+        auto component_it = std::find_if(device_state.components.begin(),
+                                         device_state.components.end(),
+                                         [&](const LowBatteryComponentState& state) {
+                                             return state.component == component;
+                                         });
+        if (component_it == device_state.components.end()) {
+            device_state.components.push_back(
+                LowBatteryComponentState{component, current_level, is_below_threshold, should_alert});
+        } else {
+            component_it->level = current_level;
+            component_it->below_threshold = is_below_threshold;
+            component_it->triggered = component_it->triggered || should_alert;
+        }
+    }
+
+    std::vector<LowBatteryNotificationText> notifications;
+    notifications.reserve(device_states.size());
+    for (const auto& [device_id, state] : device_states) {
+        Q_UNUSED(device_id);
+        const bool has_triggered = std::any_of(state.components.begin(), state.components.end(),
+                                               [](const LowBatteryComponentState& component) {
+                                                   return component.triggered;
+                                               });
+        if (!has_triggered) {
+            continue;
+        }
+        notifications.push_back(FormatLowBatteryNotification(state));
+    }
+
+    if (notifications.empty()) {
+        return;
+    }
+
+    std::sort(notifications.begin(), notifications.end(),
+              [](const LowBatteryNotificationText& lhs, const LowBatteryNotificationText& rhs) {
+                  return lhs.critical_level < rhs.critical_level;
+              });
+
+    QApplication::beep();
+
+    const auto& most_critical = notifications.front();
+    ShowLowBatteryToastMessage(most_critical.title, most_critical.line1, most_critical.line2, 7000);
+
+    if (status_label_ != nullptr) {
+        status_label_->setText(most_critical.title + QStringLiteral(": ") + most_critical.line1);
+    }
+}
 void BatteryWindow::AdjustWindowHeightForRows(int visible_rows) {
     if (visible_rows < 1 || scroll_area_ == nullptr || cards_layout_ == nullptr || layout() == nullptr) {
         return;
@@ -1476,10 +2055,17 @@ void BatteryWindow::UpdateRefreshSettingsTooltip() {
         return;
     }
     const int seconds = std::max(kMinRefreshIntervalSeconds, refresh_interval_ms_ / 1000);
+    const int threshold = ClampLowBatteryThresholdPercent(low_battery_threshold_percent_);
+    const int repeat_minutes = ClampLowBatteryRepeatMinutes(low_battery_repeat_minutes_);
     settings_button_->setToolTip(
         QString::fromUtf8(u8"\u0410\u0432\u0442\u043E\u043E\u0431\u043D\u043E\u0432\u043B\u044F\u0442\u044C "
-                          u8"\u043A\u0430\u0436\u0434\u044B\u0435 %1 \u0441\u0435\u043A")
-            .arg(seconds));
+                          u8"\u043A\u0430\u0436\u0434\u044B\u0435 %1 \u0441\u0435\u043A\n"
+                          u8"\u041F\u043E\u0440\u043E\u0433 \u043D\u0438\u0437\u043A\u043E\u0433\u043E "
+                          u8"\u0437\u0430\u0440\u044F\u0434\u0430: %2%\n"
+                          u8"\u041F\u043E\u0432\u0442\u043E\u0440 \u0443\u0432\u0435\u0434\u043E\u043C\u043B\u0435\u043D\u0438\u0439: %3 \u043C\u0438\u043D")
+            .arg(seconds)
+            .arg(threshold)
+            .arg(repeat_minutes));
 }
 
 void BatteryWindow::ApplyRefreshIntervalSeconds(int seconds, bool announce_status) {
@@ -1499,6 +2085,46 @@ void BatteryWindow::ApplyRefreshIntervalSeconds(int seconds, bool announce_statu
                               .arg(refresh_interval_ms_ / 1000));
 }
 
+void BatteryWindow::ApplyLowBatteryThresholdPercent(int percent, bool announce_status) {
+    const int new_threshold = ClampLowBatteryThresholdPercent(percent);
+    const bool threshold_changed = new_threshold != low_battery_threshold_percent_;
+    low_battery_threshold_percent_ = new_threshold;
+    SaveLowBatteryThresholdPercent(low_battery_threshold_percent_);
+    UpdateRefreshSettingsTooltip();
+
+    if (threshold_changed) {
+        // Re-arm edge-detection for the new threshold and evaluate current snapshot once.
+        last_live_component_levels_.clear();
+        last_low_battery_alert_ms_.clear();
+        if (!last_devices_snapshot_.empty()) {
+            NotifyLowBatteryIfNeeded(last_devices_snapshot_);
+        }
+    }
+
+    if (!announce_status || status_label_ == nullptr) {
+        return;
+    }
+
+    status_label_->setText(QString::fromUtf8(u8"\u041F\u043E\u0440\u043E\u0433 "
+                                             u8"\u043D\u0438\u0437\u043A\u043E\u0433\u043E "
+                                             u8"\u0437\u0430\u0440\u044F\u0434\u0430: %1%")
+                              .arg(low_battery_threshold_percent_));
+}
+
+void BatteryWindow::ApplyLowBatteryRepeatMinutes(int minutes, bool announce_status) {
+    low_battery_repeat_minutes_ = ClampLowBatteryRepeatMinutes(minutes);
+    SaveLowBatteryRepeatMinutes(low_battery_repeat_minutes_);
+    UpdateRefreshSettingsTooltip();
+
+    if (!announce_status || status_label_ == nullptr) {
+        return;
+    }
+
+    status_label_->setText(QString::fromUtf8(u8"\u041F\u043E\u0432\u0442\u043E\u0440 "
+                                             u8"\u0443\u0432\u0435\u0434\u043E\u043C\u043B\u0435\u043D\u0438\u0439: %1 \u043C\u0438\u043D")
+                              .arg(low_battery_repeat_minutes_));
+}
+
 void BatteryWindow::ConfigureRefreshInterval() {
     if (settings_panel_ == nullptr || settings_panel_animation_ == nullptr) {
         return;
@@ -1515,6 +2141,18 @@ void BatteryWindow::ConfigureRefreshInterval() {
             refresh_interval_spinbox_->blockSignals(true);
             refresh_interval_spinbox_->setValue(std::max(kMinRefreshIntervalSeconds, refresh_interval_ms_ / 1000));
             refresh_interval_spinbox_->blockSignals(false);
+        }
+        if (low_battery_threshold_spinbox_ != nullptr) {
+            low_battery_threshold_spinbox_->blockSignals(true);
+            low_battery_threshold_spinbox_->setValue(
+                ClampLowBatteryThresholdPercent(low_battery_threshold_percent_));
+            low_battery_threshold_spinbox_->blockSignals(false);
+        }
+        if (low_battery_repeat_spinbox_ != nullptr) {
+            low_battery_repeat_spinbox_->blockSignals(true);
+            low_battery_repeat_spinbox_->setValue(
+                ClampLowBatteryRepeatMinutes(low_battery_repeat_minutes_));
+            low_battery_repeat_spinbox_->blockSignals(false);
         }
 
         const int start_height = std::max(0, settings_panel_->maximumHeight());
@@ -1619,6 +2257,7 @@ void BatteryWindow::RefreshBatteryData() {
                 }
 
                 if (result.error_text.isEmpty()) {
+                    NotifyLowBatteryIfNeeded(result.devices);
                     last_devices_snapshot_ = result.devices;
                     PopulateDeviceCards(result.devices);
                     UpdateTrayTooltip(result.devices);

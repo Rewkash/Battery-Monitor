@@ -2,6 +2,7 @@
 
 #include <exception>
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <thread>
@@ -55,8 +56,11 @@ class BatteryWindow : public QWidget {
     void ResetHiddenDevices();
     void UpdateToggleActionText();
     void UpdateTrayTooltip(const std::vector<DeviceBatteryInfo>& devices);
+    void NotifyLowBatteryIfNeeded(const std::vector<DeviceBatteryInfo>& devices);
     void AdjustWindowHeightForRows(int visible_rows);
     void ApplyRefreshIntervalSeconds(int seconds, bool announce_status);
+    void ApplyLowBatteryThresholdPercent(int percent, bool announce_status);
+    void ApplyLowBatteryRepeatMinutes(int minutes, bool announce_status);
     void ConfigureRefreshInterval();
     void UpdateRefreshSettingsTooltip();
     void SetDeviceDragActive(bool active);
@@ -69,6 +73,8 @@ class BatteryWindow : public QWidget {
     QWidget* settings_panel_ = nullptr;
     QPropertyAnimation* settings_panel_animation_ = nullptr;
     QSpinBox* refresh_interval_spinbox_ = nullptr;
+    QSpinBox* low_battery_threshold_spinbox_ = nullptr;
+    QSpinBox* low_battery_repeat_spinbox_ = nullptr;
     QPushButton* refresh_button_ = nullptr;
     QPushButton* show_all_button_ = nullptr;
     QToolButton* settings_button_ = nullptr;
@@ -86,12 +92,16 @@ class BatteryWindow : public QWidget {
     std::vector<std::string> connected_device_order_;
     std::vector<std::string> disconnected_device_order_;
     std::vector<DeviceBatteryInfo> last_devices_snapshot_;
+    std::unordered_map<std::string, std::uint8_t> last_live_component_levels_;
+    std::unordered_map<std::string, std::int64_t> last_low_battery_alert_ms_;
     std::thread refresh_worker_;
     std::atomic<bool> refresh_in_progress_{false};
     bool refresh_pending_ = false;
     bool drag_in_progress_ = false;
     bool settings_panel_expanded_ = false;
     int refresh_interval_ms_ = 15000;
+    int low_battery_threshold_percent_ = 10;
+    int low_battery_repeat_minutes_ = 10;
     bool quitting_ = false;
 };
 
