@@ -12,10 +12,12 @@
 
 #include <QDateTime>
 #include <QEvent>
+#include <QPointer>
 #include <QWidget>
 
 #include "core/BatteryTypes.h"
 #include "core/IBluetoothBatteryProvider.h"
+#include "ui/BatteryHistoryStore.h"
 
 class QAction;
 class QLabel;
@@ -33,6 +35,8 @@ class QWidget;
 class QCloseEvent;
 
 namespace battery_monitor {
+
+class BatteryHistoryDialog;
 
 class BatteryWindow : public QWidget {
    public:
@@ -57,6 +61,8 @@ class BatteryWindow : public QWidget {
     void UpdateToggleActionText();
     void UpdateTrayTooltip(const std::vector<DeviceBatteryInfo>& devices);
     void NotifyLowBatteryIfNeeded(const std::vector<DeviceBatteryInfo>& devices);
+    void RecordBatteryHistory(const std::vector<DeviceBatteryInfo>& devices);
+    void ShowBatteryHistory(const std::string& device_id, const std::string& fallback_name);
     void AdjustWindowHeightForRows(int visible_rows);
     void ApplyRefreshIntervalSeconds(int seconds, bool announce_status);
     void ApplyLowBatteryThresholdPercent(int percent, bool announce_status);
@@ -94,6 +100,7 @@ class BatteryWindow : public QWidget {
     std::vector<DeviceBatteryInfo> last_devices_snapshot_;
     std::unordered_map<std::string, std::uint8_t> last_live_component_levels_;
     std::unordered_map<std::string, std::int64_t> last_low_battery_alert_ms_;
+    std::unordered_map<std::string, QPointer<BatteryHistoryDialog>> history_dialogs_;
     std::thread refresh_worker_;
     std::atomic<bool> refresh_in_progress_{false};
     bool refresh_pending_ = false;
@@ -103,6 +110,7 @@ class BatteryWindow : public QWidget {
     int low_battery_threshold_percent_ = 10;
     int low_battery_repeat_minutes_ = 10;
     bool quitting_ = false;
+    BatteryHistoryStore history_store_;
 };
 
 }  // namespace battery_monitor

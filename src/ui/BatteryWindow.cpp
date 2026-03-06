@@ -1,4 +1,5 @@
 #include "ui/BatteryWindow.h"
+#include "ui/BatteryHistoryDialog.h"
 
 #include <algorithm>
 #include <cctype>
@@ -2003,6 +2004,48 @@ void BatteryWindow::NotifyLowBatteryIfNeeded(const std::vector<DeviceBatteryInfo
         status_label_->setText(most_critical.title + QStringLiteral(": ") + most_critical.line1);
     }
 }
+
+void BatteryWindow::RecordBatteryHistory(const std::vector<DeviceBatteryInfo>& devices) {
+    history_store_.RecordSnapshot(devices);
+
+    for (auto it = history_dialogs_.begin(); it != history_dialogs_.end();) {
+        if (it->second.isNull()) {
+            it = history_dialogs_.erase(it);
+            continue;
+        }
+
+        it->second->SetHistory(history_store_.LoadHistory(ToQString(it->first)));
+        ++it;
+    }
+}
+
+void BatteryWindow::ShowBatteryHistory(const std::string& device_id, const std::string& fallback_name) {
+    if (device_id.empty()) {
+        return;
+    }
+
+    BatteryHistoryData history = history_store_.LoadHistory(ToQString(device_id));
+    if (history.device_name.trimmed().isEmpty()) {
+        history.device_name = ToQString(fallback_name);
+    }
+
+    const auto existing_dialog = history_dialogs_.find(device_id);
+    if (existing_dialog != history_dialogs_.end() && !existing_dialog->second.isNull()) {
+        existing_dialog->second->SetHistory(std::move(history));
+        existing_dialog->second->show();
+        existing_dialog->second->raise();
+        existing_dialog->second->activateWindow();
+        return;
+    }
+
+    auto* dialog = new BatteryHistoryDialog(std::move(history), this);
+    history_dialogs_[device_id] = dialog;
+    connect(dialog, &QObject::destroyed, this, [this, device_id]() { history_dialogs_.erase(device_id); });
+    dialog->show();
+    dialog->raise();
+    dialog->activateWindow();
+}
+
 void BatteryWindow::AdjustWindowHeightForRows(int visible_rows) {
     if (visible_rows < 1 || scroll_area_ == nullptr || cards_layout_ == nullptr || layout() == nullptr) {
         return;
@@ -2258,6 +2301,7 @@ void BatteryWindow::RefreshBatteryData() {
 
                 if (result.error_text.isEmpty()) {
                     NotifyLowBatteryIfNeeded(result.devices);
+                    RecordBatteryHistory(result.devices);
                     last_devices_snapshot_ = result.devices;
                     PopulateDeviceCards(result.devices);
                     UpdateTrayTooltip(result.devices);
@@ -2471,12 +2515,19 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
 
         auto* actions_menu = new QMenu(actions_button);
         auto* refresh_row_action = actions_menu->addAction(QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u0438\u0442\u044C"));
+        auto* history_row_action =
+            actions_menu->addAction(QString::fromUtf8(u8"\u0413\u0440\u0430\u0444\u0438\u043A "
+                                                      u8"\u0440\u0430\u0437\u0440\u044F\u0434\u043A\u0438"));
         auto* hide_row_action =
             actions_menu->addAction(QString::fromUtf8(u8"\u0421\u043A\u0440\u044B\u0442\u044C "
                                                       u8"\u0443\u0441\u0442\u0440\u043E\u0439\u0441\u0442\u0432\u043E"));
         actions_button->setMenu(actions_menu);
 
         connect(refresh_row_action, &QAction::triggered, this, [this]() { RefreshBatteryData(); });
+        connect(history_row_action, &QAction::triggered, this,
+                [this, device_id = device.device_id, device_name = device.device_name]() {
+                    ShowBatteryHistory(device_id, device_name);
+                });
         connect(hide_row_action, &QAction::triggered, this, [this, device_id = device.device_id]() {
             hidden_device_ids_.insert(device_id);
             RefreshBatteryData();

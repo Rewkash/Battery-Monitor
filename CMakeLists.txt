@@ -105,6 +105,10 @@ if(BATTERY_MONITOR_QT_ENABLED)
     target_sources(
         battery-monitor
         PRIVATE
+            src/ui/BatteryHistoryDialog.cpp
+            src/ui/BatteryHistoryDialog.h
+            src/ui/BatteryHistoryStore.cpp
+            src/ui/BatteryHistoryStore.h
             src/ui/BatteryWindow.cpp
             src/ui/BatteryWindow.h
     )
