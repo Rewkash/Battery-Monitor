@@ -18,6 +18,9 @@ class WinRtBatteryProvider final : public IBluetoothBatteryProvider, public INoi
                          const std::string& submode_id) override;
     bool ProbeXiaomiNoiseControl(const std::string& device_hint = std::string());
     bool ObserveXiaomiControlSession(const std::string& device_hint = std::string(), int duration_seconds = 45);
+    bool ObserveZmiSerialSession(const std::string& device_hint = std::string(), int duration_seconds = 20);
+    bool DumpBluetoothServices(const std::string& device_hint = std::string());
+    bool DumpBleGatt(const std::string& device_hint = std::string());
     bool SetXiaomiNoiseMode(const std::string& mode, const std::string& device_hint = std::string());
     bool SendXiaomiControlCandidate(int candidate_id, const std::string& device_hint = std::string());
     bool SetXiaomiNoiseSubmode(const std::string& family, int submode, const std::string& device_hint = std::string());

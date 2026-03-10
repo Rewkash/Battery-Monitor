@@ -117,6 +117,9 @@ int main(int argc, char** argv) {
     bool include_offline = false;
     bool probe_xiaomi_noise = false;
     bool observe_xiaomi_control = false;
+    bool observe_zmi_serial = false;
+    bool dump_bluetooth_services = false;
+    bool dump_ble_gatt = false;
     bool set_xiaomi_noise_mode = false;
     bool send_xiaomi_candidate = false;
     bool set_xiaomi_submode = false;
@@ -157,6 +160,39 @@ int main(int argc, char** argv) {
         }
         if (arg == "--observe-xiaomi-control") {
             observe_xiaomi_control = true;
+            if (i + 1 < argc) {
+                const std::string next = argv[i + 1];
+                if (!next.empty() && next[0] != '-') {
+                    probe_device_hint = next;
+                    ++i;
+                }
+            }
+            continue;
+        }
+        if (arg == "--observe-zmi-serial") {
+            observe_zmi_serial = true;
+            if (i + 1 < argc) {
+                const std::string next = argv[i + 1];
+                if (!next.empty() && next[0] != '-') {
+                    probe_device_hint = next;
+                    ++i;
+                }
+            }
+            continue;
+        }
+        if (arg == "--dump-bt-services") {
+            dump_bluetooth_services = true;
+            if (i + 1 < argc) {
+                const std::string next = argv[i + 1];
+                if (!next.empty() && next[0] != '-') {
+                    probe_device_hint = next;
+                    ++i;
+                }
+            }
+            continue;
+        }
+        if (arg == "--dump-ble-gatt") {
+            dump_ble_gatt = true;
             if (i + 1 < argc) {
                 const std::string next = argv[i + 1];
                 if (!next.empty() && next[0] != '-') {
@@ -226,6 +262,18 @@ int main(int argc, char** argv) {
         if (observe_xiaomi_control) {
             battery_monitor::WinRtBatteryProvider provider;
             return provider.ObserveXiaomiControlSession(probe_device_hint, observe_seconds) ? 0 : 2;
+        }
+        if (observe_zmi_serial) {
+            battery_monitor::WinRtBatteryProvider provider;
+            return provider.ObserveZmiSerialSession(probe_device_hint, observe_seconds) ? 0 : 2;
+        }
+        if (dump_bluetooth_services) {
+            battery_monitor::WinRtBatteryProvider provider;
+            return provider.DumpBluetoothServices(probe_device_hint) ? 0 : 2;
+        }
+        if (dump_ble_gatt) {
+            battery_monitor::WinRtBatteryProvider provider;
+            return provider.DumpBleGatt(probe_device_hint) ? 0 : 2;
         }
         if (probe_xiaomi_noise) {
             battery_monitor::WinRtBatteryProvider provider;
