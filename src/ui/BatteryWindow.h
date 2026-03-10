@@ -72,6 +72,11 @@ class BatteryWindow : public QWidget {
     void UpdateRefreshSettingsTooltip();
     void SetDeviceDragActive(bool active);
     void ApplyNoiseControlMode(const std::string& device_id, NoiseControlMode mode);
+    void ApplyNoiseSubmode(const std::string& device_id, NoiseControlMode mode, const std::string& submode_id);
+    void ShowNoiseSubmodeMenu(QWidget* anchor,
+                              const std::string& device_id,
+                              NoiseControlMode mode,
+                              const std::string& active_submode_id);
     static std::string FormatError(const std::exception& ex);
 
     std::unique_ptr<IBluetoothBatteryProvider> provider_;

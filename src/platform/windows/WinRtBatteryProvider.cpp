@@ -7668,6 +7668,59 @@ bool WinRtBatteryProvider::SetNoiseControlMode(const std::string& device_id, Noi
     return observed_confirmation;
 }
 
+bool WinRtBatteryProvider::SupportsNoiseSubmodes(const std::string& device_id, NoiseControlMode mode) {
+    return SupportsNoiseControl(device_id) &&
+           (mode == NoiseControlMode::Transparency || mode == NoiseControlMode::Anc);
+}
+
+std::vector<std::pair<std::string, std::string>> WinRtBatteryProvider::GetNoiseSubmodes(const std::string& device_id,
+                                                                                         NoiseControlMode mode) {
+    if (!SupportsNoiseSubmodes(device_id, mode)) {
+        return {};
+    }
+
+    return {
+        {"standard", "Прозрачность"},
+        {"voice", "Усиление голоса"},
+    };
+}
+
+bool WinRtBatteryProvider::SetNoiseSubmode(const std::string& device_id,
+                                           NoiseControlMode mode,
+                                           const std::string& submode_id) {
+    if (!SupportsNoiseSubmodes(device_id, mode)) {
+        return false;
+    }
+
+    const std::string normalized_submode = ToLowerAscii(submode_id);
+    if (mode == NoiseControlMode::Transparency) {
+        if (normalized_submode == "standard") {
+            return SetXiaomiNoiseSubmode("transparency", 0, device_id);
+        }
+        if (normalized_submode == "voice") {
+            return SetXiaomiNoiseSubmode("transparency", 1, device_id);
+        }
+        return false;
+    }
+
+    if (mode == NoiseControlMode::Anc) {
+        if (normalized_submode == "balanced") {
+            return SetXiaomiNoiseSubmode("anc", 0, device_id);
+        }
+        if (normalized_submode == "weak") {
+            return SetXiaomiNoiseSubmode("anc", 1, device_id);
+        }
+        if (normalized_submode == "deep") {
+            return SetXiaomiNoiseSubmode("anc", 2, device_id);
+        }
+        if (normalized_submode == "adaptive") {
+            return SetXiaomiNoiseSubmode("anc", 3, device_id);
+        }
+    }
+
+    return false;
+}
+
 bool WinRtBatteryProvider::SendXiaomiControlCandidate(int candidate_id, const std::string& device_hint) {
     struct Candidate {
         int id = 0;
@@ -7817,6 +7870,107 @@ bool WinRtBatteryProvider::SendXiaomiControlCandidate(int candidate_id, const st
     closesocket(socket_handle);
     std::cout << "Candidate finished.\n";
     return true;
+}
+
+bool WinRtBatteryProvider::SetXiaomiNoiseSubmode(const std::string& family, int submode, const std::string& device_hint) {
+    const std::string normalized_family = ToLowerAscii(family);
+    std::uint8_t family_code = 0;
+    int max_submode = 0;
+    if (normalized_family == "transparency" || normalized_family == "transparent") {
+        family_code = 0x02;
+        max_submode = 1;
+    } else if (normalized_family == "anc") {
+        family_code = 0x01;
+        max_submode = 3;
+    } else {
+        std::cout << "Unknown family. Use anc or transparency\n";
+        return false;
+    }
+
+    if (submode < 0 || submode > max_submode) {
+        std::cout << "Submode out of range.\n";
+        return false;
+    }
+
+    BatteryQueryOptions options;
+    options.include_disconnected = false;
+    const auto devices = GetDevicesBattery(options);
+
+    std::vector<std::pair<std::string, std::uint64_t>> candidates;
+    std::unordered_set<std::uint64_t> seen_addresses;
+    const std::string normalized_hint = ToLowerAscii(device_hint);
+    for (const auto& entry : devices) {
+        if (!entry.is_connected) {
+            continue;
+        }
+        if (!IsLikelyXiaomiEarbuds(entry.device_name, entry.device_name, entry.device_id)) {
+            continue;
+        }
+        if (!normalized_hint.empty()) {
+            const std::string probe = ToLowerAscii(entry.device_name + " " + entry.device_id);
+            if (probe.find(normalized_hint) == std::string::npos) {
+                continue;
+            }
+        }
+        const auto address = ParseBluetoothAddressFromDeviceId(entry.device_id);
+        if (!address.has_value() || !seen_addresses.insert(*address).second) {
+            continue;
+        }
+        candidates.emplace_back(entry.device_name, *address);
+    }
+
+    if (candidates.empty()) {
+        std::cout << "No connected Xiaomi/Redmi earbuds candidates were found.\n";
+        return false;
+    }
+
+    ScopedWsa wsa;
+    if (!wsa.started()) {
+        return false;
+    }
+    SOCKET socket_handle = INVALID_SOCKET;
+    std::string connected_path;
+    if (!ConnectXiaomiControlSocket(candidates.front().second, &socket_handle, &connected_path)) {
+        return false;
+    }
+
+    std::uint8_t sequence = 0;
+    if (!RunXiaomiAuthHandshake(socket_handle, &sequence)) {
+        closesocket(socket_handle);
+        return false;
+    }
+
+    XiaomiMessage message;
+    message.type = static_cast<XiaomiMessageType>(0xC1U);
+    message.opcode = static_cast<XiaomiOpcode>(0xF2U);
+    message.sequence = sequence++;
+    message.payload = {0x04, 0x00, 0x0B, family_code, static_cast<std::uint8_t>(submode)};
+    std::cout << "Sending submode family=" << normalized_family
+              << " submode=" << submode
+              << " payload=" << BytesToHex(message.payload) << "\n";
+    const bool sent = SendAll(socket_handle, EncodeXiaomiMessage(message));
+
+    std::vector<std::uint8_t> rx_buffer;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2500);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto chunk = ReceiveChunk(socket_handle);
+        if (!chunk.has_value()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+            continue;
+        }
+        std::cout << "chunk: " << BytesToHex(*chunk) << "\n";
+        rx_buffer.insert(rx_buffer.end(), chunk->begin(), chunk->end());
+        const auto messages = DecodeXiaomiMessages(&rx_buffer);
+        for (const auto& response : messages) {
+            std::cout << "rx type=" << ByteToHex(static_cast<std::uint8_t>(response.type))
+                      << " opcode=" << ByteToHex(static_cast<std::uint8_t>(response.opcode))
+                      << " seq=" << static_cast<int>(response.sequence)
+                      << " payload=" << BytesToHex(response.payload) << "\n";
+        }
+    }
+
+    closesocket(socket_handle);
+    return sent;
 }
 
 }  // namespace battery_monitor

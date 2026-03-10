@@ -2328,6 +2328,117 @@ void BatteryWindow::ApplyNoiseControlMode(const std::string& device_id, NoiseCon
     });
 }
 
+void BatteryWindow::ApplyNoiseSubmode(const std::string& device_id,
+                                      NoiseControlMode mode,
+                                      const std::string& submode_id) {
+    auto* noise_provider = dynamic_cast<INoiseControlProvider*>(provider_.get());
+    if (noise_provider == nullptr || !noise_provider->SupportsNoiseSubmodes(device_id, mode)) {
+        if (status_label_ != nullptr) {
+            status_label_->setText(
+                QString::fromUtf8(u8"\u041F\u043E\u0434\u0440\u0435\u0436\u0438\u043C\u044B "
+                                 u8"\u0434\u043B\u044F \u044D\u0442\u043E\u0433\u043E "
+                                 u8"\u0443\u0441\u0442\u0440\u043E\u0439\u0441\u0442\u0432\u0430 "
+                                 u8"\u043D\u0435 \u043F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u044E\u0442\u0441\u044F"));
+        }
+        return;
+    }
+
+    if (refresh_in_progress_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    if (refresh_worker_.joinable()) {
+        refresh_worker_.join();
+    }
+    refresh_in_progress_.store(true, std::memory_order_release);
+    refresh_button_->setEnabled(false);
+    show_all_button_->setEnabled(false);
+    status_label_->setText(QString::fromUtf8(u8"\u041F\u0435\u0440\u0435\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435 "
+                                             u8"\u043F\u043E\u0434\u0440\u0435\u0436\u0438\u043C\u0430..."));
+
+    refresh_worker_ = std::thread([this, device_id, mode, submode_id]() {
+        bool ok = false;
+        std::string error_text;
+        try {
+            if (auto* provider = dynamic_cast<INoiseControlProvider*>(provider_.get()); provider != nullptr) {
+                ok = provider->SetNoiseSubmode(device_id, mode, submode_id);
+            }
+            if (!ok) {
+                error_text = "failed";
+            }
+        } catch (const std::exception& ex) {
+            error_text = FormatError(ex);
+        } catch (...) {
+            error_text = "unknown";
+        }
+
+        QMetaObject::invokeMethod(
+            this,
+            [this, ok, error_text = std::move(error_text)]() {
+                refresh_in_progress_.store(false, std::memory_order_release);
+                refresh_button_->setEnabled(true);
+                show_all_button_->setEnabled(!hidden_device_ids_.empty());
+                if (quitting_) {
+                    return;
+                }
+                if (ok) {
+                    status_label_->setText(QString::fromUtf8(u8"\u041F\u043E\u0434\u0440\u0435\u0436\u0438\u043C "
+                                                             u8"\u043F\u0435\u0440\u0435\u043A\u043B\u044E\u0447\u0451\u043D"));
+                    RefreshBatteryData();
+                } else {
+                    status_label_->setText(
+                        QString::fromUtf8(u8"\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C "
+                                          u8"\u043F\u0435\u0440\u0435\u043A\u043B\u044E\u0447\u0438\u0442\u044C "
+                                          u8"\u043F\u043E\u0434\u0440\u0435\u0436\u0438\u043C"));
+                }
+            },
+            Qt::QueuedConnection);
+    });
+}
+
+void BatteryWindow::ShowNoiseSubmodeMenu(QWidget* anchor,
+                                         const std::string& device_id,
+                                         NoiseControlMode mode,
+                                         const std::string& active_submode_id) {
+    auto* noise_provider = dynamic_cast<INoiseControlProvider*>(provider_.get());
+    if (anchor == nullptr || noise_provider == nullptr || !noise_provider->SupportsNoiseSubmodes(device_id, mode)) {
+        return;
+    }
+
+    QMenu menu(anchor);
+    const std::string normalized_active_id = ToLowerAscii(active_submode_id);
+    std::vector<std::pair<std::string, std::string>> submodes;
+    if (mode == NoiseControlMode::Transparency) {
+        submodes = {
+            {"standard", "Прозрачность"},
+            {"voice", "Усиление голоса"},
+        };
+    } else if (mode == NoiseControlMode::Anc) {
+        submodes = {
+            {"balanced", "Баланс"},
+            {"weak", "Слабое"},
+            {"deep", "Глубокое"},
+            {"adaptive", "Адаптивное"},
+        };
+    } else {
+        submodes = noise_provider->GetNoiseSubmodes(device_id, mode);
+    }
+
+    for (const auto& [submode_id, submode_label] : submodes) {
+        QAction* action = menu.addAction(ToQString(submode_label));
+        action->setCheckable(true);
+        action->setChecked(ToLowerAscii(submode_id) == normalized_active_id);
+        connect(action, &QAction::triggered, this,
+                [this, device_id, mode, submode_id]() { ApplyNoiseSubmode(device_id, mode, submode_id); });
+    }
+
+    if (menu.isEmpty()) {
+        return;
+    }
+
+    menu.exec(anchor->mapToGlobal(QPoint(0, anchor->height())));
+}
+
 void BatteryWindow::RefreshBatteryData() {
     if (drag_in_progress_) {
         refresh_pending_ = true;
@@ -2637,6 +2748,18 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
                 connect(button, &QPushButton::clicked, this, [this, device_id = device.device_id, mode]() {
                     ApplyNoiseControlMode(device_id, mode);
                 });
+                if ((mode == NoiseControlMode::Transparency || mode == NoiseControlMode::Anc) &&
+                    noise_provider->SupportsNoiseSubmodes(device.device_id, mode)) {
+                    button->setContextMenuPolicy(Qt::CustomContextMenu);
+                    button->setToolTip(
+                        QString::fromUtf8(u8"\u041F\u0440\u0430\u0432\u044B\u0439 \u043A\u043B\u0438\u043A: "
+                                          u8"\u0432\u044B\u0431\u043E\u0440 "
+                                          u8"\u043F\u043E\u0434\u0440\u0435\u0436\u0438\u043C\u0430"));
+                    connect(button, &QWidget::customContextMenuRequested, this,
+                            [this, button, device_id = device.device_id, mode](const QPoint&) {
+                                ShowNoiseSubmodeMenu(button, device_id, mode, std::string());
+                            });
+                }
                 noise_layout->addWidget(button);
             };
 

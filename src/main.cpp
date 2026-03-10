@@ -119,9 +119,12 @@ int main(int argc, char** argv) {
     bool observe_xiaomi_control = false;
     bool set_xiaomi_noise_mode = false;
     bool send_xiaomi_candidate = false;
+    bool set_xiaomi_submode = false;
     std::string probe_device_hint;
     std::string requested_noise_mode;
+    std::string requested_submode_family;
     int requested_candidate_id = 0;
+    int requested_submode = 0;
     int observe_seconds = 45;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -191,10 +194,27 @@ int main(int argc, char** argv) {
             }
             continue;
         }
+        if (arg == "--xiaomi-set-submode" && i + 2 < argc) {
+            set_xiaomi_submode = true;
+            requested_submode_family = argv[++i];
+            requested_submode = std::stoi(argv[++i]);
+            if (i + 1 < argc) {
+                const std::string next = argv[i + 1];
+                if (!next.empty() && next[0] != '-') {
+                    probe_device_hint = next;
+                    ++i;
+                }
+            }
+            continue;
+        }
     }
 
     try {
 #ifdef _WIN32
+        if (set_xiaomi_submode) {
+            battery_monitor::WinRtBatteryProvider provider;
+            return provider.SetXiaomiNoiseSubmode(requested_submode_family, requested_submode, probe_device_hint) ? 0 : 2;
+        }
         if (send_xiaomi_candidate) {
             battery_monitor::WinRtBatteryProvider provider;
             return provider.SendXiaomiControlCandidate(requested_candidate_id, probe_device_hint) ? 0 : 2;
