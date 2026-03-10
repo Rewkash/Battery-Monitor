@@ -69,6 +69,7 @@ struct ComponentEntry {
 struct DeviceEntry {
     std::string device_id;
     std::string device_name;
+    std::optional<std::string> device_mode;
     std::vector<ComponentEntry> components;
     bool is_connected = false;
 };
@@ -94,9 +95,12 @@ struct RefreshTaskResult {
 
 constexpr int kMaxVisibleRows = 3;
 constexpr int kCollapsedRowHeight = 88;
+constexpr int kNoiseControlRowHeight = 116;
 constexpr int kListPadding = 12;
 constexpr int kListSpacing = 10;
 constexpr int kListHeightSlack = 28;
+constexpr int kDefaultWindowWidth = 390;
+constexpr int kNoiseControlWindowWidth = 470;
 constexpr const char* kDeviceRowMimeType = "application/x-chargeview-device-row";
 constexpr const char* kSettingsGroupUi = "ui";
 constexpr const char* kSettingsConnectedOrderKey = "connected_order";
@@ -592,6 +596,25 @@ QString BuildComponentTriplet(const DeviceEntry& device) {
     return QString::fromUtf8(u8"\u041B:%1 \u041F:%2 \u041A:%3").arg(left_text, right_text, case_text);
 }
 
+QString BuildDeviceModeText(const DeviceEntry& device) {
+    if (!device.device_mode.has_value()) {
+        return {};
+    }
+
+    const std::string mode = ToLowerAscii(*device.device_mode);
+    if (mode == "off") {
+        return QString::fromUtf8(u8"\u0420\u0435\u0436\u0438\u043C: \u0432\u044B\u043A\u043B");
+    }
+    if (mode == "transparency") {
+        return QString::fromUtf8(u8"\u0420\u0435\u0436\u0438\u043C: \u043F\u0440\u043E\u0437\u0440\u0430\u0447\u043D\u043E\u0441\u0442\u044C");
+    }
+    if (mode == "anc") {
+        return QString::fromUtf8(u8"\u0420\u0435\u0436\u0438\u043C: \u0448\u0443\u043C\u043E\u043F\u043E\u0434\u0430\u0432\u043B\u0435\u043D\u0438\u0435");
+    }
+
+    return QString::fromUtf8(u8"\u0420\u0435\u0436\u0438\u043C: %1").arg(ToQString(*device.device_mode));
+}
+
 QString ProgressLevelState(const PrimaryBattery& primary) {
     if (!primary.level.has_value()) {
         return QStringLiteral("na");
@@ -768,12 +791,16 @@ std::vector<DeviceEntry> GroupDevices(const std::vector<DeviceBatteryInfo>& devi
             DeviceEntry device;
             device.device_id = device_id;
             device.device_name = device_name;
+            device.device_mode = item.device_mode;
             device.is_connected = item.is_connected;
             grouped.push_back(std::move(device));
         } else {
             index = found->second;
             if (grouped[index].device_name == "Unknown device" && device_name != "Unknown device") {
                 grouped[index].device_name = device_name;
+            }
+            if (!grouped[index].device_mode.has_value() && item.device_mode.has_value()) {
+                grouped[index].device_mode = item.device_mode;
             }
             grouped[index].is_connected = grouped[index].is_connected || item.is_connected;
         }
@@ -1307,7 +1334,7 @@ BatteryWindow::BatteryWindow(std::unique_ptr<IBluetoothBatteryProvider> provider
     setAttribute(Qt::WA_TranslucentBackground, true);
     setAttribute(Qt::WA_NoSystemBackground, true);
     setAutoFillBackground(false);
-    setFixedWidth(390);
+    setFixedWidth(kDefaultWindowWidth);
 
     setStyleSheet(R"(
 QWidget#trayPanelWindow {
@@ -2237,6 +2264,70 @@ void BatteryWindow::SetDeviceDragActive(bool active) {
     }
 }
 
+void BatteryWindow::ApplyNoiseControlMode(const std::string& device_id, NoiseControlMode mode) {
+    auto* noise_provider = dynamic_cast<INoiseControlProvider*>(provider_.get());
+    if (noise_provider == nullptr) {
+        if (status_label_ != nullptr) {
+            status_label_->setText(QString::fromUtf8(u8"\u0423\u043F\u0440\u0430\u0432\u043B\u0435\u043D\u0438\u0435 "
+                                                     u8"\u0440\u0435\u0436\u0438\u043C\u043E\u043C "
+                                                     u8"\u043D\u0435 \u043F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u0442\u0441\u044F"));
+        }
+        return;
+    }
+
+    if (refresh_in_progress_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    if (refresh_worker_.joinable()) {
+        refresh_worker_.join();
+    }
+    refresh_in_progress_.store(true, std::memory_order_release);
+    refresh_button_->setEnabled(false);
+    show_all_button_->setEnabled(false);
+    status_label_->setText(QString::fromUtf8(u8"\u041F\u0435\u0440\u0435\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435 "
+                                             u8"\u0440\u0435\u0436\u0438\u043C\u0430..."));
+
+    refresh_worker_ = std::thread([this, device_id, mode]() {
+        bool ok = false;
+        std::string error_text;
+        try {
+            if (auto* provider = dynamic_cast<INoiseControlProvider*>(provider_.get()); provider != nullptr) {
+                ok = provider->SetNoiseControlMode(device_id, mode);
+            }
+            if (!ok) {
+                error_text = "failed";
+            }
+        } catch (const std::exception& ex) {
+            error_text = FormatError(ex);
+        } catch (...) {
+            error_text = "unknown";
+        }
+
+        QMetaObject::invokeMethod(
+            this,
+            [this, ok, error_text = std::move(error_text)]() {
+                refresh_in_progress_.store(false, std::memory_order_release);
+                refresh_button_->setEnabled(true);
+                show_all_button_->setEnabled(!hidden_device_ids_.empty());
+                if (quitting_) {
+                    return;
+                }
+                if (ok) {
+                    status_label_->setText(QString::fromUtf8(u8"\u0420\u0435\u0436\u0438\u043C "
+                                                             u8"\u043F\u0435\u0440\u0435\u043A\u043B\u044E\u0447\u0451\u043D"));
+                    RefreshBatteryData();
+                } else {
+                    status_label_->setText(
+                        QString::fromUtf8(u8"\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C "
+                                          u8"\u043F\u0435\u0440\u0435\u043A\u043B\u044E\u0447\u0438\u0442\u044C "
+                                          u8"\u0440\u0435\u0436\u0438\u043C"));
+                }
+            },
+            Qt::QueuedConnection);
+    });
+}
+
 void BatteryWindow::RefreshBatteryData() {
     if (drag_in_progress_) {
         refresh_pending_ = true;
@@ -2352,6 +2443,15 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
     SyncOrderQueue(grouped, true, &connected_device_order_);
     SyncOrderQueue(grouped, false, &disconnected_device_order_);
     const auto ordered = ApplyCustomOrder(grouped, connected_device_order_, disconnected_device_order_);
+    const bool has_noise_control_devices = std::any_of(
+        ordered.begin(), ordered.end(),
+        [this](const DeviceEntry& device) {
+            auto* noise_provider = dynamic_cast<INoiseControlProvider*>(provider_.get());
+            return noise_provider != nullptr &&
+                   device.device_mode.has_value() &&
+                   noise_provider->SupportsNoiseControl(device.device_id);
+        });
+    setFixedWidth(has_noise_control_devices ? kNoiseControlWindowWidth : kDefaultWindowWidth);
 
     const auto now = QDateTime::currentDateTime();
     const int device_count = static_cast<int>(ordered.size());
@@ -2382,11 +2482,19 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
     }
 
     for (const auto& device : ordered) {
+        const bool is_active = IsDeviceConnected(device);
         auto* row = new DraggableDeviceRow(device.device_id, IsDeviceConnected(device), cards_container_);
         row->setObjectName(QStringLiteral("deviceRow"));
-        row->setFixedHeight(kCollapsedRowHeight);
-        row->setMinimumHeight(kCollapsedRowHeight);
-        row->setMaximumHeight(kCollapsedRowHeight);
+        auto* noise_provider = dynamic_cast<INoiseControlProvider*>(provider_.get());
+        const bool supports_noise_control =
+            noise_provider != nullptr &&
+            is_active &&
+            device.device_mode.has_value() &&
+            noise_provider->SupportsNoiseControl(device.device_id);
+        const int row_height = supports_noise_control ? kNoiseControlRowHeight : kCollapsedRowHeight;
+        row->setFixedHeight(row_height);
+        row->setMinimumHeight(row_height);
+        row->setMaximumHeight(row_height);
         row->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
         row->SetDragStateCallback([this](bool active) { SetDeviceDragActive(active); });
         row->SetReorderCallback([this](const std::string& dragged_device_id,
@@ -2440,7 +2548,6 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
         center_layout->setContentsMargins(0, 0, 0, 0);
         center_layout->setSpacing(4);
 
-        const bool is_active = IsDeviceConnected(device);
         const QString active_state = is_active ? QStringLiteral("active") : QStringLiteral("inactive");
         row->setProperty("activeState", active_state);
 
@@ -2455,6 +2562,7 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
         const auto primary = ComputePrimaryBattery(device);
         const QString level_state = ProgressLevelState(primary);
         const QString triplet_text = BuildComponentTriplet(device);
+        const QString mode_text = BuildDeviceModeText(device);
 
         auto* progress = new QProgressBar(center_widget);
         progress->setObjectName(QStringLiteral("deviceProgress"));
@@ -2475,6 +2583,10 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
         percent_chip->setProperty("activeState", active_state);
 
         QString technical_text = triplet_text;
+        if (!mode_text.isEmpty()) {
+            technical_text = technical_text.isEmpty() ? mode_text
+                                                      : technical_text + QStringLiteral("  \u00B7  ") + mode_text;
+        }
         if (!is_active) {
             const QString inactive_marker = QString::fromUtf8(u8"\u041D\u0435 \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u043E");
             technical_text = technical_text.isEmpty() ? inactive_marker
@@ -2506,6 +2618,33 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
         center_layout->addLayout(battery_layout);
         center_layout->addWidget(technical_label);
         center_layout->addStretch(1);
+
+        if (supports_noise_control) {
+            auto* noise_controls = new QWidget(center_widget);
+            auto* noise_layout = new QHBoxLayout(noise_controls);
+            noise_layout->setContentsMargins(0, 0, 0, 0);
+            noise_layout->setSpacing(4);
+
+            auto make_mode_button = [&](const QString& text, NoiseControlMode mode, const char* mode_name) {
+                auto* button = new QPushButton(text, noise_controls);
+                button->setMinimumHeight(24);
+                button->setMinimumWidth(74);
+                button->setCursor(Qt::PointingHandCursor);
+                const bool active_mode = ToLowerAscii(*device.device_mode) == mode_name;
+                if (active_mode) {
+                    button->setStyleSheet(QStringLiteral("QPushButton { font-weight: 600; }"));
+                }
+                connect(button, &QPushButton::clicked, this, [this, device_id = device.device_id, mode]() {
+                    ApplyNoiseControlMode(device_id, mode);
+                });
+                noise_layout->addWidget(button);
+            };
+
+            make_mode_button(QString::fromUtf8(u8"ANC"), NoiseControlMode::Anc, "anc");
+            make_mode_button(QString::fromUtf8(u8"\u041F\u0440\u043E\u0437\u0440\u0430\u0447"), NoiseControlMode::Transparency, "transparency");
+            make_mode_button(QString::fromUtf8(u8"\u0412\u044B\u043A\u043B"), NoiseControlMode::Off, "off");
+            center_layout->addWidget(noise_controls);
+        }
 
         auto* actions_button = new QToolButton(row);
         actions_button->setObjectName(QStringLiteral("inlineMenuButton"));

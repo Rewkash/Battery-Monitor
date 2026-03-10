@@ -14,6 +14,8 @@
 
 #ifdef _WIN32
 #include <winrt/base.h>
+
+#include "platform/windows/WinRtBatteryProvider.h"
 #endif
 
 #include "core/BatteryTypes.h"
@@ -74,6 +76,9 @@ void PrintTable(const std::vector<DeviceBatteryInfo>& devices) {
         if (!device.is_connected) {
             battery_text += " (offline)";
         }
+        if (device.device_mode.has_value()) {
+            battery_text += " [" + *device.device_mode + "]";
+        }
         std::cout << device.device_name << " | " << device.battery_component << " | "
                   << battery_text << " | " << device.device_id << '\n';
     }
@@ -89,6 +94,8 @@ void PrintJson(const std::vector<DeviceBatteryInfo>& devices) {
                   << "\"deviceName\":\"" << EscapeJson(device.device_name) << "\","
                   << "\"component\":\"" << EscapeJson(device.battery_component) << "\","
                   << "\"batteryLevelPercent\":" << battery_json << ","
+                  << "\"deviceMode\":"
+                  << (device.device_mode.has_value() ? ("\"" + EscapeJson(*device.device_mode) + "\"") : "null") << ","
                   << "\"isCached\":" << (device.is_cached ? "true" : "false") << ","
                   << "\"isConnected\":" << (device.is_connected ? "true" : "false") << "}";
         if (i + 1 < devices.size()) {
@@ -108,6 +115,14 @@ int main(int argc, char** argv) {
     bool cli_output = false;
     bool gui_forced = false;
     bool include_offline = false;
+    bool probe_xiaomi_noise = false;
+    bool observe_xiaomi_control = false;
+    bool set_xiaomi_noise_mode = false;
+    bool send_xiaomi_candidate = false;
+    std::string probe_device_hint;
+    std::string requested_noise_mode;
+    int requested_candidate_id = 0;
+    int observe_seconds = 45;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--json") {
@@ -124,10 +139,79 @@ int main(int argc, char** argv) {
         }
         if (arg == "--all" || arg == "--include-offline") {
             include_offline = true;
+            continue;
+        }
+        if (arg == "--probe-xiaomi-noise") {
+            probe_xiaomi_noise = true;
+            if (i + 1 < argc) {
+                const std::string next = argv[i + 1];
+                if (!next.empty() && next[0] != '-') {
+                    probe_device_hint = next;
+                    ++i;
+                }
+            }
+            continue;
+        }
+        if (arg == "--observe-xiaomi-control") {
+            observe_xiaomi_control = true;
+            if (i + 1 < argc) {
+                const std::string next = argv[i + 1];
+                if (!next.empty() && next[0] != '-') {
+                    probe_device_hint = next;
+                    ++i;
+                }
+            }
+            continue;
+        }
+        if (arg == "--observe-seconds" && i + 1 < argc) {
+            observe_seconds = std::max(5, std::stoi(argv[++i]));
+            continue;
+        }
+        if (arg == "--xiaomi-set-noise" && i + 1 < argc) {
+            set_xiaomi_noise_mode = true;
+            requested_noise_mode = argv[++i];
+            if (i + 1 < argc) {
+                const std::string next = argv[i + 1];
+                if (!next.empty() && next[0] != '-') {
+                    probe_device_hint = next;
+                    ++i;
+                }
+            }
+            continue;
+        }
+        if (arg == "--xiaomi-test-candidate" && i + 1 < argc) {
+            send_xiaomi_candidate = true;
+            requested_candidate_id = std::stoi(argv[++i]);
+            if (i + 1 < argc) {
+                const std::string next = argv[i + 1];
+                if (!next.empty() && next[0] != '-') {
+                    probe_device_hint = next;
+                    ++i;
+                }
+            }
+            continue;
         }
     }
 
     try {
+#ifdef _WIN32
+        if (send_xiaomi_candidate) {
+            battery_monitor::WinRtBatteryProvider provider;
+            return provider.SendXiaomiControlCandidate(requested_candidate_id, probe_device_hint) ? 0 : 2;
+        }
+        if (set_xiaomi_noise_mode) {
+            battery_monitor::WinRtBatteryProvider provider;
+            return provider.SetXiaomiNoiseMode(requested_noise_mode, probe_device_hint) ? 0 : 2;
+        }
+        if (observe_xiaomi_control) {
+            battery_monitor::WinRtBatteryProvider provider;
+            return provider.ObserveXiaomiControlSession(probe_device_hint, observe_seconds) ? 0 : 2;
+        }
+        if (probe_xiaomi_noise) {
+            battery_monitor::WinRtBatteryProvider provider;
+            return provider.ProbeXiaomiNoiseControl(probe_device_hint) ? 0 : 2;
+        }
+#endif
 #ifdef BATTERY_MONITOR_WITH_QT
         if (!json_output && (!cli_output || gui_forced)) {
             QApplication app(argc, argv);

@@ -546,6 +546,11 @@ struct ControllerBatteryCacheEntry {
     std::chrono::steady_clock::time_point captured_at = std::chrono::steady_clock::now();
 };
 
+struct XiaomiModeCacheEntry {
+    std::string mode;
+    std::chrono::steady_clock::time_point captured_at = std::chrono::steady_clock::now();
+};
+
 std::unordered_map<std::string, DualShockHidRouteCacheEntry>& DualShockHidRouteCache() {
     static std::unordered_map<std::string, DualShockHidRouteCacheEntry> cache;
     return cache;
@@ -562,6 +567,16 @@ std::unordered_map<std::string, ControllerBatteryCacheEntry>& ControllerBatteryC
 }
 
 std::mutex& ControllerBatteryCacheStoreMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::unordered_map<std::uint64_t, XiaomiModeCacheEntry>& XiaomiModeCacheStore() {
+    static std::unordered_map<std::uint64_t, XiaomiModeCacheEntry> cache;
+    return cache;
+}
+
+std::mutex& XiaomiModeCacheStoreMutex() {
     static std::mutex mutex;
     return mutex;
 }
@@ -2320,6 +2335,85 @@ std::vector<XiaomiMessage> DecodeXiaomiMessages(std::vector<std::uint8_t>* buffe
     }
 
     return messages;
+}
+
+std::optional<std::uint8_t> ParseXiaomiNoiseModeCodeFromRunInfoPayload(const std::vector<std::uint8_t>& payload) {
+    for (std::size_t index = 0; index + 2U < payload.size();) {
+        const std::size_t len = payload[index];
+        const std::size_t field_size = len + 1U;
+        if (len < 2U || index + field_size > payload.size()) {
+            break;
+        }
+        const std::uint8_t tag = payload[index + 1U];
+        if (tag == 0x09U && len >= 2U) {
+            return payload[index + 2U];
+        }
+        index += field_size;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::uint8_t> ParseXiaomiNoiseModeCodeFromStatusPayload(const std::vector<std::uint8_t>& payload) {
+    if (payload.size() >= 3U && payload[0] == 0x02U && payload[1] == 0x04U) {
+        return payload[2];
+    }
+    return std::nullopt;
+}
+
+std::optional<std::uint8_t> ParseXiaomiNoiseModeCodeFromF4Payload(const std::vector<std::uint8_t>& payload) {
+    if (payload.size() >= 4U && payload[0] == 0x04U && payload[1] == 0x00U && payload[2] == 0x0BU) {
+        return payload[3];
+    }
+    return std::nullopt;
+}
+
+std::optional<std::uint8_t> ParseXiaomiNoiseModeCode(std::uint8_t opcode, const std::vector<std::uint8_t>& payload) {
+    if (opcode == static_cast<std::uint8_t>(XiaomiOpcode::kGetDeviceRunInfo)) {
+        return ParseXiaomiNoiseModeCodeFromRunInfoPayload(payload);
+    }
+    if (opcode == static_cast<std::uint8_t>(XiaomiOpcode::kReportStatus)) {
+        return ParseXiaomiNoiseModeCodeFromStatusPayload(payload);
+    }
+    if (opcode == 0xF4U) {
+        return ParseXiaomiNoiseModeCodeFromF4Payload(payload);
+    }
+    return std::nullopt;
+}
+
+std::string XiaomiNoiseModeCodeToText(std::uint8_t code) {
+    if (code == 0U) {
+        return "off";
+    }
+    if (code == 2U) {
+        return "transparency";
+    }
+    if (code == 1U) {
+        return "anc";
+    }
+    return "mode " + std::to_string(code);
+}
+
+void PutXiaomiModeCacheEntry(std::uint64_t address, std::uint8_t code) {
+    if (address <= 0xFFFFULL) {
+        return;
+    }
+    XiaomiModeCacheEntry entry;
+    entry.mode = XiaomiNoiseModeCodeToText(code);
+    entry.captured_at = std::chrono::steady_clock::now();
+    const std::lock_guard<std::mutex> lock(XiaomiModeCacheStoreMutex());
+    XiaomiModeCacheStore()[address] = std::move(entry);
+}
+
+std::optional<std::string> TryGetXiaomiModeCacheEntry(std::uint64_t address) {
+    if (address <= 0xFFFFULL) {
+        return std::nullopt;
+    }
+    const std::lock_guard<std::mutex> lock(XiaomiModeCacheStoreMutex());
+    const auto found = XiaomiModeCacheStore().find(address);
+    if (found == XiaomiModeCacheStore().end()) {
+        return std::nullopt;
+    }
+    return found->second.mode;
 }
 
 std::uint32_t ModPow(std::uint32_t base, std::uint32_t exponent, std::uint32_t modulo) {
@@ -4114,6 +4208,14 @@ std::vector<BatteryReading> TryReadXiaomiClassicBattery(std::uint64_t bluetooth_
                          " payload=" + BytesToHex(message.payload));
             }
 
+            if (const auto mode_code =
+                    ParseXiaomiNoiseModeCode(static_cast<std::uint8_t>(opcode), message.payload);
+                mode_code.has_value()) {
+                PutXiaomiModeCacheEntry(bluetooth_address, *mode_code);
+                DebugLog("Xiaomi mode candidate code=" + std::to_string(*mode_code) +
+                         " text='" + XiaomiNoiseModeCodeToText(*mode_code) + "'");
+            }
+
             if (opcode == XiaomiOpcode::kAuthChallenge) {
                 if (type == XiaomiMessageType::kResponse) {
                     XiaomiMessage confirm;
@@ -4317,6 +4419,192 @@ std::vector<BatteryReading> TryReadXiaomiClassicBattery(std::uint64_t bluetooth_
 
     closesocket(socket_handle);
     return readings;
+}
+
+struct XiaomiProbeCommand {
+    const char* label = "";
+    XiaomiMessageType type = XiaomiMessageType::kPhoneRequest;
+    std::uint8_t opcode = 0;
+    std::vector<std::uint8_t> payload;
+    int pause_ms = 1800;
+};
+
+bool ConnectXiaomiControlSocket(std::uint64_t bluetooth_address, SOCKET* socket_handle, std::string* connected_path) {
+    if (socket_handle == nullptr || connected_path == nullptr) {
+        return false;
+    }
+
+    *socket_handle = INVALID_SOCKET;
+    connected_path->clear();
+
+    SOCKADDR_BTH address{};
+    address.addressFamily = AF_BTH;
+    address.btAddr = bluetooth_address;
+    address.port = BT_PORT_ANY;
+
+    auto try_connect = [&](const GUID& service_uuid, const char* service_name) -> bool {
+        auto connect_once = [&](bool secure_mode, const char* mode_suffix) -> bool {
+            const SOCKET candidate_socket = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
+            if (candidate_socket == INVALID_SOCKET) {
+                return false;
+            }
+
+            const ULONG secure_transport = secure_mode ? TRUE : FALSE;
+            setsockopt(candidate_socket, SOL_RFCOMM, SO_BTH_AUTHENTICATE,
+                       reinterpret_cast<const char*>(&secure_transport), sizeof(secure_transport));
+            setsockopt(candidate_socket, SOL_RFCOMM, SO_BTH_ENCRYPT,
+                       reinterpret_cast<const char*>(&secure_transport), sizeof(secure_transport));
+
+            const int timeout_ms = 320;
+            setsockopt(candidate_socket, SOL_SOCKET, SO_RCVTIMEO,
+                       reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+            setsockopt(candidate_socket, SOL_SOCKET, SO_SNDTIMEO,
+                       reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+
+            auto service_address = address;
+            service_address.serviceClassId = service_uuid;
+            if (!ConnectWithTimeout(candidate_socket, service_address, timeout_ms)) {
+                closesocket(candidate_socket);
+                return false;
+            }
+
+            *socket_handle = candidate_socket;
+            *connected_path = std::string(service_name) + mode_suffix;
+            return true;
+        };
+
+        return connect_once(true, "") || connect_once(false, "-insecure");
+    };
+
+    return try_connect(kXiaomiDeviceCtrlServiceUuid, "FD2D") ||
+           try_connect(kBluetoothSerialPortServiceUuid, "SPP-1101") ||
+           try_connect(kZmiPurPodsSerialServiceUuid, "ZMI-1101");
+}
+
+bool RunXiaomiAuthHandshake(SOCKET socket_handle, std::uint8_t* next_sequence) {
+    if (socket_handle == INVALID_SOCKET || next_sequence == nullptr) {
+        return false;
+    }
+
+    std::uint8_t sequence = 0;
+    const auto challenge = GenerateRandomChallenge();
+    XiaomiMessage auth_start;
+    auth_start.type = XiaomiMessageType::kPhoneRequest;
+    auth_start.opcode = XiaomiOpcode::kAuthChallenge;
+    auth_start.sequence = sequence++;
+    auth_start.payload.push_back(0x01);
+    auth_start.payload.insert(auth_start.payload.end(), challenge.begin(), challenge.end());
+    if (!SendAll(socket_handle, EncodeXiaomiMessage(auth_start))) {
+        return false;
+    }
+
+    std::vector<std::uint8_t> rx_buffer;
+    bool init_requests_sent = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1800);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto chunk = ReceiveChunk(socket_handle);
+        if (!chunk.has_value()) {
+            continue;
+        }
+
+        rx_buffer.insert(rx_buffer.end(), chunk->begin(), chunk->end());
+        const auto messages = DecodeXiaomiMessages(&rx_buffer);
+        for (const auto& message : messages) {
+            if (DebugEnabled()) {
+                DebugLog("Probe auth rx type=" + ByteToHex(static_cast<std::uint8_t>(message.type)) +
+                         " opcode=" + ByteToHex(static_cast<std::uint8_t>(message.opcode)) +
+                         " seq=" + std::to_string(message.sequence) +
+                         " payload=" + BytesToHex(message.payload));
+            }
+
+            if (message.opcode == XiaomiOpcode::kAuthChallenge) {
+                if (message.type == XiaomiMessageType::kResponse) {
+                    XiaomiMessage confirm;
+                    confirm.type = XiaomiMessageType::kPhoneRequest;
+                    confirm.opcode = XiaomiOpcode::kAuthConfirm;
+                    confirm.sequence = sequence++;
+                    confirm.payload = {0x01, 0x00};
+                    SendAll(socket_handle, EncodeXiaomiMessage(confirm));
+                    continue;
+                }
+
+                if (message.type == XiaomiMessageType::kEarbudsRequest && message.payload.size() >= 17U) {
+                    std::array<std::uint8_t, 16> remote_challenge{};
+                    std::copy_n(message.payload.begin() + 1, 16, remote_challenge.begin());
+                    const auto response = ComputeXiaomiChallengeResponse(remote_challenge);
+
+                    XiaomiMessage challenge_response;
+                    challenge_response.type = XiaomiMessageType::kResponse;
+                    challenge_response.opcode = XiaomiOpcode::kAuthChallenge;
+                    challenge_response.sequence = message.sequence;
+                    challenge_response.payload.push_back(0x01);
+                    challenge_response.payload.insert(challenge_response.payload.end(), response.begin(), response.end());
+                    SendAll(socket_handle, EncodeXiaomiMessage(challenge_response));
+                    continue;
+                }
+            }
+
+            if (message.opcode == XiaomiOpcode::kAuthConfirm && message.type == XiaomiMessageType::kEarbudsRequest) {
+                XiaomiMessage ack;
+                ack.type = XiaomiMessageType::kResponse;
+                ack.opcode = XiaomiOpcode::kAuthConfirm;
+                ack.sequence = message.sequence;
+                ack.payload = {0x01};
+                SendAll(socket_handle, EncodeXiaomiMessage(ack));
+
+                if (!init_requests_sent) {
+                    XiaomiMessage info_request;
+                    info_request.type = XiaomiMessageType::kPhoneRequest;
+                    info_request.opcode = XiaomiOpcode::kGetDeviceInfo;
+                    info_request.sequence = sequence++;
+                    info_request.payload = {0xFF, 0xFF, 0xFF, 0xFF};
+                    SendAll(socket_handle, EncodeXiaomiMessage(info_request));
+
+                    XiaomiMessage run_info_request;
+                    run_info_request.type = XiaomiMessageType::kPhoneRequest;
+                    run_info_request.opcode = XiaomiOpcode::kGetDeviceRunInfo;
+                    run_info_request.sequence = sequence++;
+                    run_info_request.payload = {0xFF, 0xFF, 0xFF, 0xFF};
+                    SendAll(socket_handle, EncodeXiaomiMessage(run_info_request));
+                    init_requests_sent = true;
+                }
+
+                *next_sequence = sequence;
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+std::vector<XiaomiProbeCommand> BuildXiaomiNoiseProbeCommands() {
+    return {
+        {"candidate 01", XiaomiMessageType::kPhoneRequest, 0x03, {0x01, 0x00}},
+        {"candidate 02", XiaomiMessageType::kPhoneRequest, 0x03, {0x01, 0x01}},
+        {"candidate 03", XiaomiMessageType::kPhoneRequest, 0x03, {0x01, 0x02}},
+        {"candidate 04", XiaomiMessageType::kPhoneRequest, 0x03, {0x02, 0x00}},
+        {"candidate 05", XiaomiMessageType::kPhoneRequest, 0x03, {0x02, 0x01}},
+        {"candidate 06", XiaomiMessageType::kPhoneRequest, 0x03, {0x02, 0x02}},
+        {"candidate 07", XiaomiMessageType::kPhoneRequest, 0x04, {0x01, 0x00}},
+        {"candidate 08", XiaomiMessageType::kPhoneRequest, 0x04, {0x01, 0x01}},
+        {"candidate 09", XiaomiMessageType::kPhoneRequest, 0x04, {0x01, 0x02}},
+        {"candidate 10", XiaomiMessageType::kPhoneRequest, 0x05, {0x01, 0x00}},
+        {"candidate 11", XiaomiMessageType::kPhoneRequest, 0x05, {0x01, 0x01}},
+        {"candidate 12", XiaomiMessageType::kPhoneRequest, 0x05, {0x01, 0x02}},
+        {"candidate 13", XiaomiMessageType::kPhoneRequest, 0x06, {0x00}},
+        {"candidate 14", XiaomiMessageType::kPhoneRequest, 0x06, {0x01}},
+        {"candidate 15", XiaomiMessageType::kPhoneRequest, 0x06, {0x02}},
+        {"candidate 16", XiaomiMessageType::kPhoneRequest, 0x08, {0x01, 0x00}},
+        {"candidate 17", XiaomiMessageType::kPhoneRequest, 0x08, {0x01, 0x01}},
+        {"candidate 18", XiaomiMessageType::kPhoneRequest, 0x08, {0x01, 0x02}},
+        {"candidate 19", XiaomiMessageType::kPhoneRequest, 0x0A, {0x01, 0x00}},
+        {"candidate 20", XiaomiMessageType::kPhoneRequest, 0x0A, {0x01, 0x01}},
+        {"candidate 21", XiaomiMessageType::kPhoneRequest, 0x0A, {0x01, 0x02}},
+        {"candidate 22", XiaomiMessageType::kPhoneRequest, 0x0B, {0x01, 0x00}},
+        {"candidate 23", XiaomiMessageType::kPhoneRequest, 0x0B, {0x01, 0x01}},
+        {"candidate 24", XiaomiMessageType::kPhoneRequest, 0x0B, {0x01, 0x02}},
+    };
 }
 
 bool TryExtractBatteryPercent(const IInspectable& raw_value, std::uint8_t* value) {
@@ -5900,11 +6188,20 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
         std::unordered_set<std::uint64_t> paired_addresses;
         bool paired_snapshot_loaded = false;
         auto try_add_entry = [&](DeviceBatteryInfo entry) {
+            if (!entry.device_mode.has_value()) {
+                const auto parsed_address = ParseBluetoothAddressFromDeviceId(entry.device_id);
+                if (parsed_address.has_value()) {
+                    entry.device_mode = TryGetXiaomiModeCacheEntry(*parsed_address);
+                }
+            }
             const std::string dedupe_key = MakeEntryKey(entry);
             const auto known = known_entries.find(dedupe_key);
             if (known != known_entries.end()) {
                 auto& existing = devices_with_battery[known->second];
                 existing.is_connected = existing.is_connected || entry.is_connected;
+                if (!existing.device_mode.has_value() && entry.device_mode.has_value()) {
+                    existing.device_mode = entry.device_mode;
+                }
                 return;
             }
             if (entry.battery_level_percent.has_value() && !entry.is_cached) {
@@ -6932,6 +7229,594 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
         DebugLog("GetConnectedDevicesBattery failed with unknown exception.");
         return {};
     }
+}
+
+bool WinRtBatteryProvider::ProbeXiaomiNoiseControl(const std::string& device_hint) {
+    EnsureApartmentInitialized();
+
+    BatteryQueryOptions options;
+    options.include_disconnected = false;
+    const auto devices = GetDevicesBattery(options);
+
+    std::vector<std::pair<std::string, std::uint64_t>> candidates;
+    std::unordered_set<std::uint64_t> seen_addresses;
+    const std::string normalized_hint = ToLowerAscii(device_hint);
+    for (const auto& entry : devices) {
+        if (!entry.is_connected) {
+            continue;
+        }
+        if (!IsLikelyXiaomiEarbuds(entry.device_name, entry.device_name, entry.device_id)) {
+            continue;
+        }
+        if (!normalized_hint.empty()) {
+            const std::string probe = ToLowerAscii(entry.device_name + " " + entry.device_id);
+            if (probe.find(normalized_hint) == std::string::npos) {
+                continue;
+            }
+        }
+
+        const auto address = ParseBluetoothAddressFromDeviceId(entry.device_id);
+        if (!address.has_value() || !seen_addresses.insert(*address).second) {
+            continue;
+        }
+        candidates.emplace_back(entry.device_name, *address);
+    }
+
+    if (candidates.empty()) {
+        std::cout << "No connected Xiaomi/Redmi earbuds candidates were found.\n";
+        return false;
+    }
+
+    const auto& target = candidates.front();
+    std::cout << "Probing device: " << target.first << " address=" << target.second << "\n";
+    std::cout << "Watch the earbuds state. Each candidate waits about 2 seconds.\n";
+    std::cout << "If a mode changes, note the candidate number and the observed mode.\n";
+
+    ScopedWsa wsa;
+    if (!wsa.started()) {
+        std::cout << "WSAStartup failed.\n";
+        return false;
+    }
+
+    SOCKET socket_handle = INVALID_SOCKET;
+    std::string connected_path;
+    if (!ConnectXiaomiControlSocket(target.second, &socket_handle, &connected_path)) {
+        std::cout << "Failed to open Xiaomi control socket.\n";
+        return false;
+    }
+
+    std::cout << "Connected via " << connected_path << "\n";
+
+    std::uint8_t sequence = 0;
+    const bool auth_ok = RunXiaomiAuthHandshake(socket_handle, &sequence);
+    if (!auth_ok) {
+        std::cout << "Auth handshake failed.\n";
+        closesocket(socket_handle);
+        return false;
+    }
+
+    const auto commands = BuildXiaomiNoiseProbeCommands();
+    std::vector<std::uint8_t> rx_buffer;
+    for (std::size_t index = 0; index < commands.size(); ++index) {
+        const auto& command = commands[index];
+        XiaomiMessage message;
+        message.type = command.type;
+        message.opcode = static_cast<XiaomiOpcode>(command.opcode);
+        message.sequence = sequence++;
+        message.payload = command.payload;
+
+        const auto bytes = EncodeXiaomiMessage(message);
+        std::cout << "[" << (index + 1) << "/" << commands.size() << "] "
+                  << command.label
+                  << " opcode=" << ByteToHex(command.opcode)
+                  << " payload=" << BytesToHex(command.payload) << "\n";
+
+        if (!SendAll(socket_handle, bytes)) {
+            std::cout << "Send failed for candidate " << (index + 1) << "\n";
+            continue;
+        }
+
+        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(command.pause_ms);
+        while (std::chrono::steady_clock::now() < until) {
+            const auto chunk = ReceiveChunk(socket_handle);
+            if (!chunk.has_value()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
+            rx_buffer.insert(rx_buffer.end(), chunk->begin(), chunk->end());
+            const auto messages = DecodeXiaomiMessages(&rx_buffer);
+            for (const auto& response : messages) {
+                std::cout << "  rx type=" << ByteToHex(static_cast<std::uint8_t>(response.type))
+                          << " opcode=" << ByteToHex(static_cast<std::uint8_t>(response.opcode))
+                          << " payload=" << BytesToHex(response.payload) << "\n";
+            }
+        }
+    }
+
+    closesocket(socket_handle);
+    std::cout << "Probe finished.\n";
+    return true;
+}
+
+bool WinRtBatteryProvider::ObserveXiaomiControlSession(const std::string& device_hint, int duration_seconds) {
+    EnsureApartmentInitialized();
+
+    BatteryQueryOptions options;
+    options.include_disconnected = false;
+    const auto devices = GetDevicesBattery(options);
+
+    std::vector<std::pair<std::string, std::uint64_t>> candidates;
+    std::unordered_set<std::uint64_t> seen_addresses;
+    const std::string normalized_hint = ToLowerAscii(device_hint);
+    for (const auto& entry : devices) {
+        if (!entry.is_connected) {
+            continue;
+        }
+        if (!IsLikelyXiaomiEarbuds(entry.device_name, entry.device_name, entry.device_id)) {
+            continue;
+        }
+        if (!normalized_hint.empty()) {
+            const std::string probe = ToLowerAscii(entry.device_name + " " + entry.device_id);
+            if (probe.find(normalized_hint) == std::string::npos) {
+                continue;
+            }
+        }
+
+        const auto address = ParseBluetoothAddressFromDeviceId(entry.device_id);
+        if (!address.has_value() || !seen_addresses.insert(*address).second) {
+            continue;
+        }
+        candidates.emplace_back(entry.device_name, *address);
+    }
+
+    if (candidates.empty()) {
+        std::cout << "No connected Xiaomi/Redmi earbuds candidates were found.\n";
+        return false;
+    }
+
+    const auto& target = candidates.front();
+    std::cout << "Observing device: " << target.first << " address=" << target.second << "\n";
+    std::cout << "Observation window: " << duration_seconds << " seconds.\n";
+    std::cout << "Now switch ANC/transparency/off on the earbuds or in the phone app.\n";
+
+    ScopedWsa wsa;
+    if (!wsa.started()) {
+        std::cout << "WSAStartup failed.\n";
+        return false;
+    }
+
+    SOCKET socket_handle = INVALID_SOCKET;
+    std::string connected_path;
+    if (!ConnectXiaomiControlSocket(target.second, &socket_handle, &connected_path)) {
+        std::cout << "Failed to open Xiaomi control socket.\n";
+        return false;
+    }
+
+    std::cout << "Connected via " << connected_path << "\n";
+
+    std::uint8_t sequence = 0;
+    if (!RunXiaomiAuthHandshake(socket_handle, &sequence)) {
+        std::cout << "Auth handshake failed.\n";
+        closesocket(socket_handle);
+        return false;
+    }
+
+    XiaomiMessage run_info_request;
+    run_info_request.type = XiaomiMessageType::kPhoneRequest;
+    run_info_request.opcode = XiaomiOpcode::kGetDeviceRunInfo;
+    run_info_request.sequence = sequence++;
+    run_info_request.payload = {0xFF, 0xFF, 0xFF, 0xFF};
+    SendAll(socket_handle, EncodeXiaomiMessage(run_info_request));
+
+    XiaomiMessage info_request;
+    info_request.type = XiaomiMessageType::kPhoneRequest;
+    info_request.opcode = XiaomiOpcode::kGetDeviceInfo;
+    info_request.sequence = sequence++;
+    info_request.payload = {0xFF, 0xFF, 0xFF, 0xFF};
+    SendAll(socket_handle, EncodeXiaomiMessage(info_request));
+
+    std::vector<std::uint8_t> rx_buffer;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(duration_seconds);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto chunk = ReceiveChunk(socket_handle);
+        if (!chunk.has_value()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+
+        std::cout << "chunk: " << BytesToHex(*chunk) << "\n";
+        rx_buffer.insert(rx_buffer.end(), chunk->begin(), chunk->end());
+        const auto messages = DecodeXiaomiMessages(&rx_buffer);
+        for (const auto& response : messages) {
+            std::cout << "rx type=" << ByteToHex(static_cast<std::uint8_t>(response.type))
+                      << " opcode=" << ByteToHex(static_cast<std::uint8_t>(response.opcode))
+                      << " seq=" << static_cast<int>(response.sequence)
+                      << " payload=" << BytesToHex(response.payload) << "\n";
+
+            if (response.type == XiaomiMessageType::kEarbudsNotify &&
+                response.opcode == XiaomiOpcode::kReportStatus) {
+                XiaomiMessage ack;
+                ack.type = XiaomiMessageType::kResponse;
+                ack.opcode = XiaomiOpcode::kReportStatus;
+                ack.sequence = response.sequence;
+                SendAll(socket_handle, EncodeXiaomiMessage(ack));
+            }
+        }
+    }
+
+    closesocket(socket_handle);
+    std::cout << "Observation finished.\n";
+    return true;
+}
+
+bool WinRtBatteryProvider::SetXiaomiNoiseMode(const std::string& mode, const std::string& device_hint) {
+    EnsureApartmentInitialized();
+
+    const std::string normalized_mode = ToLowerAscii(mode);
+    std::uint8_t mode_value = 0;
+    std::uint8_t f4_tail_value = 0;
+    if (normalized_mode == "off" || normalized_mode == "disable" || normalized_mode == "disabled") {
+        mode_value = 0x00;
+        f4_tail_value = 0x00;
+    } else if (normalized_mode == "anc" || normalized_mode == "noise" || normalized_mode == "noise-canceling") {
+        mode_value = 0x01;
+        f4_tail_value = 0x02;
+    } else if (normalized_mode == "transparency" || normalized_mode == "transparent") {
+        mode_value = 0x02;
+        f4_tail_value = 0x01;
+    } else {
+        std::cout << "Unknown mode. Use one of: off, anc, transparency\n";
+        return false;
+    }
+
+    BatteryQueryOptions options;
+    options.include_disconnected = false;
+    const auto devices = GetDevicesBattery(options);
+
+    std::vector<std::pair<std::string, std::uint64_t>> candidates;
+    std::unordered_set<std::uint64_t> seen_addresses;
+    const std::string normalized_hint = ToLowerAscii(device_hint);
+    for (const auto& entry : devices) {
+        if (!entry.is_connected) {
+            continue;
+        }
+        if (!IsLikelyXiaomiEarbuds(entry.device_name, entry.device_name, entry.device_id)) {
+            continue;
+        }
+        if (!normalized_hint.empty()) {
+            const std::string probe = ToLowerAscii(entry.device_name + " " + entry.device_id);
+            if (probe.find(normalized_hint) == std::string::npos) {
+                continue;
+            }
+        }
+
+        const auto address = ParseBluetoothAddressFromDeviceId(entry.device_id);
+        if (!address.has_value() || !seen_addresses.insert(*address).second) {
+            continue;
+        }
+        candidates.emplace_back(entry.device_name, *address);
+    }
+
+    if (candidates.empty()) {
+        std::cout << "No connected Xiaomi/Redmi earbuds candidates were found.\n";
+        return false;
+    }
+
+    const auto& target = candidates.front();
+    std::cout << "Setting mode on device: " << target.first << " address=" << target.second << "\n";
+    std::cout << "Requested mode: " << normalized_mode << " (experimental)\n";
+
+    ScopedWsa wsa;
+    if (!wsa.started()) {
+        std::cout << "WSAStartup failed.\n";
+        return false;
+    }
+
+    SOCKET socket_handle = INVALID_SOCKET;
+    std::string connected_path;
+    if (!ConnectXiaomiControlSocket(target.second, &socket_handle, &connected_path)) {
+        std::cout << "Failed to open Xiaomi control socket.\n";
+        return false;
+    }
+
+    std::cout << "Connected via " << connected_path << "\n";
+
+    std::uint8_t sequence = 0;
+    if (!RunXiaomiAuthHandshake(socket_handle, &sequence)) {
+        std::cout << "Auth handshake failed.\n";
+        closesocket(socket_handle);
+        return false;
+    }
+
+    const auto send_command = [&](std::uint8_t raw_type,
+                                  std::uint8_t raw_opcode,
+                                  std::initializer_list<std::uint8_t> payload) -> bool {
+        XiaomiMessage message;
+        message.type = static_cast<XiaomiMessageType>(raw_type);
+        message.opcode = static_cast<XiaomiOpcode>(raw_opcode);
+        message.sequence = sequence++;
+        message.payload.assign(payload.begin(), payload.end());
+
+        std::cout << "Sending type=" << ByteToHex(raw_type)
+                  << " opcode=" << ByteToHex(raw_opcode)
+                  << " payload=" << BytesToHex(message.payload) << "\n";
+        return SendAll(socket_handle, EncodeXiaomiMessage(message));
+    };
+
+    if (!send_command(0x01U, 0x0EU, {0x02, 0x04, mode_value})) {
+        std::cout << "Send failed for opcode 0x0E.\n";
+        closesocket(socket_handle);
+        return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    if (!send_command(0x01U, 0xF4U, {0x04, 0x00, 0x0B, mode_value, f4_tail_value})) {
+        std::cout << "Send failed for opcode 0xF4.\n";
+        closesocket(socket_handle);
+        return false;
+    }
+
+    std::vector<std::uint8_t> rx_buffer;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2500);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto chunk = ReceiveChunk(socket_handle);
+        if (!chunk.has_value()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+
+        std::cout << "chunk: " << BytesToHex(*chunk) << "\n";
+        rx_buffer.insert(rx_buffer.end(), chunk->begin(), chunk->end());
+        const auto messages = DecodeXiaomiMessages(&rx_buffer);
+        for (const auto& response : messages) {
+            std::cout << "rx type=" << ByteToHex(static_cast<std::uint8_t>(response.type))
+                      << " opcode=" << ByteToHex(static_cast<std::uint8_t>(response.opcode))
+                      << " seq=" << static_cast<int>(response.sequence)
+                      << " payload=" << BytesToHex(response.payload) << "\n";
+
+            if (response.type == XiaomiMessageType::kEarbudsNotify &&
+                response.opcode == XiaomiOpcode::kReportStatus) {
+                XiaomiMessage ack;
+                ack.type = XiaomiMessageType::kResponse;
+                ack.opcode = XiaomiOpcode::kReportStatus;
+                ack.sequence = response.sequence;
+                SendAll(socket_handle, EncodeXiaomiMessage(ack));
+            }
+        }
+    }
+
+    closesocket(socket_handle);
+    std::cout << "Command finished.\n";
+    return true;
+}
+
+bool WinRtBatteryProvider::SupportsNoiseControl(const std::string& device_id) {
+    return ParseBluetoothAddressFromDeviceId(device_id).has_value();
+}
+
+bool WinRtBatteryProvider::SetNoiseControlMode(const std::string& device_id, NoiseControlMode mode) {
+    const auto address = ParseBluetoothAddressFromDeviceId(device_id);
+    if (!address.has_value()) {
+        return false;
+    }
+
+    EnsureApartmentInitialized();
+    ScopedWsa wsa;
+    if (!wsa.started()) {
+        return false;
+    }
+
+    SOCKET socket_handle = INVALID_SOCKET;
+    std::string connected_path;
+    if (!ConnectXiaomiControlSocket(*address, &socket_handle, &connected_path)) {
+        return false;
+    }
+
+    std::uint8_t sequence = 0;
+    if (!RunXiaomiAuthHandshake(socket_handle, &sequence)) {
+        closesocket(socket_handle);
+        return false;
+    }
+
+    std::uint8_t mode_value = 0;
+    switch (mode) {
+        case NoiseControlMode::Off:
+            mode_value = 0x00;
+            break;
+        case NoiseControlMode::Anc:
+            mode_value = 0x01;
+            break;
+        case NoiseControlMode::Transparency:
+            mode_value = 0x02;
+            break;
+    }
+
+    XiaomiMessage message;
+    message.type = static_cast<XiaomiMessageType>(0xC1U);
+    message.opcode = static_cast<XiaomiOpcode>(0x08U);
+    message.sequence = sequence++;
+    message.payload = {0x02, 0x04, mode_value};
+    const bool sent = SendAll(socket_handle, EncodeXiaomiMessage(message));
+    if (!sent) {
+        closesocket(socket_handle);
+        return false;
+    }
+
+    bool observed_confirmation = false;
+    std::vector<std::uint8_t> rx_buffer;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1800);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto chunk = ReceiveChunk(socket_handle);
+        if (!chunk.has_value()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+            continue;
+        }
+        rx_buffer.insert(rx_buffer.end(), chunk->begin(), chunk->end());
+        const auto messages = DecodeXiaomiMessages(&rx_buffer);
+        for (const auto& response : messages) {
+            const auto parsed_mode =
+                ParseXiaomiNoiseModeCode(static_cast<std::uint8_t>(response.opcode), response.payload);
+            if (parsed_mode.has_value()) {
+                PutXiaomiModeCacheEntry(*address, *parsed_mode);
+                if (*parsed_mode == mode_value) {
+                    observed_confirmation = true;
+                }
+            }
+        }
+    }
+
+    closesocket(socket_handle);
+    return observed_confirmation;
+}
+
+bool WinRtBatteryProvider::SendXiaomiControlCandidate(int candidate_id, const std::string& device_hint) {
+    struct Candidate {
+        int id = 0;
+        std::uint8_t opcode = 0;
+        std::vector<std::uint8_t> payload;
+        const char* label = "";
+    };
+
+    const std::vector<Candidate> candidates = {
+        {1, 0x08, {0x02, 0x04, 0x00}, "c1-08 off"},
+        {2, 0x08, {0x02, 0x04, 0x01}, "c1-08 anc"},
+        {3, 0x08, {0x02, 0x04, 0x02}, "c1-08 transparency"},
+        {4, 0xF4, {0x04, 0x00, 0x0B, 0x00, 0x00}, "f4 style off"},
+        {5, 0xF4, {0x04, 0x00, 0x0B, 0x01, 0x00}, "f4 style anc"},
+        {6, 0xF4, {0x04, 0x00, 0x0B, 0x02, 0x01}, "f4 style transparency"},
+        {7, 0xF4, {0x04, 0x00, 0x0B, 0x01, 0x01}, "f4 alt anc"},
+        {8, 0xF4, {0x04, 0x00, 0x0B, 0x02, 0x00}, "f4 alt transparency"},
+        {9, 0xF4, {0x04, 0x00, 0x0B, 0x00, 0x01}, "f4 alt off"},
+        {10, 0xF4, {0x04, 0x00, 0x0B, 0x00, 0x00}, "f4 off as response"},
+        {11, 0xF4, {0x04, 0x00, 0x0B, 0x01, 0x00}, "f4 anc as response"},
+        {12, 0xF4, {0x04, 0x00, 0x0B, 0x02, 0x01}, "f4 transparency as response"},
+        {13, 0xF4, {0x04, 0x00, 0x0B, 0x00, 0x00}, "f4 off as earbuds-request"},
+        {14, 0xF4, {0x04, 0x00, 0x0B, 0x01, 0x00}, "f4 anc as earbuds-request"},
+        {15, 0xF4, {0x04, 0x00, 0x0B, 0x02, 0x01}, "f4 transparency as earbuds-request"},
+    };
+
+    const auto candidate_it = std::find_if(candidates.begin(), candidates.end(),
+                                           [candidate_id](const Candidate& candidate) {
+                                               return candidate.id == candidate_id;
+                                           });
+    if (candidate_it == candidates.end()) {
+        std::cout << "Unknown candidate. Use 1..9\n";
+        return false;
+    }
+
+    EnsureApartmentInitialized();
+    BatteryQueryOptions options;
+    options.include_disconnected = false;
+    const auto devices = GetDevicesBattery(options);
+
+    std::vector<std::pair<std::string, std::uint64_t>> matched_devices;
+    std::unordered_set<std::uint64_t> seen_addresses;
+    const std::string normalized_hint = ToLowerAscii(device_hint);
+    for (const auto& entry : devices) {
+        if (!entry.is_connected) {
+            continue;
+        }
+        if (!IsLikelyXiaomiEarbuds(entry.device_name, entry.device_name, entry.device_id)) {
+            continue;
+        }
+        if (!normalized_hint.empty()) {
+            const std::string probe = ToLowerAscii(entry.device_name + " " + entry.device_id);
+            if (probe.find(normalized_hint) == std::string::npos) {
+                continue;
+            }
+        }
+
+        const auto address = ParseBluetoothAddressFromDeviceId(entry.device_id);
+        if (!address.has_value() || !seen_addresses.insert(*address).second) {
+            continue;
+        }
+        matched_devices.emplace_back(entry.device_name, *address);
+    }
+
+    if (matched_devices.empty()) {
+        std::cout << "No connected Xiaomi/Redmi earbuds candidates were found.\n";
+        return false;
+    }
+
+    const auto& target = matched_devices.front();
+    std::cout << "Testing candidate #" << candidate_it->id << " on device: " << target.first << "\n";
+    std::cout << "Label: " << candidate_it->label << "\n";
+    std::cout << "Opcode=" << ByteToHex(candidate_it->opcode)
+              << " payload=" << BytesToHex(candidate_it->payload) << "\n";
+
+    ScopedWsa wsa;
+    if (!wsa.started()) {
+        std::cout << "WSAStartup failed.\n";
+        return false;
+    }
+
+    SOCKET socket_handle = INVALID_SOCKET;
+    std::string connected_path;
+    if (!ConnectXiaomiControlSocket(target.second, &socket_handle, &connected_path)) {
+        std::cout << "Failed to open Xiaomi control socket.\n";
+        return false;
+    }
+
+    std::cout << "Connected via " << connected_path << "\n";
+
+    std::uint8_t sequence = 0;
+    if (!RunXiaomiAuthHandshake(socket_handle, &sequence)) {
+        std::cout << "Auth handshake failed.\n";
+        closesocket(socket_handle);
+        return false;
+    }
+
+    XiaomiMessage message;
+    if (candidate_it->id <= 3) {
+        message.type = static_cast<XiaomiMessageType>(0xC1U);
+    } else if (candidate_it->id >= 13) {
+        message.type = XiaomiMessageType::kEarbudsRequest;
+    } else if (candidate_it->id >= 10) {
+        message.type = XiaomiMessageType::kResponse;
+    } else {
+        message.type = XiaomiMessageType::kPhoneRequest;
+    }
+    message.opcode = static_cast<XiaomiOpcode>(candidate_it->opcode);
+    message.sequence = sequence++;
+    message.payload = candidate_it->payload;
+
+    if (!SendAll(socket_handle, EncodeXiaomiMessage(message))) {
+        std::cout << "Send failed.\n";
+        closesocket(socket_handle);
+        return false;
+    }
+
+    std::vector<std::uint8_t> rx_buffer;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2500);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto chunk = ReceiveChunk(socket_handle);
+        if (!chunk.has_value()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+
+        std::cout << "chunk: " << BytesToHex(*chunk) << "\n";
+        rx_buffer.insert(rx_buffer.end(), chunk->begin(), chunk->end());
+        const auto messages = DecodeXiaomiMessages(&rx_buffer);
+        for (const auto& response : messages) {
+            std::cout << "rx type=" << ByteToHex(static_cast<std::uint8_t>(response.type))
+                      << " opcode=" << ByteToHex(static_cast<std::uint8_t>(response.opcode))
+                      << " seq=" << static_cast<int>(response.sequence)
+                      << " payload=" << BytesToHex(response.payload) << "\n";
+
+            if (response.type == XiaomiMessageType::kEarbudsNotify &&
+                response.opcode == XiaomiOpcode::kReportStatus) {
+                XiaomiMessage ack;
+                ack.type = XiaomiMessageType::kResponse;
+                ack.opcode = XiaomiOpcode::kReportStatus;
+                ack.sequence = response.sequence;
+                SendAll(socket_handle, EncodeXiaomiMessage(ack));
+            }
+        }
+    }
+
+    closesocket(socket_handle);
+    std::cout << "Candidate finished.\n";
+    return true;
 }
 
 }  // namespace battery_monitor

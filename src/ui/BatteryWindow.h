@@ -17,6 +17,7 @@
 
 #include "core/BatteryTypes.h"
 #include "core/IBluetoothBatteryProvider.h"
+#include "core/INoiseControlProvider.h"
 #include "ui/BatteryHistoryStore.h"
 
 class QAction;
@@ -70,6 +71,7 @@ class BatteryWindow : public QWidget {
     void ConfigureRefreshInterval();
     void UpdateRefreshSettingsTooltip();
     void SetDeviceDragActive(bool active);
+    void ApplyNoiseControlMode(const std::string& device_id, NoiseControlMode mode);
     static std::string FormatError(const std::exception& ex);
 
     std::unique_ptr<IBluetoothBatteryProvider> provider_;
