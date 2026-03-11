@@ -78,6 +78,9 @@ void PrintTable(const std::vector<DeviceBatteryInfo>& devices) {
         }
         if (device.device_mode.has_value()) {
             battery_text += " [" + *device.device_mode + "]";
+            if (device.device_submode.has_value()) {
+                battery_text += "{" + *device.device_submode + "}";
+            }
         }
         std::cout << device.device_name << " | " << device.battery_component << " | "
                   << battery_text << " | " << device.device_id << '\n';
@@ -96,6 +99,8 @@ void PrintJson(const std::vector<DeviceBatteryInfo>& devices) {
                   << "\"batteryLevelPercent\":" << battery_json << ","
                   << "\"deviceMode\":"
                   << (device.device_mode.has_value() ? ("\"" + EscapeJson(*device.device_mode) + "\"") : "null") << ","
+                  << "\"deviceSubmode\":"
+                  << (device.device_submode.has_value() ? ("\"" + EscapeJson(*device.device_submode) + "\"") : "null") << ","
                   << "\"isCached\":" << (device.is_cached ? "true" : "false") << ","
                   << "\"isConnected\":" << (device.is_connected ? "true" : "false") << "}";
         if (i + 1 < devices.size()) {

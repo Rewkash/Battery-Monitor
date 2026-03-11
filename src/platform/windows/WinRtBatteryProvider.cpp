@@ -548,6 +548,7 @@ struct ControllerBatteryCacheEntry {
 
 struct XiaomiModeCacheEntry {
     std::string mode;
+    std::string submode;
     std::chrono::steady_clock::time_point captured_at = std::chrono::steady_clock::now();
 };
 
@@ -2367,6 +2368,13 @@ std::optional<std::uint8_t> ParseXiaomiNoiseModeCodeFromF4Payload(const std::vec
     return std::nullopt;
 }
 
+std::optional<std::uint8_t> ParseXiaomiNoiseSubmodeCodeFromF4Payload(const std::vector<std::uint8_t>& payload) {
+    if (payload.size() >= 5U && payload[0] == 0x04U && payload[1] == 0x00U && payload[2] == 0x0BU) {
+        return payload[4];
+    }
+    return std::nullopt;
+}
+
 std::optional<std::uint8_t> ParseXiaomiNoiseModeCode(std::uint8_t opcode, const std::vector<std::uint8_t>& payload) {
     if (opcode == static_cast<std::uint8_t>(XiaomiOpcode::kGetDeviceRunInfo)) {
         return ParseXiaomiNoiseModeCodeFromRunInfoPayload(payload);
@@ -2393,18 +2401,49 @@ std::string XiaomiNoiseModeCodeToText(std::uint8_t code) {
     return "mode " + std::to_string(code);
 }
 
-void PutXiaomiModeCacheEntry(std::uint64_t address, std::uint8_t code) {
+std::optional<std::string> XiaomiNoiseSubmodeCodeToText(std::uint8_t mode_code, std::uint8_t submode_code) {
+    if (mode_code == 1U) {
+        if (submode_code == 0U) {
+            return std::string("balanced");
+        }
+        if (submode_code == 1U) {
+            return std::string("weak");
+        }
+        if (submode_code == 2U) {
+            return std::string("deep");
+        }
+        if (submode_code == 3U) {
+            return std::string("adaptive");
+        }
+    }
+    if (mode_code == 2U) {
+        if (submode_code == 0U) {
+            return std::string("standard");
+        }
+        if (submode_code == 1U) {
+            return std::string("voice");
+        }
+    }
+    return std::nullopt;
+}
+
+void PutXiaomiModeCacheEntry(std::uint64_t address,
+                             std::uint8_t code,
+                             std::optional<std::uint8_t> submode_code = std::nullopt) {
     if (address <= 0xFFFFULL) {
         return;
     }
     XiaomiModeCacheEntry entry;
     entry.mode = XiaomiNoiseModeCodeToText(code);
+    if (submode_code.has_value()) {
+        entry.submode = XiaomiNoiseSubmodeCodeToText(code, *submode_code).value_or(std::string());
+    }
     entry.captured_at = std::chrono::steady_clock::now();
     const std::lock_guard<std::mutex> lock(XiaomiModeCacheStoreMutex());
     XiaomiModeCacheStore()[address] = std::move(entry);
 }
 
-std::optional<std::string> TryGetXiaomiModeCacheEntry(std::uint64_t address) {
+std::optional<XiaomiModeCacheEntry> TryGetXiaomiModeCacheEntryFull(std::uint64_t address) {
     if (address <= 0xFFFFULL) {
         return std::nullopt;
     }
@@ -2413,7 +2452,23 @@ std::optional<std::string> TryGetXiaomiModeCacheEntry(std::uint64_t address) {
     if (found == XiaomiModeCacheStore().end()) {
         return std::nullopt;
     }
-    return found->second.mode;
+    return found->second;
+}
+
+std::optional<std::string> TryGetXiaomiModeCacheEntry(std::uint64_t address) {
+    const auto entry = TryGetXiaomiModeCacheEntryFull(address);
+    if (!entry.has_value()) {
+        return std::nullopt;
+    }
+    return entry->mode;
+}
+
+std::optional<std::string> TryGetXiaomiSubmodeCacheEntry(std::uint64_t address) {
+    const auto entry = TryGetXiaomiModeCacheEntryFull(address);
+    if (!entry.has_value() || entry->submode.empty()) {
+        return std::nullopt;
+    }
+    return entry->submode;
 }
 
 std::uint32_t ModPow(std::uint32_t base, std::uint32_t exponent, std::uint32_t modulo) {
@@ -4222,7 +4277,11 @@ std::vector<BatteryReading> TryReadXiaomiClassicBattery(std::uint64_t bluetooth_
             if (const auto mode_code =
                     ParseXiaomiNoiseModeCode(static_cast<std::uint8_t>(opcode), message.payload);
                 mode_code.has_value()) {
-                PutXiaomiModeCacheEntry(bluetooth_address, *mode_code);
+                const auto submode_code =
+                    static_cast<std::uint8_t>(opcode) == 0xF4U
+                        ? ParseXiaomiNoiseSubmodeCodeFromF4Payload(message.payload)
+                        : std::optional<std::uint8_t>{};
+                PutXiaomiModeCacheEntry(bluetooth_address, *mode_code, submode_code);
                 DebugLog("Xiaomi mode candidate code=" + std::to_string(*mode_code) +
                          " text='" + XiaomiNoiseModeCodeToText(*mode_code) + "'");
             }
@@ -6199,10 +6258,13 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
         std::unordered_set<std::uint64_t> paired_addresses;
         bool paired_snapshot_loaded = false;
         auto try_add_entry = [&](DeviceBatteryInfo entry) {
-            if (!entry.device_mode.has_value()) {
-                const auto parsed_address = ParseBluetoothAddressFromDeviceId(entry.device_id);
-                if (parsed_address.has_value()) {
+            const auto parsed_address = ParseBluetoothAddressFromDeviceId(entry.device_id);
+            if (parsed_address.has_value()) {
+                if (!entry.device_mode.has_value()) {
                     entry.device_mode = TryGetXiaomiModeCacheEntry(*parsed_address);
+                }
+                if (!entry.device_submode.has_value()) {
+                    entry.device_submode = TryGetXiaomiSubmodeCacheEntry(*parsed_address);
                 }
             }
             const std::string dedupe_key = MakeEntryKey(entry);
@@ -6213,10 +6275,12 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
                 if (!existing.device_mode.has_value() && entry.device_mode.has_value()) {
                     existing.device_mode = entry.device_mode;
                 }
+                if (!existing.device_submode.has_value() && entry.device_submode.has_value()) {
+                    existing.device_submode = entry.device_submode;
+                }
                 return;
             }
             if (entry.battery_level_percent.has_value() && !entry.is_cached) {
-                const auto parsed_address = ParseBluetoothAddressFromDeviceId(entry.device_id);
                 if (parsed_address.has_value()) {
                     addresses_with_real_battery.insert(*parsed_address);
                 }
@@ -8001,7 +8065,11 @@ bool WinRtBatteryProvider::SetNoiseControlMode(const std::string& device_id, Noi
             const auto parsed_mode =
                 ParseXiaomiNoiseModeCode(static_cast<std::uint8_t>(response.opcode), response.payload);
             if (parsed_mode.has_value()) {
-                PutXiaomiModeCacheEntry(*address, *parsed_mode);
+                const auto parsed_submode =
+                    static_cast<std::uint8_t>(response.opcode) == 0xF4U
+                        ? ParseXiaomiNoiseSubmodeCodeFromF4Payload(response.payload)
+                        : std::optional<std::uint8_t>{};
+                PutXiaomiModeCacheEntry(*address, *parsed_mode, parsed_submode);
                 if (*parsed_mode == mode_value) {
                     observed_confirmation = true;
                 }
@@ -8315,6 +8383,11 @@ bool WinRtBatteryProvider::SetXiaomiNoiseSubmode(const std::string& family, int 
     }
 
     closesocket(socket_handle);
+    if (sent) {
+        PutXiaomiModeCacheEntry(candidates.front().second,
+                                family_code == 0x01U ? 0x01U : 0x02U,
+                                static_cast<std::uint8_t>(submode));
+    }
     return sent;
 }
 

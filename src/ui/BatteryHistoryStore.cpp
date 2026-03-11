@@ -18,10 +18,12 @@ namespace {
 
 struct PendingHistorySnapshot {
     QString device_name;
+    QString device_mode;
+    QString device_submode;
     QMap<QString, int> component_levels;
 };
 
-constexpr int kHistorySchemaVersion = 1;
+constexpr int kHistorySchemaVersion = 2;
 constexpr qint64 kHistoryRetentionMs = 14LL * 24LL * 60LL * 60LL * 1000LL;
 constexpr qint64 kHistoryMinSampleIntervalMs = 10LL * 60LL * 1000LL;
 constexpr int kMaxSamplesPerDevice = 2048;
@@ -61,6 +63,9 @@ bool ShouldAppendSample(const QVector<BatteryHistorySample>& samples, const Batt
     if (previous.component_levels != sample.component_levels) {
         return true;
     }
+    if (previous.device_mode != sample.device_mode || previous.device_submode != sample.device_submode) {
+        return true;
+    }
 
     return (sample.timestamp_ms - previous.timestamp_ms) >= kHistoryMinSampleIntervalMs;
 }
@@ -74,6 +79,12 @@ QJsonObject SerializeSample(const BatteryHistorySample& sample) {
         components_object.insert(it.key(), it.value());
     }
     sample_object.insert(QStringLiteral("components"), components_object);
+    if (!sample.device_mode.trimmed().isEmpty()) {
+        sample_object.insert(QStringLiteral("mode"), sample.device_mode);
+    }
+    if (!sample.device_submode.trimmed().isEmpty()) {
+        sample_object.insert(QStringLiteral("submode"), sample.device_submode);
+    }
     return sample_object;
 }
 
@@ -104,6 +115,8 @@ bool ParseSample(const QJsonObject& sample_object, BatteryHistorySample* sample)
 
     sample->timestamp_ms = timestamp_ms;
     sample->component_levels = std::move(component_levels);
+    sample->device_mode = sample_object.value(QStringLiteral("mode")).toString().trimmed();
+    sample->device_submode = sample_object.value(QStringLiteral("submode")).toString().trimmed();
     return true;
 }
 
@@ -129,6 +142,12 @@ void BatteryHistoryStore::RecordSnapshot(const std::vector<DeviceBatteryInfo>& d
         if (snapshot.device_name.isEmpty()) {
             snapshot.device_name = QString::fromUtf8(entry.device_name.c_str());
         }
+        if (!entry.device_mode.value_or(std::string()).empty()) {
+            snapshot.device_mode = QString::fromUtf8(entry.device_mode->c_str()).trimmed();
+        }
+        if (!entry.device_submode.value_or(std::string()).empty()) {
+            snapshot.device_submode = QString::fromUtf8(entry.device_submode->c_str()).trimmed();
+        }
         snapshot.component_levels.insert(NormalizeHistoryComponent(entry.battery_component),
                                          static_cast<int>(*entry.battery_level_percent));
     }
@@ -150,6 +169,8 @@ void BatteryHistoryStore::RecordSnapshot(const std::vector<DeviceBatteryInfo>& d
         BatteryHistorySample sample;
         sample.timestamp_ms = now_ms;
         sample.component_levels = it->component_levels;
+        sample.device_mode = it->device_mode;
+        sample.device_submode = it->device_submode;
 
         if (ShouldAppendSample(history.samples, sample)) {
             history.samples.push_back(std::move(sample));

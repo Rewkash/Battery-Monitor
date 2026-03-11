@@ -1,5 +1,6 @@
 #include "ui/BatteryWindow.h"
 #include "ui/BatteryHistoryDialog.h"
+#include "ui/BatteryRuntimeEstimator.h"
 
 #include <algorithm>
 #include <cctype>
@@ -70,6 +71,7 @@ struct DeviceEntry {
     std::string device_id;
     std::string device_name;
     std::optional<std::string> device_mode;
+    std::optional<std::string> device_submode;
     std::vector<ComponentEntry> components;
     bool is_connected = false;
 };
@@ -602,17 +604,47 @@ QString BuildDeviceModeText(const DeviceEntry& device) {
     }
 
     const std::string mode = ToLowerAscii(*device.device_mode);
+    const std::string submode = device.device_submode.has_value() ? ToLowerAscii(*device.device_submode) : std::string();
+    auto append_submode = [&](QString base_text) {
+        if (submode.empty()) {
+            return base_text;
+        }
+
+        if (submode == "balanced") {
+            return base_text + QString::fromUtf8(u8" · Баланс");
+        }
+        if (submode == "weak") {
+            return base_text + QString::fromUtf8(u8" · Слабое");
+        }
+        if (submode == "deep") {
+            return base_text + QString::fromUtf8(u8" · Глубокое");
+        }
+        if (submode == "adaptive") {
+            return base_text + QString::fromUtf8(u8" · Адаптивное");
+        }
+        if (submode == "voice") {
+            return base_text + QString::fromUtf8(u8" · Усиление голоса");
+        }
+        if (submode == "standard") {
+            return base_text;
+        }
+
+        return base_text + QString::fromUtf8(u8" · %1").arg(ToQString(submode));
+    };
+
     if (mode == "off") {
         return QString::fromUtf8(u8"\u0420\u0435\u0436\u0438\u043C: \u0432\u044B\u043A\u043B");
     }
     if (mode == "transparency") {
-        return QString::fromUtf8(u8"\u0420\u0435\u0436\u0438\u043C: \u043F\u0440\u043E\u0437\u0440\u0430\u0447\u043D\u043E\u0441\u0442\u044C");
+        return append_submode(
+            QString::fromUtf8(u8"\u0420\u0435\u0436\u0438\u043C: \u043F\u0440\u043E\u0437\u0440\u0430\u0447\u043D\u043E\u0441\u0442\u044C"));
     }
     if (mode == "anc") {
-        return QString::fromUtf8(u8"\u0420\u0435\u0436\u0438\u043C: \u0448\u0443\u043C\u043E\u043F\u043E\u0434\u0430\u0432\u043B\u0435\u043D\u0438\u0435");
+        return append_submode(
+            QString::fromUtf8(u8"\u0420\u0435\u0436\u0438\u043C: \u0448\u0443\u043C\u043E\u043F\u043E\u0434\u0430\u0432\u043B\u0435\u043D\u0438\u0435"));
     }
 
-    return QString::fromUtf8(u8"\u0420\u0435\u0436\u0438\u043C: %1").arg(ToQString(*device.device_mode));
+    return append_submode(QString::fromUtf8(u8"\u0420\u0435\u0436\u0438\u043C: %1").arg(ToQString(*device.device_mode)));
 }
 
 QString ProgressLevelState(const PrimaryBattery& primary) {
@@ -792,6 +824,7 @@ std::vector<DeviceEntry> GroupDevices(const std::vector<DeviceBatteryInfo>& devi
             device.device_id = device_id;
             device.device_name = device_name;
             device.device_mode = item.device_mode;
+            device.device_submode = item.device_submode;
             device.is_connected = item.is_connected;
             grouped.push_back(std::move(device));
         } else {
@@ -801,6 +834,9 @@ std::vector<DeviceEntry> GroupDevices(const std::vector<DeviceBatteryInfo>& devi
             }
             if (!grouped[index].device_mode.has_value() && item.device_mode.has_value()) {
                 grouped[index].device_mode = item.device_mode;
+            }
+            if (!grouped[index].device_submode.has_value() && item.device_submode.has_value()) {
+                grouped[index].device_submode = item.device_submode;
             }
             grouped[index].is_connected = grouped[index].is_connected || item.is_connected;
         }
@@ -2674,6 +2710,12 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
         const QString level_state = ProgressLevelState(primary);
         const QString triplet_text = BuildComponentTriplet(device);
         const QString mode_text = BuildDeviceModeText(device);
+        QString runtime_text;
+        if (is_active) {
+            const BatteryHistoryData device_history = history_store_.LoadHistory(ToQString(device.device_id));
+            const BatteryRuntimeForecast runtime_forecast = EstimateBatteryRuntimeForecast(device_history);
+            runtime_text = BuildRuntimeForecastCompactSummary(runtime_forecast);
+        }
 
         auto* progress = new QProgressBar(center_widget);
         progress->setObjectName(QStringLiteral("deviceProgress"));
@@ -2697,6 +2739,10 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
         if (!mode_text.isEmpty()) {
             technical_text = technical_text.isEmpty() ? mode_text
                                                       : technical_text + QStringLiteral("  \u00B7  ") + mode_text;
+        }
+        if (!runtime_text.isEmpty()) {
+            technical_text = technical_text.isEmpty() ? runtime_text
+                                                      : technical_text + QStringLiteral("  \u00B7  ") + runtime_text;
         }
         if (!is_active) {
             const QString inactive_marker = QString::fromUtf8(u8"\u041D\u0435 \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u043E");
@@ -2756,8 +2802,9 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
                                           u8"\u0432\u044B\u0431\u043E\u0440 "
                                           u8"\u043F\u043E\u0434\u0440\u0435\u0436\u0438\u043C\u0430"));
                     connect(button, &QWidget::customContextMenuRequested, this,
-                            [this, button, device_id = device.device_id, mode](const QPoint&) {
-                                ShowNoiseSubmodeMenu(button, device_id, mode, std::string());
+                            [this, button, device_id = device.device_id, mode,
+                             active_submode_id = device.device_submode.value_or(std::string())](const QPoint&) {
+                                ShowNoiseSubmodeMenu(button, device_id, mode, active_submode_id);
                             });
                 }
                 noise_layout->addWidget(button);

@@ -107,6 +107,8 @@ if(BATTERY_MONITOR_QT_ENABLED)
         PRIVATE
             src/ui/BatteryHistoryDialog.cpp
             src/ui/BatteryHistoryDialog.h
+            src/ui/BatteryRuntimeEstimator.cpp
+            src/ui/BatteryRuntimeEstimator.h
             src/ui/BatteryHistoryStore.cpp
             src/ui/BatteryHistoryStore.h
             src/ui/BatteryWindow.cpp

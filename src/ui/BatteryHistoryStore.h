@@ -14,6 +14,8 @@ namespace battery_monitor {
 struct BatteryHistorySample {
     qint64 timestamp_ms = 0;
     QMap<QString, int> component_levels;
+    QString device_mode;
+    QString device_submode;
 };
 
 struct BatteryHistoryData {
