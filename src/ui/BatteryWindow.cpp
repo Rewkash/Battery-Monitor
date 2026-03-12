@@ -1,6 +1,7 @@
 #include "ui/BatteryWindow.h"
 #include "ui/BatteryHistoryDialog.h"
 #include "ui/BatteryRuntimeEstimator.h"
+#include "ui/BatteryStatsDialog.h"
 
 #include <algorithm>
 #include <cctype>
@@ -645,6 +646,58 @@ QString BuildDeviceModeText(const DeviceEntry& device) {
     }
 
     return append_submode(QString::fromUtf8(u8"\u0420\u0435\u0436\u0438\u043C: %1").arg(ToQString(*device.device_mode)));
+}
+
+QString FormatRuntimeCountdownNoSeconds(qint64 duration_ms) {
+    if (duration_ms <= 0) {
+        return QString::fromUtf8(u8"Осталось: меньше минуты");
+    }
+
+    const qint64 total_minutes = std::max<qint64>(1, duration_ms / (60LL * 1000LL));
+    const qint64 hours = total_minutes / 60LL;
+    const qint64 minutes = total_minutes % 60LL;
+    if (hours <= 0) {
+        return QString::fromUtf8(u8"Осталось: %1 м").arg(total_minutes);
+    }
+    if (minutes == 0) {
+        return QString::fromUtf8(u8"Осталось: %1 ч").arg(hours);
+    }
+    return QString::fromUtf8(u8"Осталось: %1 ч %2 м").arg(hours).arg(minutes);
+}
+
+std::optional<std::uint8_t> ComponentLevel(const DeviceEntry& device, const char* name) {
+    if (const auto* component = FindComponent(device, name); component != nullptr) {
+        return component->battery_level_percent;
+    }
+    return std::nullopt;
+}
+
+std::string BuildRuntimeStateKey(const DeviceEntry& device,
+                                 const QString& selected_component_key,
+                                 bool use_pair_forecast) {
+    std::ostringstream stream;
+    stream << (use_pair_forecast ? "pair" : selected_component_key.toStdString()) << '|';
+
+    if (use_pair_forecast) {
+        const auto left = ComponentLevel(device, "left");
+        const auto right = ComponentLevel(device, "right");
+        stream << (left.has_value() ? std::to_string(*left) : std::string("na")) << '|'
+               << (right.has_value() ? std::to_string(*right) : std::string("na"));
+    } else {
+        const auto component = FindComponent(device, selected_component_key.toUtf8().constData());
+        const auto level = component != nullptr ? component->battery_level_percent : std::optional<std::uint8_t>{};
+        stream << (level.has_value() ? std::to_string(*level) : std::string("na"));
+    }
+
+    stream << '|';
+    if (device.device_mode.has_value()) {
+        stream << ToLowerAscii(*device.device_mode);
+    }
+    stream << '|';
+    if (device.device_submode.has_value()) {
+        stream << ToLowerAscii(*device.device_submode);
+    }
+    return stream.str();
 }
 
 QString ProgressLevelState(const PrimaryBattery& primary) {
@@ -1727,6 +1780,7 @@ QWidget#listContainer {
             this, [this](int minutes) { ApplyLowBatteryRepeatMinutes(minutes, true); });
 
     refresh_timer_ = new QTimer(this);
+    runtime_timer_ = new QTimer(this);
     refresh_interval_ms_ = LoadRefreshIntervalMs();
     low_battery_threshold_percent_ = LoadLowBatteryThresholdPercent();
     low_battery_repeat_minutes_ = LoadLowBatteryRepeatMinutes();
@@ -1747,7 +1801,10 @@ QWidget#listContainer {
         low_battery_repeat_spinbox_->blockSignals(false);
     }
     connect(refresh_timer_, &QTimer::timeout, this, [this]() { RefreshBatteryData(); });
+    connect(runtime_timer_, &QTimer::timeout, this, [this]() { UpdateRuntimeCountdownLabels(); });
     refresh_timer_->start();
+    runtime_timer_->setInterval(1000);
+    runtime_timer_->start();
     UpdateRefreshSettingsTooltip();
     RunLowBatteryNotificationSelfCheck();
 
@@ -2080,6 +2137,16 @@ void BatteryWindow::RecordBatteryHistory(const std::vector<DeviceBatteryInfo>& d
         it->second->SetHistory(history_store_.LoadHistory(ToQString(it->first)));
         ++it;
     }
+
+    for (auto it = stats_dialogs_.begin(); it != stats_dialogs_.end();) {
+        if (it->second.isNull()) {
+            it = stats_dialogs_.erase(it);
+            continue;
+        }
+
+        it->second->SetHistory(history_store_.LoadHistory(ToQString(it->first)));
+        ++it;
+    }
 }
 
 void BatteryWindow::ShowBatteryHistory(const std::string& device_id, const std::string& fallback_name) {
@@ -2104,6 +2171,33 @@ void BatteryWindow::ShowBatteryHistory(const std::string& device_id, const std::
     auto* dialog = new BatteryHistoryDialog(std::move(history), this);
     history_dialogs_[device_id] = dialog;
     connect(dialog, &QObject::destroyed, this, [this, device_id]() { history_dialogs_.erase(device_id); });
+    dialog->show();
+    dialog->raise();
+    dialog->activateWindow();
+}
+
+void BatteryWindow::ShowBatteryStats(const std::string& device_id, const std::string& fallback_name) {
+    if (device_id.empty()) {
+        return;
+    }
+
+    BatteryHistoryData history = history_store_.LoadHistory(ToQString(device_id));
+    if (history.device_name.trimmed().isEmpty()) {
+        history.device_name = ToQString(fallback_name);
+    }
+
+    const auto existing_dialog = stats_dialogs_.find(device_id);
+    if (existing_dialog != stats_dialogs_.end() && !existing_dialog->second.isNull()) {
+        existing_dialog->second->SetHistory(std::move(history));
+        existing_dialog->second->show();
+        existing_dialog->second->raise();
+        existing_dialog->second->activateWindow();
+        return;
+    }
+
+    auto* dialog = new BatteryStatsDialog(std::move(history), this);
+    stats_dialogs_[device_id] = dialog;
+    connect(dialog, &QObject::destroyed, this, [this, device_id]() { stats_dialogs_.erase(device_id); });
     dialog->show();
     dialog->raise();
     dialog->activateWindow();
@@ -2711,10 +2805,53 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
         const QString triplet_text = BuildComponentTriplet(device);
         const QString mode_text = BuildDeviceModeText(device);
         QString runtime_text;
+        qint64 runtime_deadline_ms = -1;
         if (is_active) {
             const BatteryHistoryData device_history = history_store_.LoadHistory(ToQString(device.device_id));
             const BatteryRuntimeForecast runtime_forecast = EstimateBatteryRuntimeForecast(device_history);
-            runtime_text = BuildRuntimeForecastCompactSummary(runtime_forecast);
+            QString selected_component_key;
+            bool use_pair_forecast = false;
+            std::optional<qint64> remaining_ms;
+            if (runtime_forecast.pair_remaining_ms.has_value()) {
+                use_pair_forecast = true;
+                remaining_ms = runtime_forecast.pair_remaining_ms;
+            } else {
+                const std::array<QString, 4> runtime_order = {
+                    QStringLiteral("left"),
+                    QStringLiteral("right"),
+                    QStringLiteral("main"),
+                    QStringLiteral("case"),
+                };
+                for (const auto& key : runtime_order) {
+                    const auto found = runtime_forecast.by_component.find(key);
+                    if (found == runtime_forecast.by_component.end() || !found->remaining_ms.has_value()) {
+                        continue;
+                    }
+                    selected_component_key = key;
+                    remaining_ms = found->remaining_ms;
+                    break;
+                }
+            }
+
+            if (remaining_ms.has_value() && !device_history.samples.isEmpty()) {
+                const qint64 proposed_deadline_ms = device_history.samples.back().timestamp_ms + *remaining_ms;
+                const std::string runtime_state_key =
+                    BuildRuntimeStateKey(device, selected_component_key, use_pair_forecast);
+                const auto state_it = runtime_state_key_by_device_.find(device.device_id);
+                const auto deadline_it = runtime_deadline_ms_by_device_.find(device.device_id);
+                if (state_it != runtime_state_key_by_device_.end() && deadline_it != runtime_deadline_ms_by_device_.end() &&
+                    state_it->second == runtime_state_key) {
+                    runtime_deadline_ms = std::min(deadline_it->second, proposed_deadline_ms);
+                } else {
+                    runtime_deadline_ms = proposed_deadline_ms;
+                }
+                runtime_state_key_by_device_[device.device_id] = runtime_state_key;
+                runtime_deadline_ms_by_device_[device.device_id] = runtime_deadline_ms;
+                runtime_text = FormatRuntimeCountdownNoSeconds(runtime_deadline_ms - QDateTime::currentMSecsSinceEpoch());
+            }
+        } else {
+            runtime_deadline_ms_by_device_.erase(device.device_id);
+            runtime_state_key_by_device_.erase(device.device_id);
         }
 
         auto* progress = new QProgressBar(center_widget);
@@ -2756,6 +2893,14 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
         technical_label->setProperty("activeState", active_state);
         technical_label->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
         technical_label->setFixedHeight(14);
+        const QString technical_prefix =
+            (!triplet_text.isEmpty() && !mode_text.isEmpty())
+                ? triplet_text + QStringLiteral("  ·  ") + mode_text
+                : (!triplet_text.isEmpty() ? triplet_text : mode_text);
+        technical_label->setProperty("runtimePrefix", technical_prefix);
+        technical_label->setProperty("runtimeDeadlineMs", runtime_deadline_ms);
+        technical_label->setProperty("runtimeHasDeadline", runtime_deadline_ms >= 0);
+        runtime_labels_.push_back(technical_label);
 
         auto* battery_layout = new QHBoxLayout();
         battery_layout->setContentsMargins(0, 0, 0, 0);
@@ -2824,6 +2969,8 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
 
         auto* actions_menu = new QMenu(actions_button);
         auto* refresh_row_action = actions_menu->addAction(QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u0438\u0442\u044C"));
+        auto* stats_row_action =
+            actions_menu->addAction(QString::fromUtf8(u8"\u0421\u0442\u0430\u0442\u0438\u0441\u0442\u0438\u043A\u0430"));
         auto* history_row_action =
             actions_menu->addAction(QString::fromUtf8(u8"\u0413\u0440\u0430\u0444\u0438\u043A "
                                                       u8"\u0440\u0430\u0437\u0440\u044F\u0434\u043A\u0438"));
@@ -2833,6 +2980,10 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
         actions_button->setMenu(actions_menu);
 
         connect(refresh_row_action, &QAction::triggered, this, [this]() { RefreshBatteryData(); });
+        connect(stats_row_action, &QAction::triggered, this,
+                [this, device_id = device.device_id, device_name = device.device_name]() {
+                    ShowBatteryStats(device_id, device_name);
+                });
         connect(history_row_action, &QAction::triggered, this,
                 [this, device_id = device.device_id, device_name = device.device_name]() {
                     ShowBatteryHistory(device_id, device_name);
@@ -2853,10 +3004,40 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
     AdjustWindowHeightForRows(std::min(kMaxVisibleRows, std::max(1, device_count)));
 }
 
+void BatteryWindow::UpdateRuntimeCountdownLabels() {
+    if (runtime_labels_.empty()) {
+        return;
+    }
+
+    const qint64 now_ms = QDateTime::currentMSecsSinceEpoch();
+    auto it = runtime_labels_.begin();
+    while (it != runtime_labels_.end()) {
+        if (it->isNull()) {
+            it = runtime_labels_.erase(it);
+            continue;
+        }
+
+        QLabel* label = it->data();
+        if (label == nullptr || !label->property("runtimeHasDeadline").toBool()) {
+            ++it;
+            continue;
+        }
+
+        const qint64 deadline_ms = label->property("runtimeDeadlineMs").toLongLong();
+        const QString runtime_prefix = label->property("runtimePrefix").toString();
+        const QString runtime_text = FormatRuntimeCountdownNoSeconds(deadline_ms - now_ms);
+        label->setText(runtime_prefix.isEmpty() ? runtime_text
+                                                : runtime_prefix + QStringLiteral("  ·  ") + runtime_text);
+        ++it;
+    }
+}
+
 void BatteryWindow::ClearDeviceCards() {
     if (cards_layout_ == nullptr) {
         return;
     }
+
+    runtime_labels_.clear();
 
     QLayoutItem* item = nullptr;
     while ((item = cards_layout_->takeAt(0)) != nullptr) {

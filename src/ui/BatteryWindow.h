@@ -38,6 +38,7 @@ class QCloseEvent;
 namespace battery_monitor {
 
 class BatteryHistoryDialog;
+class BatteryStatsDialog;
 
 class BatteryWindow : public QWidget {
    public:
@@ -64,12 +65,14 @@ class BatteryWindow : public QWidget {
     void NotifyLowBatteryIfNeeded(const std::vector<DeviceBatteryInfo>& devices);
     void RecordBatteryHistory(const std::vector<DeviceBatteryInfo>& devices);
     void ShowBatteryHistory(const std::string& device_id, const std::string& fallback_name);
+    void ShowBatteryStats(const std::string& device_id, const std::string& fallback_name);
     void AdjustWindowHeightForRows(int visible_rows);
     void ApplyRefreshIntervalSeconds(int seconds, bool announce_status);
     void ApplyLowBatteryThresholdPercent(int percent, bool announce_status);
     void ApplyLowBatteryRepeatMinutes(int minutes, bool announce_status);
     void ConfigureRefreshInterval();
     void UpdateRefreshSettingsTooltip();
+    void UpdateRuntimeCountdownLabels();
     void SetDeviceDragActive(bool active);
     void ApplyNoiseControlMode(const std::string& device_id, NoiseControlMode mode);
     void ApplyNoiseSubmode(const std::string& device_id, NoiseControlMode mode, const std::string& submode_id);
@@ -100,6 +103,7 @@ class BatteryWindow : public QWidget {
     QAction* reset_hidden_action_ = nullptr;
     QAction* quit_action_ = nullptr;
     QTimer* refresh_timer_ = nullptr;
+    QTimer* runtime_timer_ = nullptr;
     std::unordered_set<std::string> hidden_device_ids_;
     std::unordered_map<std::string, QDateTime> last_live_update_;
     std::vector<std::string> connected_device_order_;
@@ -108,6 +112,10 @@ class BatteryWindow : public QWidget {
     std::unordered_map<std::string, std::uint8_t> last_live_component_levels_;
     std::unordered_map<std::string, std::int64_t> last_low_battery_alert_ms_;
     std::unordered_map<std::string, QPointer<BatteryHistoryDialog>> history_dialogs_;
+    std::unordered_map<std::string, QPointer<BatteryStatsDialog>> stats_dialogs_;
+    std::vector<QPointer<QLabel>> runtime_labels_;
+    std::unordered_map<std::string, qint64> runtime_deadline_ms_by_device_;
+    std::unordered_map<std::string, std::string> runtime_state_key_by_device_;
     std::thread refresh_worker_;
     std::atomic<bool> refresh_in_progress_{false};
     bool refresh_pending_ = false;

@@ -20,6 +20,7 @@
 
 #include "core/BatteryTypes.h"
 #include "core/ProviderFactory.h"
+#include "AppMain.h"
 
 namespace battery_monitor {
 
@@ -115,7 +116,7 @@ void PrintJson(const std::vector<DeviceBatteryInfo>& devices) {
 
 }  // namespace battery_monitor
 
-int main(int argc, char** argv) {
+int battery_monitor::BatteryMonitorMain(int argc, char** argv, bool prefer_gui) {
     bool json_output = false;
     bool cli_output = false;
     bool gui_forced = false;
@@ -286,7 +287,7 @@ int main(int argc, char** argv) {
         }
 #endif
 #ifdef BATTERY_MONITOR_WITH_QT
-        if (!json_output && (!cli_output || gui_forced)) {
+        if (!json_output && !cli_output && (prefer_gui || gui_forced)) {
             QApplication app(argc, argv);
             auto provider = battery_monitor::CreateBatteryProvider();
             battery_monitor::BatteryWindow window(std::move(provider));

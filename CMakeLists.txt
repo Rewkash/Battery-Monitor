@@ -18,22 +18,27 @@ if(BATTERY_MONITOR_ENABLE_QT)
     endif()
 endif()
 
-add_executable(
-    battery-monitor
+set(BATTERY_MONITOR_APP_SOURCES
     src/main.cpp
     src/core/ProviderFactory.cpp
 )
 
+add_library(
+    battery-monitor-app
+    STATIC
+    ${BATTERY_MONITOR_APP_SOURCES}
+)
+
 target_include_directories(
-    battery-monitor
-    PRIVATE
+    battery-monitor-app
+    PUBLIC
         ${PROJECT_SOURCE_DIR}/include
         ${PROJECT_SOURCE_DIR}/src
 )
 
 if(MSVC)
     target_compile_options(
-        battery-monitor
+        battery-monitor-app
         PRIVATE
             /W4
             /permissive-
@@ -42,7 +47,7 @@ if(MSVC)
     )
 else()
     target_compile_options(
-        battery-monitor
+        battery-monitor-app
         PRIVATE
             -Wall
             -Wextra
@@ -52,21 +57,21 @@ endif()
 
 if(WIN32)
     target_sources(
-        battery-monitor
+        battery-monitor-app
         PRIVATE
             src/platform/windows/WinRtBatteryProvider.cpp
     )
 
     target_compile_definitions(
-        battery-monitor
+        battery-monitor-app
         PRIVATE
             WIN32_LEAN_AND_MEAN
             NOMINMAX
     )
 
     target_link_libraries(
-        battery-monitor
-        PRIVATE
+        battery-monitor-app
+        PUBLIC
             windowsapp
             Ws2_32
     )
@@ -75,25 +80,25 @@ elseif(UNIX AND NOT APPLE)
     pkg_check_modules(DBUS REQUIRED dbus-1)
 
     target_sources(
-        battery-monitor
+        battery-monitor-app
         PRIVATE
             src/platform/linux/BluezBatteryProvider.cpp
     )
 
     target_include_directories(
-        battery-monitor
+        battery-monitor-app
         PRIVATE
             ${DBUS_INCLUDE_DIRS}
     )
 
     target_link_libraries(
-        battery-monitor
-        PRIVATE
+        battery-monitor-app
+        PUBLIC
             ${DBUS_LIBRARIES}
     )
 
     target_compile_options(
-        battery-monitor
+        battery-monitor-app
         PRIVATE
             ${DBUS_CFLAGS_OTHER}
     )
@@ -103,7 +108,7 @@ endif()
 
 if(BATTERY_MONITOR_QT_ENABLED)
     target_sources(
-        battery-monitor
+        battery-monitor-app
         PRIVATE
             src/ui/BatteryHistoryDialog.cpp
             src/ui/BatteryHistoryDialog.h
@@ -111,21 +116,36 @@ if(BATTERY_MONITOR_QT_ENABLED)
             src/ui/BatteryRuntimeEstimator.h
             src/ui/BatteryHistoryStore.cpp
             src/ui/BatteryHistoryStore.h
+            src/ui/BatteryStatsDialog.cpp
+            src/ui/BatteryStatsDialog.h
             src/ui/BatteryWindow.cpp
             src/ui/BatteryWindow.h
     )
 
     target_compile_definitions(
-        battery-monitor
+        battery-monitor-app
         PRIVATE
             BATTERY_MONITOR_WITH_QT
     )
 
     target_link_libraries(
-        battery-monitor
-        PRIVATE
+        battery-monitor-app
+        PUBLIC
             Qt6::Widgets
     )
+
+endif()
+
+if(BATTERY_MONITOR_QT_ENABLED)
+    if(WIN32)
+        add_executable(battery-monitor WIN32 src/gui_main.cpp)
+    else()
+        add_executable(battery-monitor src/gui_main.cpp)
+    endif()
+    add_executable(battery-monitor-cli src/cli_main.cpp)
+
+    target_link_libraries(battery-monitor PRIVATE battery-monitor-app)
+    target_link_libraries(battery-monitor-cli PRIVATE battery-monitor-app)
 
     if(WIN32)
         get_target_property(_qt_qmake_executable Qt6::qmake IMPORTED_LOCATION)
@@ -147,4 +167,7 @@ if(BATTERY_MONITOR_QT_ENABLED)
             VERBATIM
         )
     endif()
+else()
+    add_executable(battery-monitor src/cli_main.cpp)
+    target_link_libraries(battery-monitor PRIVATE battery-monitor-app)
 endif()

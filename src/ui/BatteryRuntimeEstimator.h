@@ -31,5 +31,6 @@ BatteryRuntimeForecast EstimateBatteryRuntimeForecast(const BatteryHistoryData& 
 QString FormatRuntimeDurationCompact(qint64 duration_ms);
 QString BuildRuntimeForecastSummary(const BatteryRuntimeForecast& forecast);
 QString BuildRuntimeForecastCompactSummary(const BatteryRuntimeForecast& forecast);
+QString BuildBatteryStatisticsReport(const BatteryHistoryData& history);
 
 }  // namespace battery_monitor

@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <array>
 
+#include <QDateTime>
 #include <QMap>
+#include <QSet>
 #include <QStringList>
 
 namespace battery_monitor {
@@ -366,6 +368,236 @@ QString ComponentLabel(const QString& component_key) {
     return component_key;
 }
 
+QString ModeLabel(const QString& mode) {
+    const QString normalized = NormalizeToken(mode);
+    if (normalized == QStringLiteral("off")) {
+        return QString::fromUtf8(u8"Выкл");
+    }
+    if (normalized == QStringLiteral("anc")) {
+        return QString::fromUtf8(u8"Шумоподавление");
+    }
+    if (normalized == QStringLiteral("transparency")) {
+        return QString::fromUtf8(u8"Прозрачность");
+    }
+    return mode.trimmed();
+}
+
+QString SubmodeLabel(const QString& submode) {
+    const QString normalized = NormalizeToken(submode);
+    if (normalized == QStringLiteral("balanced")) {
+        return QString::fromUtf8(u8"Баланс");
+    }
+    if (normalized == QStringLiteral("weak")) {
+        return QString::fromUtf8(u8"Слабое");
+    }
+    if (normalized == QStringLiteral("deep")) {
+        return QString::fromUtf8(u8"Глубокое");
+    }
+    if (normalized == QStringLiteral("adaptive")) {
+        return QString::fromUtf8(u8"Адаптивное");
+    }
+    if (normalized == QStringLiteral("voice")) {
+        return QString::fromUtf8(u8"Усиление голоса");
+    }
+    if (normalized == QStringLiteral("standard")) {
+        return QString::fromUtf8(u8"Обычная прозрачность");
+    }
+    return submode.trimmed();
+}
+
+QString ConfidenceLabel(BatteryRuntimeConfidence confidence) {
+    switch (confidence) {
+        case BatteryRuntimeConfidence::High:
+            return QString::fromUtf8(u8"высокая");
+        case BatteryRuntimeConfidence::Medium:
+            return QString::fromUtf8(u8"средняя");
+        case BatteryRuntimeConfidence::Low:
+        default:
+            return QString::fromUtf8(u8"низкая");
+    }
+}
+
+struct AverageRuntimeSummary {
+    qint64 total_duration_ms = 0;
+    int total_drop = 0;
+};
+
+QHash<QString, AverageRuntimeSummary> ComputeAverageRuntimeSummaries(const BatteryHistoryData& history) {
+    QHash<QString, AverageRuntimeSummary> summaries;
+    for (const auto& component_key : VisibleComponents(history)) {
+        bool have_previous = false;
+        qint64 previous_timestamp_ms = 0;
+        int previous_level = -1;
+
+        for (const auto& sample : history.samples) {
+            const auto current_level_opt = SampleLevel(sample, component_key);
+            const int current_level = current_level_opt.value_or(-1);
+            if (!have_previous) {
+                previous_timestamp_ms = sample.timestamp_ms;
+                previous_level = current_level;
+                have_previous = true;
+                continue;
+            }
+
+            const qint64 delta_ms = sample.timestamp_ms - previous_timestamp_ms;
+            const bool invalid_pair = delta_ms <= 0 ||
+                                      previous_level < 0 || current_level < 0 ||
+                                      IsDisconnectedLevel(previous_level) || IsDisconnectedLevel(current_level) ||
+                                      delta_ms > kSeriesGapBreakMs ||
+                                      (current_level - previous_level) > kChargeJumpBreakPercent;
+
+            if (!invalid_pair) {
+                auto& summary = summaries[component_key];
+                summary.total_duration_ms += delta_ms;
+                summary.total_drop += std::max(0, previous_level - current_level);
+            }
+
+            previous_timestamp_ms = sample.timestamp_ms;
+            previous_level = current_level;
+        }
+    }
+    return summaries;
+}
+
+struct ContextRuntimeSummary {
+    QString component_key;
+    QString mode;
+    QString submode;
+    qint64 total_duration_ms = 0;
+    int total_drop = 0;
+    int sessions = 0;
+};
+
+QVector<ContextRuntimeSummary> ComputeContextRuntimeSummaries(const BatteryHistoryData& history) {
+    QHash<QString, ContextRuntimeSummary> summaries;
+
+    for (const auto& component_key : VisibleComponents(history)) {
+        bool in_session = false;
+        BatteryHistorySample previous_sample;
+        int previous_level = -1;
+        qint64 session_duration_ms = 0;
+        int session_drop = 0;
+        QString session_mode;
+        QString session_submode;
+
+        auto flush_session = [&]() {
+            if (session_drop > 0 && session_duration_ms > 0 && !session_mode.trimmed().isEmpty()) {
+                const QString key = component_key + QChar('|') + NormalizeToken(session_mode) + QChar('|') +
+                                    NormalizeToken(session_submode);
+                auto& summary = summaries[key];
+                if (summary.component_key.isEmpty()) {
+                    summary.component_key = component_key;
+                    summary.mode = NormalizeToken(session_mode);
+                    summary.submode = NormalizeToken(session_submode);
+                }
+                summary.total_duration_ms += session_duration_ms;
+                summary.total_drop += session_drop;
+                summary.sessions += 1;
+            }
+
+            session_duration_ms = 0;
+            session_drop = 0;
+            session_mode.clear();
+            session_submode.clear();
+        };
+
+        for (const auto& sample : history.samples) {
+            const auto current_level_opt = SampleLevel(sample, component_key);
+            if (!current_level_opt.has_value() || IsDisconnectedLevel(*current_level_opt)) {
+                flush_session();
+                in_session = false;
+                continue;
+            }
+
+            if (!in_session) {
+                previous_sample = sample;
+                previous_level = *current_level_opt;
+                session_mode = sample.device_mode;
+                session_submode = sample.device_submode;
+                in_session = true;
+                continue;
+            }
+
+            if (IsSessionBreak(previous_sample, sample, component_key)) {
+                flush_session();
+                previous_sample = sample;
+                previous_level = *current_level_opt;
+                session_mode = sample.device_mode;
+                session_submode = sample.device_submode;
+                in_session = true;
+                continue;
+            }
+
+            const int current_level = *current_level_opt;
+            session_duration_ms += std::max<qint64>(0, sample.timestamp_ms - previous_sample.timestamp_ms);
+            if (current_level < previous_level) {
+                session_drop += previous_level - current_level;
+            }
+
+            previous_sample = sample;
+            previous_level = current_level;
+        }
+
+        flush_session();
+    }
+
+    QVector<ContextRuntimeSummary> result;
+    result.reserve(summaries.size());
+    for (auto it = summaries.cbegin(); it != summaries.cend(); ++it) {
+        result.push_back(it.value());
+    }
+
+    std::sort(result.begin(), result.end(), [](const ContextRuntimeSummary& left, const ContextRuntimeSummary& right) {
+        static const std::array<QString, 4> order = {
+            QStringLiteral("left"),
+            QStringLiteral("right"),
+            QStringLiteral("case"),
+            QStringLiteral("main"),
+        };
+        const auto left_it = std::find(order.begin(), order.end(), left.component_key);
+        const auto right_it = std::find(order.begin(), order.end(), right.component_key);
+        if (left_it != right_it) {
+            return left_it < right_it;
+        }
+        if (left.mode != right.mode) {
+            return QString::localeAwareCompare(left.mode, right.mode) < 0;
+        }
+        return QString::localeAwareCompare(left.submode, right.submode) < 0;
+    });
+    return result;
+}
+
+struct ImbalanceSummary {
+    int shared_samples = 0;
+    double average_diff = 0.0;
+    int max_abs_gap = 0;
+    std::optional<int> latest_diff;
+};
+
+ImbalanceSummary ComputeImbalanceSummary(const BatteryHistoryData& history) {
+    ImbalanceSummary summary;
+    double total_diff = 0.0;
+    for (const auto& sample : history.samples) {
+        const auto left_level = SampleLevel(sample, QStringLiteral("left"));
+        const auto right_level = SampleLevel(sample, QStringLiteral("right"));
+        if (!left_level.has_value() || !right_level.has_value() ||
+            IsDisconnectedLevel(*left_level) || IsDisconnectedLevel(*right_level)) {
+            continue;
+        }
+
+        const int diff = *left_level - *right_level;
+        total_diff += static_cast<double>(diff);
+        summary.shared_samples += 1;
+        summary.max_abs_gap = std::max(summary.max_abs_gap, std::abs(diff));
+        summary.latest_diff = diff;
+    }
+
+    if (summary.shared_samples > 0) {
+        summary.average_diff = total_diff / static_cast<double>(summary.shared_samples);
+    }
+    return summary;
+}
+
 }  // namespace
 
 BatteryRuntimeForecast EstimateBatteryRuntimeForecast(const BatteryHistoryData& history) {
@@ -504,6 +736,146 @@ QString BuildRuntimeForecastCompactSummary(const BatteryRuntimeForecast& forecas
     }
 
     return QString();
+}
+
+QString BuildBatteryStatisticsReport(const BatteryHistoryData& history) {
+    if (history.samples.isEmpty()) {
+        return QString::fromUtf8(u8"Статистика появится после нескольких живых обновлений.");
+    }
+
+    QStringList lines;
+    const auto& latest_sample = history.samples.back();
+    const QDateTime start_time = QDateTime::fromMSecsSinceEpoch(history.samples.front().timestamp_ms);
+    const QDateTime end_time = QDateTime::fromMSecsSinceEpoch(history.samples.back().timestamp_ms);
+
+    QSet<QDate> days;
+    for (const auto& sample : history.samples) {
+        days.insert(QDateTime::fromMSecsSinceEpoch(sample.timestamp_ms).date());
+    }
+
+    lines << QString::fromUtf8(u8"Период истории: %1 — %2")
+                 .arg(start_time.toString(QStringLiteral("dd MMM yyyy HH:mm")))
+                 .arg(end_time.toString(QStringLiteral("dd MMM yyyy HH:mm")));
+    lines << QString::fromUtf8(u8"Дней с данными: %1 · Точек: %2")
+                 .arg(days.size())
+                 .arg(history.samples.size());
+
+    lines << QString();
+    lines << QString::fromUtf8(u8"Текущее состояние");
+    if (!latest_sample.device_mode.trimmed().isEmpty()) {
+        QString mode_line = QString::fromUtf8(u8"Режим: %1").arg(ModeLabel(latest_sample.device_mode));
+        if (!latest_sample.device_submode.trimmed().isEmpty()) {
+            mode_line += QString::fromUtf8(u8" · %1").arg(SubmodeLabel(latest_sample.device_submode));
+        }
+        lines << mode_line;
+    }
+
+    const std::array<QString, 4> component_order = {
+        QStringLiteral("left"),
+        QStringLiteral("right"),
+        QStringLiteral("case"),
+        QStringLiteral("main"),
+    };
+    for (const auto& component_key : component_order) {
+        const auto level = SampleLevel(latest_sample, component_key);
+        if (!level.has_value()) {
+            continue;
+        }
+        lines << QStringLiteral("%1: %2%").arg(ComponentLabel(component_key)).arg(*level);
+    }
+
+    const BatteryRuntimeForecast forecast = EstimateBatteryRuntimeForecast(history);
+    lines << QString();
+    lines << QString::fromUtf8(u8"Прогноз до разрядки");
+    bool have_forecast = false;
+    if (forecast.pair_remaining_ms.has_value()) {
+        lines << QString::fromUtf8(u8"Пара: %1 (%2)")
+                     .arg(FormatRuntimeDurationCompact(*forecast.pair_remaining_ms))
+                     .arg(ConfidenceLabel(forecast.pair_confidence));
+        have_forecast = true;
+    }
+    for (const auto& component_key : component_order) {
+        const auto found = forecast.by_component.find(component_key);
+        if (found == forecast.by_component.end() || !found->remaining_ms.has_value()) {
+            continue;
+        }
+        lines << QStringLiteral("%1: %2 (%3)")
+                     .arg(ComponentLabel(component_key))
+                     .arg(FormatRuntimeDurationCompact(*found->remaining_ms))
+                     .arg(ConfidenceLabel(found->confidence));
+        have_forecast = true;
+    }
+    if (!have_forecast) {
+        lines << QString::fromUtf8(u8"Данных для прогноза пока недостаточно.");
+    }
+
+    lines << QString();
+    lines << QString::fromUtf8(u8"Среднее время 100→0");
+    const auto average_summaries = ComputeAverageRuntimeSummaries(history);
+    bool have_averages = false;
+    for (const auto& component_key : component_order) {
+        const auto found = average_summaries.find(component_key);
+        if (found == average_summaries.end() || found->total_duration_ms <= 0 || found->total_drop < 10) {
+            continue;
+        }
+
+        const qint64 estimated_full_ms = static_cast<qint64>(
+            (static_cast<long double>(found->total_duration_ms) * 100.0L) /
+            static_cast<long double>(found->total_drop));
+        lines << QStringLiteral("%1: %2")
+                     .arg(ComponentLabel(component_key))
+                     .arg(FormatRuntimeDurationCompact(estimated_full_ms));
+        have_averages = true;
+    }
+    if (!have_averages) {
+        lines << QString::fromUtf8(u8"Недостаточно истории.");
+    }
+
+    const auto imbalance = ComputeImbalanceSummary(history);
+    if (imbalance.shared_samples > 0) {
+        lines << QString();
+        lines << QString::fromUtf8(u8"Баланс левого и правого");
+        lines << QString::fromUtf8(u8"Общих точек: %1").arg(imbalance.shared_samples);
+        lines << QString::fromUtf8(u8"Средняя разница (левый - правый): %1%")
+                     .arg(QString::number(imbalance.average_diff, 'f', 1));
+        lines << QString::fromUtf8(u8"Максимальный разрыв: %1%").arg(imbalance.max_abs_gap);
+        if (imbalance.latest_diff.has_value()) {
+            lines << QString::fromUtf8(u8"Текущая разница: %1%").arg(*imbalance.latest_diff);
+        }
+        if (std::abs(imbalance.average_diff) >= 10.0) {
+            lines << (imbalance.average_diff > 0.0
+                          ? QString::fromUtf8(u8"Вывод: правый наушник в среднем садится быстрее.")
+                          : QString::fromUtf8(u8"Вывод: левый наушник в среднем садится быстрее."));
+        }
+    }
+
+    lines << QString();
+    lines << QString::fromUtf8(u8"Статистика по режимам");
+    const auto context_summaries = ComputeContextRuntimeSummaries(history);
+    bool have_context = false;
+    for (const auto& summary : context_summaries) {
+        if (summary.total_duration_ms <= 0 || summary.total_drop < 10) {
+            continue;
+        }
+
+        const qint64 estimated_full_ms = static_cast<qint64>(
+            (static_cast<long double>(summary.total_duration_ms) * 100.0L) /
+            static_cast<long double>(summary.total_drop));
+        QString label = QStringLiteral("%1 · %2").arg(ComponentLabel(summary.component_key), ModeLabel(summary.mode));
+        if (!summary.submode.trimmed().isEmpty()) {
+            label += QString::fromUtf8(u8" · %1").arg(SubmodeLabel(summary.submode));
+        }
+        lines << QStringLiteral("%1: %2 · сессий %3")
+                     .arg(label)
+                     .arg(FormatRuntimeDurationCompact(estimated_full_ms))
+                     .arg(summary.sessions);
+        have_context = true;
+    }
+    if (!have_context) {
+        lines << QString::fromUtf8(u8"По режимам пока мало данных.");
+    }
+
+    return lines.join(QStringLiteral("\n"));
 }
 
 }  // namespace battery_monitor
