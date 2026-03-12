@@ -27,6 +27,7 @@
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QFrame>
+#include <QIcon>
 #include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -40,6 +41,7 @@
 #include <QPointer>
 #include <QPropertyAnimation>
 #include <QProgressBar>
+#include <QPixmap>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QScreen>
@@ -663,6 +665,67 @@ QString FormatRuntimeCountdownNoSeconds(qint64 duration_ms) {
         return QString::fromUtf8(u8"Осталось: %1 ч").arg(hours);
     }
     return QString::fromUtf8(u8"Осталось: %1 ч %2 м").arg(hours).arg(minutes);
+}
+
+QColor TrayLevelColor(int level) {
+    if (level < 20) {
+        return QColor(QStringLiteral("#FF7A7A"));
+    }
+    if (level < 40) {
+        return QColor(QStringLiteral("#FFD166"));
+    }
+    return QColor(QStringLiteral("#F8FAFC"));
+}
+
+QIcon BuildTrayLevelIcon(int level) {
+    const QString text = QString::number(level);
+    const QColor fill_color = TrayLevelColor(level);
+    const QColor shadow_color(0, 0, 0, 150);
+
+    auto build_pixmap = [&](int size) {
+        QPixmap pixmap(size, size);
+        pixmap.fill(Qt::transparent);
+
+        QPainter painter(&pixmap);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        painter.setRenderHint(QPainter::TextAntialiasing, true);
+
+        QFont font(QStringLiteral("Segoe UI"));
+        font.setBold(true);
+        if (text.size() >= 3) {
+            font.setPixelSize(std::max(8, static_cast<int>(std::round(size * 0.58))));
+        } else {
+            font.setPixelSize(std::max(9, static_cast<int>(std::round(size * 0.86))));
+        }
+        painter.setFont(font);
+
+        QPainterPath path;
+        path.addText(0, 0, font, text);
+        QRectF bounds = path.boundingRect();
+        const qreal x = (static_cast<qreal>(size) - bounds.width()) / 2.0 - bounds.left();
+        const qreal y = (static_cast<qreal>(size) - bounds.height()) / 2.0 - bounds.top();
+
+        QTransform transform;
+        transform.translate(x, y);
+        path = transform.map(path);
+
+        QPainterPath shadow_path = path;
+        shadow_path.translate(std::max<qreal>(1.0, size / 18.0), std::max<qreal>(1.0, size / 18.0));
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(shadow_color);
+        painter.drawPath(shadow_path);
+
+        painter.setBrush(fill_color);
+        painter.drawPath(path);
+
+        return pixmap;
+    };
+
+    QIcon icon;
+    for (const int size : {16, 20, 24, 32, 40, 48, 64}) {
+        icon.addPixmap(build_pixmap(size));
+    }
+    return icon;
 }
 
 qint64 ResolveStickyRuntimeDeadline(qint64 current_deadline_ms, qint64 proposed_deadline_ms) {
@@ -2047,6 +2110,15 @@ void BatteryWindow::UpdateTrayTooltip(const std::vector<DeviceBatteryInfo>& devi
         ++shown;
     }
 
+    QIcon tray_icon = windowIcon();
+    if (!ordered.empty()) {
+        const auto primary = ComputePrimaryBattery(ordered.front());
+        if (primary.level.has_value()) {
+            tray_icon = BuildTrayLevelIcon(static_cast<int>(*primary.level));
+        }
+    }
+
+    tray_icon_->setIcon(tray_icon);
     tray_icon_->setToolTip(tooltip);
 }
 
