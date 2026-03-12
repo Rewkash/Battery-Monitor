@@ -116,6 +116,8 @@ class BatteryWindow : public QWidget {
     std::vector<QPointer<QLabel>> runtime_labels_;
     std::unordered_map<std::string, qint64> runtime_deadline_ms_by_device_;
     std::unordered_map<std::string, std::string> runtime_state_key_by_device_;
+    std::unordered_map<std::string, std::unordered_map<std::string, qint64>> runtime_deadline_ms_by_component_;
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> runtime_state_key_by_component_;
     std::thread refresh_worker_;
     std::atomic<bool> refresh_in_progress_{false};
     bool refresh_pending_ = false;

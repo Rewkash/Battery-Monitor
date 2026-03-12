@@ -168,6 +168,25 @@ QString FormatCountdownDuration(qint64 duration_ms) {
         .arg(seconds, 2, 10, QLatin1Char('0'));
 }
 
+qint64 ResolveStickyCountdownDeadline(qint64 current_deadline_ms, qint64 proposed_deadline_ms) {
+    const qint64 now_ms = QDateTime::currentMSecsSinceEpoch();
+    if (proposed_deadline_ms <= current_deadline_ms) {
+        return proposed_deadline_ms;
+    }
+    if (current_deadline_ms <= now_ms) {
+        return proposed_deadline_ms;
+    }
+
+    constexpr qint64 kHardCorrectionThresholdMs = 45LL * 60LL * 1000LL;
+    const qint64 current_remaining_ms = current_deadline_ms - now_ms;
+    const qint64 delta_ms = proposed_deadline_ms - current_deadline_ms;
+    if (delta_ms >= kHardCorrectionThresholdMs || delta_ms >= (current_remaining_ms / 2LL)) {
+        return proposed_deadline_ms;
+    }
+
+    return current_deadline_ms;
+}
+
 QString BadgeText(BatteryRuntimeConfidence confidence, bool has_forecast) {
     if (!has_forecast) {
         return QString::fromUtf8(u8"Недостаточно данных");
@@ -1055,7 +1074,8 @@ void BatteryStatsDialog::RefreshUi() {
                                            : std::nullopt;
     if (left_state_key == left_countdown_state_key_ && left_countdown_deadline_ms_.has_value()) {
         if (proposed_left_deadline.has_value()) {
-            left_countdown_deadline_ms_ = std::min(*left_countdown_deadline_ms_, *proposed_left_deadline);
+            left_countdown_deadline_ms_ =
+                ResolveStickyCountdownDeadline(*left_countdown_deadline_ms_, *proposed_left_deadline);
         }
     } else {
         left_countdown_deadline_ms_ = proposed_left_deadline;
@@ -1077,7 +1097,8 @@ void BatteryStatsDialog::RefreshUi() {
         right_countdown_state_key_.clear();
     } else if (right_state_key == right_countdown_state_key_ && right_countdown_deadline_ms_.has_value()) {
         if (proposed_right_deadline.has_value()) {
-            right_countdown_deadline_ms_ = std::min(*right_countdown_deadline_ms_, *proposed_right_deadline);
+            right_countdown_deadline_ms_ =
+                ResolveStickyCountdownDeadline(*right_countdown_deadline_ms_, *proposed_right_deadline);
         }
     } else {
         right_countdown_deadline_ms_ = proposed_right_deadline;

@@ -6,6 +6,7 @@
 #include <cmath>
 
 #include <QDateTime>
+#include <QFrame>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLocale>
@@ -146,6 +147,43 @@ QString FormatDayLabel(const QDate& day) {
 
 QString FormatAxisLabel(qint64 timestamp_ms) {
     return QLocale::system().toString(QDateTime::fromMSecsSinceEpoch(timestamp_ms).time(), QStringLiteral("HH:mm"));
+}
+
+QString ModeLabel(const QString& mode) {
+    const QString normalized = mode.trimmed().toLower();
+    if (normalized == QStringLiteral("off")) {
+        return QString::fromUtf8(u8"выключено");
+    }
+    if (normalized == QStringLiteral("anc")) {
+        return QString::fromUtf8(u8"шумоподавление");
+    }
+    if (normalized == QStringLiteral("transparency")) {
+        return QString::fromUtf8(u8"прозрачность");
+    }
+    return normalized;
+}
+
+QString SubmodeLabel(const QString& submode) {
+    const QString normalized = submode.trimmed().toLower();
+    if (normalized == QStringLiteral("balance")) {
+        return QString::fromUtf8(u8"баланс");
+    }
+    if (normalized == QStringLiteral("weak")) {
+        return QString::fromUtf8(u8"слабое");
+    }
+    if (normalized == QStringLiteral("deep")) {
+        return QString::fromUtf8(u8"глубокое");
+    }
+    if (normalized == QStringLiteral("adaptive")) {
+        return QString::fromUtf8(u8"адаптивное");
+    }
+    if (normalized == QStringLiteral("normal")) {
+        return QString::fromUtf8(u8"обычная");
+    }
+    if (normalized == QStringLiteral("voice")) {
+        return QString::fromUtf8(u8"усиление голоса");
+    }
+    return normalized;
 }
 
 qint64 DayWindowStartMs(const QDate& day) {
@@ -426,6 +464,159 @@ QString BuildRuntimeEstimateText(const BatteryHistoryData& history, const QSet<Q
 
     return QString::fromUtf8(u8"Среднее время работы 100→0: %1")
         .arg(parts.join(QString::fromUtf8(u8" · ")));
+}
+
+struct SummaryCardText {
+    QString value;
+    QString note;
+};
+
+std::optional<qint64> EstimateAverageRuntimeForComponent(const BatteryHistoryData& history,
+                                                         const QString& component_key) {
+    qint64 total_duration_ms = 0;
+    int total_drop = 0;
+    bool have_previous = false;
+    qint64 previous_timestamp_ms = 0;
+    int previous_level = -1;
+
+    for (const auto& sample : history.samples) {
+        const auto level_it = sample.component_levels.find(component_key);
+        const int current_level = level_it == sample.component_levels.end() ? -1 : level_it.value();
+
+        if (!have_previous) {
+            previous_timestamp_ms = sample.timestamp_ms;
+            previous_level = current_level;
+            have_previous = true;
+            continue;
+        }
+
+        const qint64 delta_ms = sample.timestamp_ms - previous_timestamp_ms;
+        const bool invalid_pair = delta_ms <= 0 ||
+                                  previous_level < 0 || current_level < 0 ||
+                                  IsDisconnectedLevel(previous_level) || IsDisconnectedLevel(current_level) ||
+                                  delta_ms > kSeriesGapBreakMs ||
+                                  (current_level - previous_level) > kChargeJumpBreakPercent;
+
+        if (!invalid_pair) {
+            total_duration_ms += delta_ms;
+            total_drop += std::max(0, previous_level - current_level);
+        }
+
+        previous_timestamp_ms = sample.timestamp_ms;
+        previous_level = current_level;
+    }
+
+    if (total_duration_ms <= 0 || total_drop < 10) {
+        return std::nullopt;
+    }
+
+    return static_cast<qint64>((static_cast<long double>(total_duration_ms) * 100.0L) /
+                               static_cast<long double>(total_drop));
+}
+
+std::optional<qint64> RemainingMsForComponent(const QString& component_key,
+                                              const QHash<QString, qint64>& component_runtime_deadlines_ms,
+                                              std::optional<qint64> runtime_deadline_ms,
+                                              const BatteryRuntimeForecast& forecast) {
+    const qint64 now_ms = QDateTime::currentMSecsSinceEpoch();
+    const auto deadline_it = component_runtime_deadlines_ms.find(component_key);
+    if (deadline_it != component_runtime_deadlines_ms.end()) {
+        return std::max<qint64>(0, deadline_it.value() - now_ms);
+    }
+
+    if (component_key == QStringLiteral("main") && runtime_deadline_ms.has_value()) {
+        return std::max<qint64>(0, *runtime_deadline_ms - now_ms);
+    }
+
+    const auto forecast_it = forecast.by_component.find(component_key);
+    if (forecast_it == forecast.by_component.end() || !forecast_it->remaining_ms.has_value()) {
+        return std::nullopt;
+    }
+    return *forecast_it->remaining_ms;
+}
+
+SummaryCardText BuildComponentCard(const QString& component_key,
+                                   const BatteryHistoryData& history,
+                                   const QHash<QString, qint64>& component_runtime_deadlines_ms,
+                                   std::optional<qint64> runtime_deadline_ms,
+                                   const BatteryRuntimeForecast& forecast) {
+    const auto remaining_ms = RemainingMsForComponent(component_key,
+                                                      component_runtime_deadlines_ms,
+                                                      runtime_deadline_ms,
+                                                      forecast);
+    const auto average_ms = EstimateAverageRuntimeForComponent(history, component_key);
+
+    SummaryCardText card;
+    if (remaining_ms.has_value()) {
+        card.value = FormatRuntimeDurationCompact(*remaining_ms);
+    } else {
+        card.value = QString::fromUtf8(u8"—");
+    }
+
+    if (average_ms.has_value()) {
+        card.note = QString::fromUtf8(u8"100→0: %1").arg(FormatDurationCompact(*average_ms));
+    } else {
+        card.note = QString::fromUtf8(u8"100→0: мало данных");
+    }
+
+    return card;
+}
+
+QString BuildCompactHistorySubtitle(const BatteryHistoryData& full_history,
+                                    const BatteryHistoryData& visible_history,
+                                    const QDate& selected_day) {
+    if (full_history.samples.isEmpty()) {
+        return QString::fromUtf8(u8"История появится после нескольких живых обновлений.");
+    }
+    if (visible_history.samples.isEmpty()) {
+        return QString::fromUtf8(u8"История за %1 пока пуста.").arg(FormatDayLabel(selected_day));
+    }
+    const auto& latest_sample = full_history.samples.back();
+    if (latest_sample.device_mode.trimmed().isEmpty()) {
+        return QString::fromUtf8(u8"История за %1").arg(FormatDayLabel(selected_day));
+    }
+
+    QString mode_text = ModeLabel(latest_sample.device_mode);
+    if (!latest_sample.device_submode.trimmed().isEmpty()) {
+        mode_text += QString::fromUtf8(u8" · %1").arg(SubmodeLabel(latest_sample.device_submode));
+    }
+    return QString::fromUtf8(u8"История за %1 · сейчас: %2")
+        .arg(FormatDayLabel(selected_day))
+        .arg(mode_text);
+}
+
+QString BuildCompactStatsLine(const BatteryHistoryData& history) {
+    Q_UNUSED(history);
+    return QString();
+}
+
+QFrame* CreateSummaryCard(QLabel** title_label,
+                          QLabel** value_label,
+                          QLabel** note_label,
+                          QWidget* parent) {
+    auto* card = new QFrame(parent);
+    card->setObjectName(QStringLiteral("historySummaryCard"));
+    card->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+
+    auto* layout = new QVBoxLayout(card);
+    layout->setContentsMargins(14, 12, 14, 12);
+    layout->setSpacing(4);
+
+    *title_label = new QLabel(card);
+    (*title_label)->setObjectName(QStringLiteral("historySummaryTitle"));
+
+    *value_label = new QLabel(card);
+    (*value_label)->setObjectName(QStringLiteral("historySummaryValue"));
+
+    *note_label = new QLabel(card);
+    (*note_label)->setObjectName(QStringLiteral("historySummaryNote"));
+    (*note_label)->setWordWrap(true);
+
+    layout->addWidget(*title_label);
+    layout->addWidget(*value_label);
+    layout->addWidget(*note_label);
+
+    return card;
 }
 
 }  // namespace
@@ -804,9 +995,27 @@ QLabel#historySubtitle {
     font-size: 11px;
 }
 QLabel#historyStats {
-    color: #E7ECF6;
+    color: #AEB9C8;
+    font-size: 11px;
+}
+QFrame#historySummaryCard {
+    background: #2A2F37;
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    border-radius: 12px;
+}
+QLabel#historySummaryTitle {
+    color: #AEB9C8;
     font-size: 11px;
     font-weight: 600;
+}
+QLabel#historySummaryValue {
+    color: #F8FAFC;
+    font-size: 20px;
+    font-weight: 800;
+}
+QLabel#historySummaryNote {
+    color: #D1D5DB;
+    font-size: 11px;
 }
 QLabel#historyDayLabel {
     color: #F8FAFC;
@@ -879,6 +1088,18 @@ QPushButton#historyNavButton:disabled {
     stats_label_->setObjectName(QStringLiteral("historyStats"));
     stats_label_->setWordWrap(true);
 
+    summary_container_ = new QFrame(this);
+    auto* summary_layout = new QHBoxLayout(summary_container_);
+    summary_layout->setContentsMargins(0, 0, 0, 0);
+    summary_layout->setSpacing(10);
+    for (int index = 0; index < static_cast<int>(summary_cards_.size()); ++index) {
+        summary_cards_[index] = CreateSummaryCard(&summary_title_labels_[index],
+                                                  &summary_value_labels_[index],
+                                                  &summary_note_labels_[index],
+                                                  summary_container_);
+        summary_layout->addWidget(summary_cards_[index]);
+    }
+
     auto* day_row = new QHBoxLayout();
     day_row->setContentsMargins(0, 0, 0, 0);
     day_row->setSpacing(8);
@@ -921,6 +1142,7 @@ QPushButton#historyNavButton:disabled {
 
     root_layout->addWidget(title_label_);
     root_layout->addWidget(subtitle_label_);
+    root_layout->addWidget(summary_container_);
     root_layout->addWidget(stats_label_);
     root_layout->addLayout(day_row);
     root_layout->addWidget(chart_widget_, 1);
@@ -944,22 +1166,67 @@ void BatteryHistoryDialog::SetHistory(BatteryHistoryData history) {
     RefreshUi();
 }
 
+void BatteryHistoryDialog::SetRuntimeDeadline(std::optional<qint64> runtime_deadline_ms) {
+    runtime_deadline_ms_ = runtime_deadline_ms;
+    RefreshUi();
+}
+
+void BatteryHistoryDialog::SetComponentRuntimeDeadlines(QHash<QString, qint64> component_runtime_deadlines_ms) {
+    component_runtime_deadlines_ms_ = std::move(component_runtime_deadlines_ms);
+    RefreshUi();
+}
+
 void BatteryHistoryDialog::RefreshUi() {
     const BatteryHistoryData day_history = FilterHistoryForDay(history_, selected_day_);
     const BatteryHistoryData visible_history = FilterHiddenComponents(day_history, hidden_components_);
     const auto available_days = AvailableDays(history_);
     const int day_index = DayIndex(available_days, selected_day_);
     const BatteryRuntimeForecast runtime_forecast = EstimateBatteryRuntimeForecast(history_);
+    const QStringList component_keys = VisibleComponents(history_);
+    QStringList summary_component_keys;
+    const auto append_if_present = [&](const QString& component_key) {
+        if (component_keys.contains(component_key) && !summary_component_keys.contains(component_key)) {
+            summary_component_keys.push_back(component_key);
+        }
+    };
+    append_if_present(QStringLiteral("left"));
+    append_if_present(QStringLiteral("case"));
+    append_if_present(QStringLiteral("right"));
+    if (summary_component_keys.isEmpty()) {
+        append_if_present(QStringLiteral("main"));
+    }
+    if (summary_component_keys.isEmpty()) {
+        summary_component_keys = component_keys;
+    }
 
     title_label_->setText(BuildDialogTitle(history_));
-    subtitle_label_->setText(BuildDialogSubtitle(history_, day_history, selected_day_));
-    QStringList stats_lines;
-    stats_lines.push_back(BuildRuntimeEstimateText(history_, hidden_components_));
-    const QString forecast_text = BuildRuntimeForecastSummary(runtime_forecast);
-    if (!forecast_text.isEmpty()) {
-        stats_lines.push_back(forecast_text);
+    subtitle_label_->setText(BuildCompactHistorySubtitle(history_, day_history, selected_day_));
+    bool has_visible_summary_card = false;
+    for (int index = 0; index < static_cast<int>(summary_cards_.size()); ++index) {
+        if (index >= summary_component_keys.size()) {
+            summary_cards_[index]->setVisible(false);
+            continue;
+        }
+
+        const QString component_key = summary_component_keys[index];
+        const SummaryCardText component_card = BuildComponentCard(component_key,
+                                                                  history_,
+                                                                  component_runtime_deadlines_ms_,
+                                                                  runtime_deadline_ms_,
+                                                                  runtime_forecast);
+        summary_title_labels_[index]->setText(ComponentLabel(component_key));
+        summary_value_labels_[index]->setText(component_card.value);
+        summary_value_labels_[index]->setVisible(!component_card.value.trimmed().isEmpty());
+        summary_note_labels_[index]->setText(component_card.note);
+        summary_note_labels_[index]->setVisible(!component_card.note.trimmed().isEmpty());
+        summary_cards_[index]->setVisible(true);
+        has_visible_summary_card = true;
     }
-    stats_label_->setText(stats_lines.join(QStringLiteral("\n")));
+
+    summary_container_->setVisible(has_visible_summary_card);
+    const QString compact_stats = BuildCompactStatsLine(history_);
+    stats_label_->setText(compact_stats);
+    stats_label_->setVisible(!compact_stats.isEmpty());
     day_label_->setText(FormatDayLabel(selected_day_));
     hint_label_->setText(BuildHintText(history_));
     chart_widget_->SetHistory(visible_history, DayWindowStartMs(selected_day_), DayWindowEndMs(selected_day_));
