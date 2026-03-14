@@ -79,6 +79,11 @@ using winrt::Windows::Foundation::IPropertyValue;
 using winrt::Windows::Foundation::PropertyType;
 using winrt::Windows::Storage::Streams::DataReader;
 
+constexpr const wchar_t* kDeviceContainerCategoryProperty =
+    L"{78C34FC8-104A-4ACA-9EA4-524D52996E57} 90";
+constexpr const wchar_t* kDeviceContainerPrimaryCategoryProperty =
+    L"{78C34FC8-104A-4ACA-9EA4-524D52996E57} 97";
+
 struct BatteryReading {
     std::string component;
     std::uint8_t percent = 0;
@@ -99,8 +104,18 @@ struct EndpointCandidate {
     std::string endpoint_id;
     std::string endpoint_name;
     std::uint64_t bluetooth_address = 0;
+    std::optional<std::uint16_t> bluetooth_le_appearance;
+    std::optional<std::uint32_t> bluetooth_cod_major;
+    std::optional<std::uint32_t> bluetooth_cod_minor;
+    std::vector<std::string> device_categories;
     bool from_connected_scan = false;
     bool is_connected = false;
+};
+
+struct PnpBluetoothVisualHints {
+    std::optional<std::uint32_t> bluetooth_cod_major;
+    std::optional<std::uint32_t> bluetooth_cod_minor;
+    std::vector<std::string> device_categories;
 };
 
 enum class XiaomiMessageType : std::uint8_t {
@@ -135,6 +150,15 @@ constexpr DEVPROPKEY kPhoneHfpBatteryHintPropKey = {
 constexpr DEVPROPKEY kZmiVendorBatteryHintPropKey = {
     {0x670245F9, 0x6E25, 0x4179, {0x85, 0xC1, 0x98, 0x1C, 0x33, 0xB9, 0xD3, 0xB7}},
     4};
+constexpr DEVPROPKEY kBluetoothClassOfDevicePropKey = {
+    {0x2BD67D8B, 0x8BEB, 0x48D5, {0x87, 0xE0, 0x6C, 0xDA, 0x34, 0x28, 0x04, 0x0A}},
+    4};
+constexpr DEVPROPKEY kDeviceContainerCategoryPropKey = {
+    {0x78C34FC8, 0x104A, 0x4ACA, {0x9E, 0xA4, 0x52, 0x4D, 0x52, 0x99, 0x6E, 0x57}},
+    90};
+constexpr DEVPROPKEY kDeviceContainerPrimaryCategoryPropKey = {
+    {0x78C34FC8, 0x104A, 0x4ACA, {0x9E, 0xA4, 0x52, 0x4D, 0x52, 0x99, 0x6E, 0x57}},
+    97};
 
 constexpr std::array<std::uint8_t, 3> kXiaomiMessageHeader = {0xFE, 0xDC, 0xBA};
 constexpr std::uint8_t kXiaomiMessageTrailer = 0xEF;
@@ -387,6 +411,10 @@ void EnsureApartmentInitialized() {
 
 std::string ToUtf8(const winrt::hstring& value) {
     return winrt::to_string(value);
+}
+
+std::string ToUtf8(const std::wstring& value) {
+    return winrt::to_string(winrt::hstring(value));
 }
 
 std::string ToLowerAscii(std::string value) {
@@ -1296,6 +1324,195 @@ bool TryGetUInt64Property(const DeviceInformation& device_info, const wchar_t* p
     return false;
 }
 
+bool TryGetUInt32Property(const DeviceInformation& device_info, const wchar_t* property_name, std::uint32_t* value) {
+    if (value == nullptr) {
+        return false;
+    }
+
+    IInspectable raw_value = nullptr;
+    if (!TryGetPropertyValue(device_info, property_name, &raw_value)) {
+        return false;
+    }
+
+    try {
+        *value = winrt::unbox_value<std::uint32_t>(raw_value);
+        return true;
+    } catch (const winrt::hresult_error&) {
+    }
+
+    try {
+        *value = static_cast<std::uint32_t>(winrt::unbox_value<std::uint16_t>(raw_value));
+        return true;
+    } catch (const winrt::hresult_error&) {
+    }
+
+    try {
+        *value = static_cast<std::uint32_t>(winrt::unbox_value<std::uint64_t>(raw_value));
+        return true;
+    } catch (const winrt::hresult_error&) {
+    }
+
+    try {
+        const auto signed_value = winrt::unbox_value<std::int32_t>(raw_value);
+        if (signed_value >= 0) {
+            *value = static_cast<std::uint32_t>(signed_value);
+            return true;
+        }
+    } catch (const winrt::hresult_error&) {
+    }
+
+    std::string text;
+    if (TryGetStringProperty(device_info, property_name, &text)) {
+        try {
+            *value = static_cast<std::uint32_t>(std::stoul(text));
+            return true;
+        } catch (const std::exception&) {
+        }
+    }
+
+    return false;
+}
+
+bool TryGetStringArrayProperty(
+    const DeviceInformation& device_info,
+    const wchar_t* property_name,
+    std::vector<std::string>* values) {
+    if (values == nullptr) {
+        return false;
+    }
+
+    IInspectable raw_value = nullptr;
+    if (!TryGetPropertyValue(device_info, property_name, &raw_value)) {
+        return false;
+    }
+
+    if (const auto property_value = raw_value.try_as<IPropertyValue>()) {
+        try {
+            if (property_value.Type() == PropertyType::StringArray) {
+                winrt::com_array<winrt::hstring> array_values;
+                property_value.GetStringArray(array_values);
+                values->clear();
+                values->reserve(array_values.size());
+                for (const auto& text : array_values) {
+                    const std::string utf8 = ToUtf8(text);
+                    if (!utf8.empty()) {
+                        values->push_back(utf8);
+                    }
+                }
+                return !values->empty();
+            }
+        } catch (const winrt::hresult_error&) {
+        }
+    }
+
+    std::string single_value;
+    if (TryGetStringProperty(device_info, property_name, &single_value) && !single_value.empty()) {
+        values->assign(1U, single_value);
+        return true;
+    }
+
+    return false;
+}
+
+void AppendUniqueStrings(std::vector<std::string>* target, const std::vector<std::string>& incoming) {
+    if (target == nullptr) {
+        return;
+    }
+    for (const auto& value : incoming) {
+        if (value.empty()) {
+            continue;
+        }
+        const auto it = std::find(target->begin(), target->end(), value);
+        if (it == target->end()) {
+            target->push_back(value);
+        }
+    }
+}
+
+void PopulateBluetoothVisualHintsFromDeviceInfo(const DeviceInformation& device_info, DeviceBatteryInfo* entry) {
+    if (entry == nullptr) {
+        return;
+    }
+
+    std::uint32_t value32 = 0;
+    if (TryGetUInt32Property(device_info, L"System.Devices.Aep.Bluetooth.Le.Appearance", &value32)) {
+        entry->bluetooth_le_appearance = static_cast<std::uint16_t>(value32);
+    }
+    if (TryGetUInt32Property(device_info, L"System.Devices.Aep.Bluetooth.Cod.Major", &value32)) {
+        entry->bluetooth_cod_major = value32;
+    }
+    if (TryGetUInt32Property(device_info, L"System.Devices.Aep.Bluetooth.Cod.Minor", &value32)) {
+        entry->bluetooth_cod_minor = value32;
+    }
+
+    std::vector<std::string> categories;
+    if (TryGetStringArrayProperty(device_info, kDeviceContainerCategoryProperty, &categories)) {
+        AppendUniqueStrings(&entry->device_categories, categories);
+    }
+    if (TryGetStringArrayProperty(device_info, kDeviceContainerPrimaryCategoryProperty, &categories)) {
+        AppendUniqueStrings(&entry->device_categories, categories);
+    }
+    if (TryGetStringArrayProperty(device_info, L"System.Devices.AepContainer.Categories", &categories)) {
+        AppendUniqueStrings(&entry->device_categories, categories);
+    }
+    if (TryGetStringArrayProperty(device_info, L"System.Devices.Aep.Category", &categories)) {
+        AppendUniqueStrings(&entry->device_categories, categories);
+    }
+    if (TryGetStringArrayProperty(device_info, L"System.Devices.Category", &categories)) {
+        AppendUniqueStrings(&entry->device_categories, categories);
+    }
+}
+
+void PopulateBluetoothVisualHintsFromEndpointCandidate(const EndpointCandidate& candidate, DeviceBatteryInfo* entry) {
+    if (entry == nullptr) {
+        return;
+    }
+    if (!entry->bluetooth_le_appearance.has_value() && candidate.bluetooth_le_appearance.has_value()) {
+        entry->bluetooth_le_appearance = candidate.bluetooth_le_appearance;
+    }
+    if (!entry->bluetooth_cod_major.has_value() && candidate.bluetooth_cod_major.has_value()) {
+        entry->bluetooth_cod_major = candidate.bluetooth_cod_major;
+    }
+    if (!entry->bluetooth_cod_minor.has_value() && candidate.bluetooth_cod_minor.has_value()) {
+        entry->bluetooth_cod_minor = candidate.bluetooth_cod_minor;
+    }
+    AppendUniqueStrings(&entry->device_categories, candidate.device_categories);
+}
+
+void PopulateBluetoothVisualHintsFromDeviceInfo(const DeviceInformation& device_info, EndpointCandidate* candidate) {
+    if (candidate == nullptr) {
+        return;
+    }
+
+    std::uint32_t value32 = 0;
+    if (TryGetUInt32Property(device_info, L"System.Devices.Aep.Bluetooth.Le.Appearance", &value32)) {
+        candidate->bluetooth_le_appearance = static_cast<std::uint16_t>(value32);
+    }
+    if (TryGetUInt32Property(device_info, L"System.Devices.Aep.Bluetooth.Cod.Major", &value32)) {
+        candidate->bluetooth_cod_major = value32;
+    }
+    if (TryGetUInt32Property(device_info, L"System.Devices.Aep.Bluetooth.Cod.Minor", &value32)) {
+        candidate->bluetooth_cod_minor = value32;
+    }
+
+    std::vector<std::string> categories;
+    if (TryGetStringArrayProperty(device_info, kDeviceContainerCategoryProperty, &categories)) {
+        AppendUniqueStrings(&candidate->device_categories, categories);
+    }
+    if (TryGetStringArrayProperty(device_info, kDeviceContainerPrimaryCategoryProperty, &categories)) {
+        AppendUniqueStrings(&candidate->device_categories, categories);
+    }
+    if (TryGetStringArrayProperty(device_info, L"System.Devices.AepContainer.Categories", &categories)) {
+        AppendUniqueStrings(&candidate->device_categories, categories);
+    }
+    if (TryGetStringArrayProperty(device_info, L"System.Devices.Aep.Category", &categories)) {
+        AppendUniqueStrings(&candidate->device_categories, categories);
+    }
+    if (TryGetStringArrayProperty(device_info, L"System.Devices.Category", &categories)) {
+        AppendUniqueStrings(&candidate->device_categories, categories);
+    }
+}
+
 std::optional<std::uint8_t> ParsePercentFromText(const std::string& text) {
     int current_number = -1;
     for (const char ch : text) {
@@ -1537,6 +1754,190 @@ std::vector<std::wstring> FindBthEnumServiceInstanceIdsByAddress(std::uint64_t a
     }
 
     return instance_ids;
+}
+
+std::vector<std::wstring> FindBthLeInstanceIdsByAddress(std::uint64_t address) {
+    std::wstringstream prefix_builder;
+    prefix_builder << L"BTHLE\\DEV_" << std::uppercase << std::hex
+                   << std::setw(12) << std::setfill(L'0') << address;
+    const std::wstring expected_prefix = prefix_builder.str();
+
+    std::wstringstream filter_builder;
+    filter_builder << expected_prefix << L"\\*";
+    const std::wstring filter = filter_builder.str();
+
+    ULONG size = 0;
+    const auto size_result =
+        CM_Get_Device_ID_List_SizeW(&size, filter.c_str(), CM_GETIDLIST_FILTER_NONE);
+    if (size_result != CR_SUCCESS || size <= 1U) {
+        return {};
+    }
+
+    std::vector<wchar_t> buffer(size);
+    const auto list_result =
+        CM_Get_Device_ID_ListW(filter.c_str(), buffer.data(), size, CM_GETIDLIST_FILTER_NONE);
+    if (list_result != CR_SUCCESS || buffer.empty() || buffer.front() == L'\0') {
+        return {};
+    }
+
+    std::vector<std::wstring> instance_ids;
+    std::size_t cursor = 0;
+    while (cursor < buffer.size() && buffer[cursor] != L'\0') {
+        const wchar_t* current = buffer.data() + static_cast<std::ptrdiff_t>(cursor);
+        const std::size_t length = std::wcslen(current);
+        if (length == 0U) {
+            break;
+        }
+        std::wstring instance_id(current, length);
+        std::wstring normalized = instance_id;
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                       [](wchar_t value) {
+                           return static_cast<wchar_t>(std::towupper(value));
+                       });
+        if (normalized.rfind(expected_prefix, 0) == 0) {
+            instance_ids.push_back(std::move(instance_id));
+        }
+        cursor += length + 1U;
+    }
+
+    return instance_ids;
+}
+
+std::optional<std::vector<std::uint8_t>> ReadDevNodePropertyRaw(DEVINST dev_inst,
+                                                                const DEVPROPKEY& property_key,
+                                                                DEVPROPTYPE* property_type) {
+    if (property_type == nullptr) {
+        return std::nullopt;
+    }
+
+    *property_type = DEVPROP_TYPE_EMPTY;
+    ULONG size = 0;
+    const auto query_result =
+        CM_Get_DevNode_PropertyW(dev_inst, &property_key, property_type, nullptr, &size, 0);
+    if (query_result != CR_SUCCESS && query_result != CR_BUFFER_SMALL) {
+        return std::nullopt;
+    }
+    if (size == 0U) {
+        return std::nullopt;
+    }
+
+    std::vector<std::uint8_t> raw_data(size);
+    const auto property_result = CM_Get_DevNode_PropertyW(
+        dev_inst, &property_key, property_type, reinterpret_cast<PBYTE>(raw_data.data()), &size, 0);
+    if (property_result != CR_SUCCESS) {
+        return std::nullopt;
+    }
+    raw_data.resize(size);
+    return raw_data;
+}
+
+std::optional<std::uint32_t> ReadDevNodeUInt32Property(DEVINST dev_inst, const DEVPROPKEY& property_key) {
+    DEVPROPTYPE property_type = DEVPROP_TYPE_EMPTY;
+    const auto raw_data = ReadDevNodePropertyRaw(dev_inst, property_key, &property_type);
+    if (!raw_data.has_value()) {
+        return std::nullopt;
+    }
+
+    if (property_type == DEVPROP_TYPE_UINT32 && raw_data->size() >= sizeof(std::uint32_t)) {
+        std::uint32_t value = 0;
+        std::memcpy(&value, raw_data->data(), sizeof(value));
+        return value;
+    }
+    if (property_type == DEVPROP_TYPE_INT32 && raw_data->size() >= sizeof(std::int32_t)) {
+        std::int32_t value = 0;
+        std::memcpy(&value, raw_data->data(), sizeof(value));
+        if (value >= 0) {
+            return static_cast<std::uint32_t>(value);
+        }
+    }
+    return std::nullopt;
+}
+
+std::vector<std::string> ReadDevNodeStringListProperty(DEVINST dev_inst, const DEVPROPKEY& property_key) {
+    DEVPROPTYPE property_type = DEVPROP_TYPE_EMPTY;
+    const auto raw_data = ReadDevNodePropertyRaw(dev_inst, property_key, &property_type);
+    if (!raw_data.has_value()) {
+        return {};
+    }
+
+    std::vector<std::string> values;
+    if ((property_type & DEVPROP_MASK_TYPE) == DEVPROP_TYPE_STRING && raw_data->size() >= sizeof(wchar_t)) {
+        const wchar_t* cursor = reinterpret_cast<const wchar_t*>(raw_data->data());
+        const wchar_t* end = reinterpret_cast<const wchar_t*>(raw_data->data() + raw_data->size());
+        while (cursor < end && *cursor != L'\0') {
+            const std::size_t length = std::wcslen(cursor);
+            if (length == 0U) {
+                break;
+            }
+            values.push_back(ToUtf8(std::wstring(cursor, length)));
+            cursor += length + 1U;
+        }
+    }
+    return values;
+}
+
+std::optional<PnpBluetoothVisualHints> ReadBluetoothVisualHintsFromPnpAddress(std::uint64_t address) {
+    if (address <= 0xFFFFULL) {
+        return std::nullopt;
+    }
+
+    const auto instance_ids = FindBthEnumInstanceIdsByAddress(address);
+    std::vector<std::wstring> ranked_instance_ids = instance_ids;
+    const auto bthle_instance_ids = FindBthLeInstanceIdsByAddress(address);
+    ranked_instance_ids.insert(ranked_instance_ids.end(), bthle_instance_ids.begin(), bthle_instance_ids.end());
+    if (ranked_instance_ids.empty()) {
+        return std::nullopt;
+    }
+
+    std::wstringstream prefix_builder;
+    prefix_builder << L"BTHENUM\\DEV_" << std::uppercase << std::hex
+                   << std::setw(12) << std::setfill(L'0') << address;
+    const std::wstring preferred_prefix = prefix_builder.str();
+    std::stable_sort(ranked_instance_ids.begin(), ranked_instance_ids.end(),
+                     [&preferred_prefix](const std::wstring& lhs, const std::wstring& rhs) {
+                         auto score = [&preferred_prefix](const std::wstring& value) {
+                             int rank = 0;
+                             if (value.rfind(preferred_prefix, 0) == 0) {
+                                 rank += 100;
+                             }
+                             if (value.rfind(L"BTHLE\\DEV_", 0) == 0) {
+                                 rank += 90;
+                             }
+                             if (value.find(L"\\DEV_") != std::wstring::npos) {
+                                 rank += 20;
+                             }
+                             if (value.find(L"{") != std::wstring::npos) {
+                                 rank -= 12;
+                             }
+                             return rank;
+                         };
+                         return score(lhs) > score(rhs);
+                     });
+
+    for (const auto& instance_id : ranked_instance_ids) {
+        DEVINST dev_inst = 0;
+        const auto locate_result =
+            CM_Locate_DevNodeW(&dev_inst, const_cast<wchar_t*>(instance_id.c_str()), CM_LOCATE_DEVNODE_NORMAL);
+        if (locate_result != CR_SUCCESS) {
+            continue;
+        }
+
+        PnpBluetoothVisualHints hints;
+        if (const auto class_of_device = ReadDevNodeUInt32Property(dev_inst, kBluetoothClassOfDevicePropKey);
+            class_of_device.has_value()) {
+            hints.bluetooth_cod_major = ((*class_of_device >> 8U) & 0x1FU);
+            hints.bluetooth_cod_minor = ((*class_of_device >> 2U) & 0x3FU);
+        }
+        AppendUniqueStrings(&hints.device_categories, ReadDevNodeStringListProperty(dev_inst, kDeviceContainerCategoryPropKey));
+        AppendUniqueStrings(
+            &hints.device_categories, ReadDevNodeStringListProperty(dev_inst, kDeviceContainerPrimaryCategoryPropKey));
+
+        if (hints.bluetooth_cod_major.has_value() || !hints.device_categories.empty()) {
+            return hints;
+        }
+    }
+
+    return std::nullopt;
 }
 
 std::optional<std::uint8_t> NormalizePhoneBatteryHintScalar(int raw_value) {
@@ -4904,6 +5305,18 @@ void AppendZmiVendorHintPropertyRequests(
     }
 }
 
+void AppendBluetoothVisualHintPropertyRequests(
+    const winrt::Windows::Foundation::Collections::IVector<winrt::hstring>& requested_properties) {
+    requested_properties.Append(L"System.Devices.Aep.Bluetooth.Le.Appearance");
+    requested_properties.Append(L"System.Devices.Aep.Bluetooth.Cod.Major");
+    requested_properties.Append(L"System.Devices.Aep.Bluetooth.Cod.Minor");
+    requested_properties.Append(kDeviceContainerCategoryProperty);
+    requested_properties.Append(kDeviceContainerPrimaryCategoryProperty);
+    requested_properties.Append(L"System.Devices.AepContainer.Categories");
+    requested_properties.Append(L"System.Devices.Aep.Category");
+    requested_properties.Append(L"System.Devices.Category");
+}
+
 std::optional<std::uint8_t> ReadBatteryPercentFromEndpointProperties(const DeviceInformation& endpoint_info) {
     constexpr std::array<const wchar_t*, 3> kBatteryProperties = {
         L"System.Devices.BatteryLife",
@@ -5643,6 +6056,7 @@ std::vector<DeviceBatteryInfo> ReadConnectedBluetoothDeviceBatteryFast(std::vect
     requested_properties.Append(L"System.Devices.BatteryLife");
     requested_properties.Append(L"System.Devices.BatteryPlusCharging");
     requested_properties.Append(L"System.Devices.BatteryPlusChargingText");
+    AppendBluetoothVisualHintPropertyRequests(requested_properties);
     AppendZmiVendorHintPropertyRequests(requested_properties);
 
     const auto query_started_at = std::chrono::steady_clock::now();
@@ -5700,6 +6114,7 @@ std::vector<DeviceBatteryInfo> ReadConnectedBluetoothDeviceBatteryFast(std::vect
             candidate.endpoint_id = device_id;
             candidate.endpoint_name = device_name.empty() ? "Unknown" : device_name;
             candidate.bluetooth_address = *address;
+            PopulateBluetoothVisualHintsFromDeviceInfo(device_info, &candidate);
             candidate.from_connected_scan = true;
             candidate.is_connected = true;
             tws_candidates->push_back(std::move(candidate));
@@ -5729,6 +6144,7 @@ std::vector<DeviceBatteryInfo> ReadConnectedBluetoothDeviceBatteryFast(std::vect
                 entry.device_name = device_name.empty() ? "Unknown" : device_name;
                 entry.battery_component = reading.component.empty() ? "main" : reading.component;
                 entry.battery_level_percent = reading.percent;
+                PopulateBluetoothVisualHintsFromDeviceInfo(device_info, &entry);
                 entry.is_connected = true;
                 entries.push_back(std::move(entry));
             }
@@ -5753,6 +6169,7 @@ std::vector<DeviceBatteryInfo> ReadConnectedBluetoothDeviceBatteryFast(std::vect
             entry.battery_component = "main";
         }
         entry.battery_level_percent = battery_percent;
+        PopulateBluetoothVisualHintsFromDeviceInfo(device_info, &entry);
         entry.is_connected = true;
         entries.push_back(std::move(entry));
     }
@@ -5800,6 +6217,7 @@ std::vector<DeviceBatteryInfo> ReadConnectedBluetoothDeviceBatteryFast(std::vect
                     candidate.endpoint_id = device_id;
                     candidate.endpoint_name = device_name.empty() ? "Unknown" : device_name;
                     candidate.bluetooth_address = *address;
+                    PopulateBluetoothVisualHintsFromDeviceInfo(device_info, &candidate);
                     candidate.from_connected_scan = false;
                     candidate.is_connected = is_connected;
                     tws_candidates->push_back(std::move(candidate));
@@ -5821,6 +6239,7 @@ std::vector<DeviceBatteryInfo> ReadConnectedBluetoothDeviceBatteryFast(std::vect
                         entry.device_name = device_name.empty() ? "Unknown" : device_name;
                         entry.battery_component = reading.component.empty() ? "main" : reading.component;
                         entry.battery_level_percent = reading.percent;
+                        PopulateBluetoothVisualHintsFromDeviceInfo(device_info, &entry);
                         entry.is_connected = is_connected;
                         entries.push_back(std::move(entry));
                     }
@@ -5836,6 +6255,7 @@ std::vector<DeviceBatteryInfo> ReadConnectedBluetoothDeviceBatteryFast(std::vect
                     entry.battery_component = "main";
                 }
                 entry.battery_level_percent = battery_percent;
+                PopulateBluetoothVisualHintsFromDeviceInfo(device_info, &entry);
                 entry.is_connected = is_connected;
                 entries.push_back(std::move(entry));
             }
@@ -5863,6 +6283,7 @@ std::vector<DeviceBatteryInfo> ReadAssociationEndpointBattery(std::vector<Endpoi
     requested_properties.Append(L"System.Devices.BatteryPlusCharging");
     requested_properties.Append(L"System.Devices.BatteryPlusChargingText");
     requested_properties.Append(L"System.ItemNameDisplay");
+    AppendBluetoothVisualHintPropertyRequests(requested_properties);
     AppendZmiVendorHintPropertyRequests(requested_properties);
 
     constexpr auto kEndpointSelector = LR"((System.Devices.Aep.IsPresent:=System.StructuredQueryType.Boolean#True)
@@ -5944,6 +6365,7 @@ OR (System.Devices.Aep.ProtocolId:="{BB7BB05E-5972-42B5-94FC-76EAA7084D49}")))";
                     candidate.endpoint_id = endpoint_id;
                     candidate.endpoint_name = endpoint_name;
                     candidate.bluetooth_address = *address;
+                    PopulateBluetoothVisualHintsFromDeviceInfo(endpoint_info, &candidate);
                     candidate.from_connected_scan = false;
                     candidate.is_connected = endpoint_is_connected;
                     tws_candidates->push_back(std::move(candidate));
@@ -5983,6 +6405,7 @@ OR (System.Devices.Aep.ProtocolId:="{BB7BB05E-5972-42B5-94FC-76EAA7084D49}")))";
                 entry.device_name = endpoint_name;
                 entry.battery_component = reading.component.empty() ? "main" : reading.component;
                 entry.battery_level_percent = reading.percent;
+                PopulateBluetoothVisualHintsFromDeviceInfo(endpoint_info, &entry);
                 entry.is_connected = endpoint_is_connected;
                 endpoint_entries.push_back(std::move(entry));
             }
@@ -6005,6 +6428,7 @@ OR (System.Devices.Aep.ProtocolId:="{BB7BB05E-5972-42B5-94FC-76EAA7084D49}")))";
             entry.battery_component = "main";
         }
         entry.battery_level_percent = *battery_percent;
+        PopulateBluetoothVisualHintsFromDeviceInfo(endpoint_info, &entry);
         entry.is_connected = endpoint_is_connected;
         endpoint_entries.push_back(std::move(entry));
         if (interesting) {
@@ -6024,6 +6448,7 @@ std::vector<DeviceBatteryInfo> ReadGenericDeviceBattery() {
     requested_properties.Append(L"System.Devices.BatteryPlusCharging");
     requested_properties.Append(L"System.Devices.BatteryPlusChargingText");
     requested_properties.Append(L"System.ItemNameDisplay");
+    AppendBluetoothVisualHintPropertyRequests(requested_properties);
     AppendZmiVendorHintPropertyRequests(requested_properties);
 
     constexpr auto kDeviceSelector = LR"(System.Devices.IsPresent:=System.StructuredQueryType.Boolean#True)";
@@ -6089,6 +6514,7 @@ std::vector<DeviceBatteryInfo> ReadGenericDeviceBattery() {
                 entry.device_name = name;
                 entry.battery_component = reading.component.empty() ? "main" : reading.component;
                 entry.battery_level_percent = reading.percent;
+                PopulateBluetoothVisualHintsFromDeviceInfo(device, &entry);
                 entry.is_connected = is_connected;
                 entries.push_back(std::move(entry));
             }
@@ -6111,6 +6537,7 @@ std::vector<DeviceBatteryInfo> ReadGenericDeviceBattery() {
             entry.battery_component = "main";
         }
         entry.battery_level_percent = *battery;
+        PopulateBluetoothVisualHintsFromDeviceInfo(device, &entry);
         entry.is_connected = is_connected;
         entries.push_back(std::move(entry));
         if (interesting) {
@@ -6204,8 +6631,12 @@ void AddCandidatesFromSelector(const winrt::hstring& selector, std::vector<Devic
     }
 
     try {
+        auto requested_properties = winrt::single_threaded_vector<winrt::hstring>();
+        requested_properties.Append(L"System.ItemNameDisplay");
+        requested_properties.Append(L"System.Devices.Aep.DeviceAddress");
+        AppendBluetoothVisualHintPropertyRequests(requested_properties);
         const auto maybe_device_infos =
-            WaitForAsyncResult(DeviceInformation::FindAllAsync(selector), std::chrono::milliseconds(1800));
+            WaitForAsyncResult(DeviceInformation::FindAllAsync(selector, requested_properties), std::chrono::milliseconds(1800));
         if (!maybe_device_infos.has_value() || !(*maybe_device_infos)) {
             DebugLog("Selector scan failed or timed out.");
             return;
@@ -6278,6 +6709,16 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
                 if (!existing.device_submode.has_value() && entry.device_submode.has_value()) {
                     existing.device_submode = entry.device_submode;
                 }
+                if (!existing.bluetooth_le_appearance.has_value() && entry.bluetooth_le_appearance.has_value()) {
+                    existing.bluetooth_le_appearance = entry.bluetooth_le_appearance;
+                }
+                if (!existing.bluetooth_cod_major.has_value() && entry.bluetooth_cod_major.has_value()) {
+                    existing.bluetooth_cod_major = entry.bluetooth_cod_major;
+                }
+                if (!existing.bluetooth_cod_minor.has_value() && entry.bluetooth_cod_minor.has_value()) {
+                    existing.bluetooth_cod_minor = entry.bluetooth_cod_minor;
+                }
+                AppendUniqueStrings(&existing.device_categories, entry.device_categories);
                 return;
             }
             if (entry.battery_level_percent.has_value() && !entry.is_cached) {
@@ -6727,6 +7168,7 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
                     unknown_entry.device_name = device_name;
                     unknown_entry.battery_component = "main";
                     unknown_entry.battery_level_percent = std::nullopt;
+                    PopulateBluetoothVisualHintsFromDeviceInfo(device_info, &unknown_entry);
                     unknown_entry.is_connected = ble_is_connected;
                     try_add_entry(std::move(unknown_entry));
                 }
@@ -6745,6 +7187,7 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
                 entry.device_name = device_name;
                 entry.battery_component = battery_reading.component;
                 entry.battery_level_percent = battery_reading.percent;
+                PopulateBluetoothVisualHintsFromDeviceInfo(device_info, &entry);
                 entry.is_cached = resolved_from_persistent_cache;
                 entry.is_connected = ble_is_connected;
                 try_add_entry(std::move(entry));
@@ -6803,6 +7246,7 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
                 offline_entry.device_name = candidate.endpoint_name.empty() ? "Unknown" : candidate.endpoint_name;
                 offline_entry.battery_component = "main";
                 offline_entry.battery_level_percent = std::nullopt;
+                PopulateBluetoothVisualHintsFromEndpointCandidate(candidate, &offline_entry);
                 offline_entry.is_connected = false;
                 try_add_entry(std::move(offline_entry));
                 continue;
@@ -6940,6 +7384,7 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
                 unknown_entry.device_name = candidate.endpoint_name.empty() ? "Unknown" : candidate.endpoint_name;
                 unknown_entry.battery_component = "main";
                 unknown_entry.battery_level_percent = std::nullopt;
+                PopulateBluetoothVisualHintsFromEndpointCandidate(candidate, &unknown_entry);
                 unknown_entry.is_connected = candidate.is_connected;
                 try_add_entry(std::move(unknown_entry));
                 continue;
@@ -7038,6 +7483,7 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
                 unknown_entry.device_name = candidate.endpoint_name.empty() ? "Unknown" : candidate.endpoint_name;
                 unknown_entry.battery_component = "main";
                 unknown_entry.battery_level_percent = std::nullopt;
+                PopulateBluetoothVisualHintsFromEndpointCandidate(candidate, &unknown_entry);
                 unknown_entry.is_connected = candidate_ble_connected;
                 try_add_entry(std::move(unknown_entry));
                 continue;
@@ -7066,6 +7512,7 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
                 entry.device_name = device_name;
                 entry.battery_component = battery_reading.component;
                 entry.battery_level_percent = battery_reading.percent;
+                PopulateBluetoothVisualHintsFromEndpointCandidate(candidate, &entry);
                 entry.is_cached = resolved_from_persistent_cache;
                 entry.is_connected = candidate_ble_connected;
                 try_add_entry(std::move(entry));
@@ -7100,6 +7547,7 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
             requested_properties.Append(L"System.ItemNameDisplay");
             requested_properties.Append(L"System.Devices.Aep.DeviceAddress");
             requested_properties.Append(L"System.Devices.Aep.IsConnected");
+            AppendBluetoothVisualHintPropertyRequests(requested_properties);
 
             std::unordered_set<std::string> processed_paired_ids;
             auto collect_paired = [&](const winrt::hstring& selector) {
@@ -7218,6 +7666,39 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
                 }
             }
         }
+    }
+
+    std::unordered_map<std::uint64_t, std::optional<PnpBluetoothVisualHints>> pnp_visual_hint_cache;
+    for (auto& entry : devices_with_battery) {
+        const bool needs_pnp_visual_hints =
+            !entry.bluetooth_cod_major.has_value() && !entry.bluetooth_cod_minor.has_value() &&
+            entry.device_categories.empty();
+        if (!needs_pnp_visual_hints) {
+            continue;
+        }
+
+        const auto parsed_address = ParseBluetoothAddressFromDeviceId(entry.device_id);
+        if (!parsed_address.has_value()) {
+            continue;
+        }
+
+        auto cache_it = pnp_visual_hint_cache.find(*parsed_address);
+        if (cache_it == pnp_visual_hint_cache.end()) {
+            cache_it = pnp_visual_hint_cache.emplace(
+                *parsed_address, ReadBluetoothVisualHintsFromPnpAddress(*parsed_address)).first;
+        }
+        if (!cache_it->second.has_value()) {
+            continue;
+        }
+
+        const auto& hints = *cache_it->second;
+        if (!entry.bluetooth_cod_major.has_value() && hints.bluetooth_cod_major.has_value()) {
+            entry.bluetooth_cod_major = hints.bluetooth_cod_major;
+        }
+        if (!entry.bluetooth_cod_minor.has_value() && hints.bluetooth_cod_minor.has_value()) {
+            entry.bluetooth_cod_minor = hints.bluetooth_cod_minor;
+        }
+        AppendUniqueStrings(&entry.device_categories, hints.device_categories);
     }
 
     std::vector<DeviceBatteryInfo> filtered_entries;

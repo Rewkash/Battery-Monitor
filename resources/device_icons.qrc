@@ -1,5 +1,6 @@
 <RCC>
     <qresource prefix="/icons">
+        <file alias="computer.svg">../assets/icons/computer.svg</file>
         <file alias="generic.svg">../assets/icons/generic.svg</file>
         <file alias="gamepad.svg">../assets/icons/gamepad.svg</file>
         <file alias="headphones.svg">../assets/icons/headphones.svg</file>

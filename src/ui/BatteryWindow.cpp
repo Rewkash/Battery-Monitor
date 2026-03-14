@@ -10,7 +10,6 @@
 #include <functional>
 #include <initializer_list>
 #include <optional>
-#include <regex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -84,6 +83,10 @@ struct DeviceEntry {
     std::string device_name;
     std::optional<std::string> device_mode;
     std::optional<std::string> device_submode;
+    std::optional<std::uint16_t> bluetooth_le_appearance;
+    std::optional<std::uint32_t> bluetooth_cod_major;
+    std::optional<std::uint32_t> bluetooth_cod_minor;
+    std::vector<std::string> device_categories;
     std::vector<ComponentEntry> components;
     bool is_connected = false;
 };
@@ -814,18 +817,15 @@ enum class DeviceVisualType {
     Mouse,
     Speaker,
     Watch,
+    Computer,
     Laptop,
     Generic,
 };
 
-bool ProbeContainsAny(const std::string& probe, std::initializer_list<const char*> needles) {
-    for (const char* needle : needles) {
-        if (probe.find(needle) != std::string::npos) {
-            return true;
-        }
-    }
-    return false;
-}
+struct DeviceVisualDecision {
+    DeviceVisualType type = DeviceVisualType::Generic;
+    QString reason;
+};
 
 bool HasAnyComponent(const DeviceEntry& device, std::initializer_list<const char*> component_names) {
     for (const auto& component : device.components) {
@@ -838,47 +838,246 @@ bool HasAnyComponent(const DeviceEntry& device, std::initializer_list<const char
     return false;
 }
 
-bool LooksLikeKeyboardModel(const std::string& probe) {
-    static const std::regex pattern(R"((^|[^a-z0-9])k[0-9]{2,3}(bt|pro|max)?([^a-z0-9]|$))");
-    return std::regex_search(probe, pattern);
+std::string JoinStrings(const std::vector<std::string>& values, const char* separator) {
+    std::ostringstream stream;
+    bool first = true;
+    for (const auto& value : values) {
+        if (value.empty()) {
+            continue;
+        }
+        if (!first) {
+            stream << separator;
+        }
+        stream << value;
+        first = false;
+    }
+    return stream.str();
+}
+
+bool CategoryContains(const std::vector<std::string>& categories, std::initializer_list<const char*> needles) {
+    for (const auto& category : categories) {
+        const std::string probe = ToLowerAscii(category);
+        for (const char* needle : needles) {
+            if (probe.find(needle) != std::string::npos) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+QString DeviceVisualTypeLabel(DeviceVisualType type) {
+    switch (type) {
+    case DeviceVisualType::Headphones:
+        return QString::fromUtf8(u8"Наушники");
+    case DeviceVisualType::Gamepad:
+        return QString::fromUtf8(u8"Геймпад");
+    case DeviceVisualType::Phone:
+        return QString::fromUtf8(u8"Телефон");
+    case DeviceVisualType::Keyboard:
+        return QString::fromUtf8(u8"Клавиатура");
+    case DeviceVisualType::Mouse:
+        return QString::fromUtf8(u8"Мышка");
+    case DeviceVisualType::Speaker:
+        return QString::fromUtf8(u8"Колонка");
+    case DeviceVisualType::Watch:
+        return QString::fromUtf8(u8"Часы");
+    case DeviceVisualType::Computer:
+        return QString::fromUtf8(u8"ПК");
+    case DeviceVisualType::Laptop:
+        return QString::fromUtf8(u8"Ноутбук");
+    case DeviceVisualType::Generic:
+    default:
+        return QString::fromUtf8(u8"Bluetooth");
+    }
+}
+
+std::optional<DeviceVisualDecision> DetectDeviceVisualTypeFromBluetoothHints(const DeviceEntry& device) {
+    if (!device.device_categories.empty()) {
+        const QString category_text = ToQString(JoinStrings(device.device_categories, ", "));
+        if (CategoryContains(device.device_categories, {"input.keyboard", "keyboard"})) {
+            return DeviceVisualDecision{
+                DeviceVisualType::Keyboard,
+                QString::fromUtf8(u8"Категория Windows: %1").arg(category_text)};
+        }
+        if (CategoryContains(device.device_categories, {"input.mouse", "mouse", "pointing"})) {
+            return DeviceVisualDecision{
+                DeviceVisualType::Mouse,
+                QString::fromUtf8(u8"Категория Windows: %1").arg(category_text)};
+        }
+        if (CategoryContains(device.device_categories, {"game.controller", "gamepad", "controller", "joystick"})) {
+            return DeviceVisualDecision{
+                DeviceVisualType::Gamepad,
+                QString::fromUtf8(u8"Категория Windows: %1").arg(category_text)};
+        }
+        if (CategoryContains(device.device_categories, {"audio.head", "headphone", "headset", "earbud"})) {
+            return DeviceVisualDecision{
+                DeviceVisualType::Headphones,
+                QString::fromUtf8(u8"Категория Windows: %1").arg(category_text)};
+        }
+        if (CategoryContains(device.device_categories, {"audio.speaker", "speaker"})) {
+            return DeviceVisualDecision{
+                DeviceVisualType::Speaker,
+                QString::fromUtf8(u8"Категория Windows: %1").arg(category_text)};
+        }
+        if (CategoryContains(device.device_categories, {"phone", "mobile"})) {
+            return DeviceVisualDecision{
+                DeviceVisualType::Phone,
+                QString::fromUtf8(u8"Категория Windows: %1").arg(category_text)};
+        }
+        if (CategoryContains(device.device_categories, {"watch", "wearable", "band"})) {
+            return DeviceVisualDecision{
+                DeviceVisualType::Watch,
+                QString::fromUtf8(u8"Категория Windows: %1").arg(category_text)};
+        }
+        if (CategoryContains(device.device_categories, {"computer", "pc", "desktop", "workstation"})) {
+            return DeviceVisualDecision{
+                DeviceVisualType::Computer,
+                QString::fromUtf8(u8"Категория Windows: %1").arg(category_text)};
+        }
+        if (CategoryContains(device.device_categories, {"laptop", "notebook"})) {
+            return DeviceVisualDecision{
+                DeviceVisualType::Laptop,
+                QString::fromUtf8(u8"Категория Windows: %1").arg(category_text)};
+        }
+    }
+
+    if (device.bluetooth_le_appearance.has_value()) {
+        switch (*device.bluetooth_le_appearance) {
+        case 64:
+            return DeviceVisualDecision{
+                DeviceVisualType::Phone,
+                QString::fromUtf8(u8"Bluetooth LE Appearance = 64 (Phone)")};
+        case 128:
+        case 129:
+        case 130:
+        case 132:
+        case 133:
+        case 134:
+        case 135:
+            return DeviceVisualDecision{
+                DeviceVisualType::Computer,
+                QString::fromUtf8(u8"Bluetooth LE Appearance = %1 (Computer)").arg(*device.bluetooth_le_appearance)};
+        case 131:
+            return DeviceVisualDecision{
+                DeviceVisualType::Laptop,
+                QString::fromUtf8(u8"Bluetooth LE Appearance = 131 (Laptop)")};
+        case 192:
+        case 193:
+            return DeviceVisualDecision{
+                DeviceVisualType::Watch,
+                QString::fromUtf8(u8"Bluetooth LE Appearance = %1 (Watch)").arg(*device.bluetooth_le_appearance)};
+        case 961:
+            return DeviceVisualDecision{
+                DeviceVisualType::Keyboard,
+                QString::fromUtf8(u8"Bluetooth LE Appearance = 961 (Keyboard)")};
+        case 962:
+            return DeviceVisualDecision{
+                DeviceVisualType::Mouse,
+                QString::fromUtf8(u8"Bluetooth LE Appearance = 962 (Mouse)")};
+        case 963:
+        case 964:
+            return DeviceVisualDecision{
+                DeviceVisualType::Gamepad,
+                QString::fromUtf8(u8"Bluetooth LE Appearance = %1 (Gamepad)").arg(*device.bluetooth_le_appearance)};
+        default:
+            break;
+        }
+    }
+
+    if (!device.bluetooth_cod_major.has_value()) {
+        return std::nullopt;
+    }
+
+    const std::uint32_t major = *device.bluetooth_cod_major;
+    const std::uint32_t minor = device.bluetooth_cod_minor.value_or(0);
+    switch (major) {
+    case 1:
+        if (minor == 3U) {
+            return DeviceVisualDecision{
+                DeviceVisualType::Laptop,
+                QString::fromUtf8(u8"Bluetooth Class of Device major = 1 (Computer), minor = 3 (Laptop)")};
+        }
+        return DeviceVisualDecision{
+            DeviceVisualType::Computer,
+            QString::fromUtf8(u8"Bluetooth Class of Device major = 1 (Computer), minor = %1").arg(minor)};
+    case 2:
+        return DeviceVisualDecision{
+            DeviceVisualType::Phone,
+            QString::fromUtf8(u8"Bluetooth Class of Device major = 2 (Phone), minor = %1").arg(minor)};
+    case 4:
+        if (HasAnyComponent(device, {"left", "right", "case"})) {
+            return DeviceVisualDecision{
+                DeviceVisualType::Headphones,
+                QString::fromUtf8(u8"Bluetooth Class of Device major = 4 (Audio/Video), а батарея разбита на left/right/case")};
+        }
+        return DeviceVisualDecision{
+            DeviceVisualType::Speaker,
+            QString::fromUtf8(u8"Bluetooth Class of Device major = 4 (Audio/Video), minor = %1").arg(minor)};
+    case 5:
+        if ((minor & 0x80U) != 0U) {
+            return DeviceVisualDecision{
+                DeviceVisualType::Mouse,
+                QString::fromUtf8(u8"Bluetooth Class of Device major = 5 (Peripheral), minor = 0x%1 с флагом pointing device")
+                    .arg(minor, 0, 16)};
+        }
+        if ((minor & 0x40U) != 0U) {
+            return DeviceVisualDecision{
+                DeviceVisualType::Keyboard,
+                QString::fromUtf8(u8"Bluetooth Class of Device major = 5 (Peripheral), minor = 0x%1 с флагом keyboard")
+                    .arg(minor, 0, 16)};
+        }
+        if ((minor & 0x0FU) >= 0x01U && (minor & 0x0FU) <= 0x05U) {
+            return DeviceVisualDecision{
+                DeviceVisualType::Gamepad,
+                QString::fromUtf8(u8"Bluetooth Class of Device major = 5 (Peripheral), minor = 0x%1 похож на game controller")
+                    .arg(minor, 0, 16)};
+        }
+        break;
+    case 7:
+        return DeviceVisualDecision{
+            DeviceVisualType::Watch,
+            QString::fromUtf8(u8"Bluetooth Class of Device major = 7 (Wearable), minor = %1").arg(minor)};
+    case 8:
+        return DeviceVisualDecision{
+            DeviceVisualType::Gamepad,
+            QString::fromUtf8(u8"Bluetooth Class of Device major = 8 (Toy/Game), minor = %1").arg(minor)};
+    default:
+        break;
+    }
+
+    return std::nullopt;
+}
+
+DeviceVisualDecision DetectDeviceVisualDecision(const DeviceEntry& device) {
+    if (const auto hinted_type = DetectDeviceVisualTypeFromBluetoothHints(device); hinted_type.has_value()) {
+        return *hinted_type;
+    }
+
+    if (HasAnyComponent(device, {"left", "right", "case"})) {
+        return {DeviceVisualType::Headphones,
+                QString::fromUtf8(u8"По компонентам батареи устройство похоже на TWS/наушники")};
+    }
+
+    if (!device.device_categories.empty()) {
+        return {
+            DeviceVisualType::Generic,
+            QString::fromUtf8(u8"Категории Windows: %1, но тип по ним не распознан")
+                .arg(ToQString(JoinStrings(device.device_categories, ", ")))};
+    }
+
+    return {DeviceVisualType::Generic,
+            QString::fromUtf8(u8"Bluetooth-подсказок не найдено, использован общий значок")};
 }
 
 DeviceVisualType DetectDeviceVisualType(const DeviceEntry& device) {
-    const std::string probe = ToLowerAscii(device.device_name + " " + device.device_id);
+    return DetectDeviceVisualDecision(device).type;
+}
 
-    if (HasAnyComponent(device, {"left", "right", "case"}) ||
-        ProbeContainsAny(
-            probe,
-            {"bud", "buds", "airpod", "airdots", "ear", "head", "headset", "headphone", "earphone", "tws", "pods",
-             "freebuds", "purpods"})) {
-        return DeviceVisualType::Headphones;
-    }
-    if (ProbeContainsAny(probe, {"keyboard", "klav", "keychron", "mx keys", "mechanical", "key board"}) ||
-        LooksLikeKeyboardModel(probe)) {
-        return DeviceVisualType::Keyboard;
-    }
-    if (ProbeContainsAny(probe, {"mouse", "mice", "mx master", "logi m", "logitech m", "delux"})) {
-        return DeviceVisualType::Mouse;
-    }
-    if (ProbeContainsAny(
-            probe,
-            {"xbox", "controller", "gamepad", "dualsense", "dualshock", "joy-con", "joycon", "8bitdo", "switch pro"})) {
-        return DeviceVisualType::Gamepad;
-    }
-    if (ProbeContainsAny(probe, {"phone", "iphone", "pixel", "galaxy", "poco", "smartphone", "android"})) {
-        return DeviceVisualType::Phone;
-    }
-    if (ProbeContainsAny(probe, {"speaker", "soundbar", "homepod", "boombox", "boom", "flip", "charge"})) {
-        return DeviceVisualType::Speaker;
-    }
-    if (ProbeContainsAny(probe, {"watch", "band", "fitbit", "amazfit"})) {
-        return DeviceVisualType::Watch;
-    }
-    if (ProbeContainsAny(probe, {"laptop", "notebook", "macbook", "surface", "thinkpad"})) {
-        return DeviceVisualType::Laptop;
-    }
-
-    return DeviceVisualType::Generic;
+QString BuildDeviceVisualTooltip(const DeviceEntry& device) {
+    const DeviceVisualDecision decision = DetectDeviceVisualDecision(device);
+    return QString::fromUtf8(u8"Иконка: %1\nПричина: %2")
+        .arg(DeviceVisualTypeLabel(decision.type), decision.reason);
 }
 
 QColor DeviceTypeAccentColor(DeviceVisualType type) {
@@ -897,6 +1096,8 @@ QColor DeviceTypeAccentColor(DeviceVisualType type) {
         return QColor(QStringLiteral("#F28F8F"));
     case DeviceVisualType::Watch:
         return QColor(QStringLiteral("#9BCB7A"));
+    case DeviceVisualType::Computer:
+        return QColor(QStringLiteral("#8EB6FF"));
     case DeviceVisualType::Laptop:
         return QColor(QStringLiteral("#A3C6FF"));
     case DeviceVisualType::Generic:
@@ -921,6 +1122,8 @@ QString DeviceTypeIconPath(DeviceVisualType type) {
         return QStringLiteral(":/icons/speaker.svg");
     case DeviceVisualType::Watch:
         return QStringLiteral(":/icons/watch.svg");
+    case DeviceVisualType::Computer:
+        return QStringLiteral(":/icons/computer.svg");
     case DeviceVisualType::Laptop:
         return QStringLiteral(":/icons/laptop.svg");
     case DeviceVisualType::Generic:
@@ -1109,6 +1312,10 @@ std::vector<DeviceEntry> GroupDevices(const std::vector<DeviceBatteryInfo>& devi
             device.device_name = device_name;
             device.device_mode = item.device_mode;
             device.device_submode = item.device_submode;
+            device.bluetooth_le_appearance = item.bluetooth_le_appearance;
+            device.bluetooth_cod_major = item.bluetooth_cod_major;
+            device.bluetooth_cod_minor = item.bluetooth_cod_minor;
+            device.device_categories = item.device_categories;
             device.is_connected = item.is_connected;
             grouped.push_back(std::move(device));
         } else {
@@ -1121,6 +1328,21 @@ std::vector<DeviceEntry> GroupDevices(const std::vector<DeviceBatteryInfo>& devi
             }
             if (!grouped[index].device_submode.has_value() && item.device_submode.has_value()) {
                 grouped[index].device_submode = item.device_submode;
+            }
+            if (!grouped[index].bluetooth_le_appearance.has_value() && item.bluetooth_le_appearance.has_value()) {
+                grouped[index].bluetooth_le_appearance = item.bluetooth_le_appearance;
+            }
+            if (!grouped[index].bluetooth_cod_major.has_value() && item.bluetooth_cod_major.has_value()) {
+                grouped[index].bluetooth_cod_major = item.bluetooth_cod_major;
+            }
+            if (!grouped[index].bluetooth_cod_minor.has_value() && item.bluetooth_cod_minor.has_value()) {
+                grouped[index].bluetooth_cod_minor = item.bluetooth_cod_minor;
+            }
+            for (const auto& category : item.device_categories) {
+                const auto it = std::find(grouped[index].device_categories.begin(), grouped[index].device_categories.end(), category);
+                if (it == grouped[index].device_categories.end()) {
+                    grouped[index].device_categories.push_back(category);
+                }
             }
             grouped[index].is_connected = grouped[index].is_connected || item.is_connected;
         }
@@ -3037,6 +3259,7 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
         icon_label->setAlignment(Qt::AlignCenter);
         icon_label->setFixedSize(34, 34);
         icon_label->setPixmap(BuildDeviceTypePixmap(DetectDeviceVisualType(device), QSize(34, 34)));
+        icon_label->setToolTip(BuildDeviceVisualTooltip(device));
 
         auto* center_widget = new QWidget(row);
         auto* center_layout = new QVBoxLayout(center_widget);
