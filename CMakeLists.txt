@@ -5,16 +5,17 @@ project(BatteryMonitor VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_AUTORCC ON)
 option(BATTERY_MONITOR_ENABLE_QT "Enable Qt6 test GUI" ON)
 
 set(BATTERY_MONITOR_QT_ENABLED OFF)
 if(BATTERY_MONITOR_ENABLE_QT)
-    find_package(Qt6 COMPONENTS Widgets QUIET)
-    if(Qt6Widgets_FOUND)
+    find_package(Qt6 COMPONENTS Widgets Svg QUIET)
+    if(Qt6Widgets_FOUND AND Qt6Svg_FOUND)
         set(BATTERY_MONITOR_QT_ENABLED ON)
-        message(STATUS "Qt6 Widgets found. GUI mode enabled.")
+        message(STATUS "Qt6 Widgets and Svg found. GUI mode enabled.")
     else()
-        message(WARNING "Qt6 Widgets not found. Building CLI-only binary.")
+        message(WARNING "Qt6 Widgets/Svg not found. Building CLI-only binary.")
     endif()
 endif()
 
@@ -120,6 +121,7 @@ if(BATTERY_MONITOR_QT_ENABLED)
             src/ui/BatteryStatsDialog.h
             src/ui/BatteryWindow.cpp
             src/ui/BatteryWindow.h
+            resources/device_icons.qrc
     )
 
     target_compile_definitions(
@@ -132,6 +134,7 @@ if(BATTERY_MONITOR_QT_ENABLED)
         battery-monitor-app
         PUBLIC
             Qt6::Widgets
+            Qt6::Svg
     )
 
 endif()

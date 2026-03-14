@@ -8,7 +8,9 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <initializer_list>
 #include <optional>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -43,10 +45,12 @@
 #include <QProgressBar>
 #include <QPixmap>
 #include <QPushButton>
+#include <QResource>
 #include <QScrollArea>
 #include <QScreen>
 #include <QSettings>
 #include <QSizePolicy>
+#include <QSvgRenderer>
 #include <QSpinBox>
 #include <QStyle>
 #include <QSystemTrayIcon>
@@ -62,6 +66,11 @@
 namespace battery_monitor {
 
 namespace {
+
+const bool kDeviceIconsResourceInitialized = []() {
+    Q_INIT_RESOURCE(device_icons);
+    return true;
+}();
 
 struct ComponentEntry {
     std::string component;
@@ -797,29 +806,169 @@ QString ProgressLevelState(const PrimaryBattery& primary) {
     return QStringLiteral("ok");
 }
 
-QString DeviceTypeCode(const DeviceEntry& device) {
+enum class DeviceVisualType {
+    Headphones,
+    Gamepad,
+    Phone,
+    Keyboard,
+    Mouse,
+    Speaker,
+    Watch,
+    Laptop,
+    Generic,
+};
+
+bool ProbeContainsAny(const std::string& probe, std::initializer_list<const char*> needles) {
+    for (const char* needle : needles) {
+        if (probe.find(needle) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool HasAnyComponent(const DeviceEntry& device, std::initializer_list<const char*> component_names) {
+    for (const auto& component : device.components) {
+        for (const char* name : component_names) {
+            if (component.component == name) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool LooksLikeKeyboardModel(const std::string& probe) {
+    static const std::regex pattern(R"((^|[^a-z0-9])k[0-9]{2,3}(bt|pro|max)?([^a-z0-9]|$))");
+    return std::regex_search(probe, pattern);
+}
+
+DeviceVisualType DetectDeviceVisualType(const DeviceEntry& device) {
     const std::string probe = ToLowerAscii(device.device_name + " " + device.device_id);
 
-    if (probe.find("bud") != std::string::npos || probe.find("airpod") != std::string::npos ||
-        probe.find("ear") != std::string::npos || probe.find("head") != std::string::npos) {
-        return QStringLiteral("HP");
+    if (HasAnyComponent(device, {"left", "right", "case"}) ||
+        ProbeContainsAny(
+            probe,
+            {"bud", "buds", "airpod", "airdots", "ear", "head", "headset", "headphone", "earphone", "tws", "pods",
+             "freebuds", "purpods"})) {
+        return DeviceVisualType::Headphones;
     }
-    if (probe.find("keyboard") != std::string::npos || probe.find("klav") != std::string::npos) {
-        return QStringLiteral("KB");
+    if (ProbeContainsAny(probe, {"keyboard", "klav", "keychron", "mx keys", "mechanical", "key board"}) ||
+        LooksLikeKeyboardModel(probe)) {
+        return DeviceVisualType::Keyboard;
     }
-    if (probe.find("mouse") != std::string::npos || probe.find("mice") != std::string::npos) {
-        return QStringLiteral("MS");
+    if (ProbeContainsAny(probe, {"mouse", "mice", "mx master", "logi m", "logitech m", "delux"})) {
+        return DeviceVisualType::Mouse;
     }
-    if (probe.find("xbox") != std::string::npos || probe.find("controller") != std::string::npos ||
-        probe.find("gamepad") != std::string::npos) {
-        return QStringLiteral("PAD");
+    if (ProbeContainsAny(
+            probe,
+            {"xbox", "controller", "gamepad", "dualsense", "dualshock", "joy-con", "joycon", "8bitdo", "switch pro"})) {
+        return DeviceVisualType::Gamepad;
     }
-    if (probe.find("phone") != std::string::npos || probe.find("poco") != std::string::npos ||
-        probe.find("redmi") != std::string::npos) {
-        return QStringLiteral("PH");
+    if (ProbeContainsAny(probe, {"phone", "iphone", "pixel", "galaxy", "poco", "smartphone", "android"})) {
+        return DeviceVisualType::Phone;
+    }
+    if (ProbeContainsAny(probe, {"speaker", "soundbar", "homepod", "boombox", "boom", "flip", "charge"})) {
+        return DeviceVisualType::Speaker;
+    }
+    if (ProbeContainsAny(probe, {"watch", "band", "fitbit", "amazfit"})) {
+        return DeviceVisualType::Watch;
+    }
+    if (ProbeContainsAny(probe, {"laptop", "notebook", "macbook", "surface", "thinkpad"})) {
+        return DeviceVisualType::Laptop;
     }
 
-    return QStringLiteral("BT");
+    return DeviceVisualType::Generic;
+}
+
+QColor DeviceTypeAccentColor(DeviceVisualType type) {
+    switch (type) {
+    case DeviceVisualType::Headphones:
+        return QColor(QStringLiteral("#63B9FF"));
+    case DeviceVisualType::Gamepad:
+        return QColor(QStringLiteral("#67DF93"));
+    case DeviceVisualType::Phone:
+        return QColor(QStringLiteral("#59D5C6"));
+    case DeviceVisualType::Keyboard:
+        return QColor(QStringLiteral("#F1C86A"));
+    case DeviceVisualType::Mouse:
+        return QColor(QStringLiteral("#FFB56A"));
+    case DeviceVisualType::Speaker:
+        return QColor(QStringLiteral("#F28F8F"));
+    case DeviceVisualType::Watch:
+        return QColor(QStringLiteral("#9BCB7A"));
+    case DeviceVisualType::Laptop:
+        return QColor(QStringLiteral("#A3C6FF"));
+    case DeviceVisualType::Generic:
+    default:
+        return QColor(QStringLiteral("#DDE5EF"));
+    }
+}
+
+QString DeviceTypeIconPath(DeviceVisualType type) {
+    switch (type) {
+    case DeviceVisualType::Headphones:
+        return QStringLiteral(":/icons/headphones.svg");
+    case DeviceVisualType::Gamepad:
+        return QStringLiteral(":/icons/gamepad.svg");
+    case DeviceVisualType::Phone:
+        return QStringLiteral(":/icons/phone.svg");
+    case DeviceVisualType::Keyboard:
+        return QStringLiteral(":/icons/keyboard.svg");
+    case DeviceVisualType::Mouse:
+        return QStringLiteral(":/icons/mouse.svg");
+    case DeviceVisualType::Speaker:
+        return QStringLiteral(":/icons/speaker.svg");
+    case DeviceVisualType::Watch:
+        return QStringLiteral(":/icons/watch.svg");
+    case DeviceVisualType::Laptop:
+        return QStringLiteral(":/icons/laptop.svg");
+    case DeviceVisualType::Generic:
+    default:
+        return QStringLiteral(":/icons/generic.svg");
+    }
+}
+
+QPixmap BuildDeviceTypePixmap(DeviceVisualType type, const QSize& logical_size) {
+    const qreal dpr = qApp != nullptr ? qApp->devicePixelRatio() : 1.0;
+    const QSize pixel_size(
+        std::max(1, qRound(static_cast<qreal>(logical_size.width()) * dpr)),
+        std::max(1, qRound(static_cast<qreal>(logical_size.height()) * dpr)));
+
+    QPixmap pixmap(pixel_size);
+    pixmap.fill(Qt::transparent);
+    pixmap.setDevicePixelRatio(dpr);
+
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+
+    const QRectF badge_rect(0.5, 0.5, logical_size.width() - 1.0, logical_size.height() - 1.0);
+    const QColor accent = DeviceTypeAccentColor(type);
+    const QColor badge_fill(QStringLiteral("#2B2F36"));
+
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(badge_fill);
+    painter.drawRoundedRect(badge_rect, 11.0, 11.0);
+
+    QPen border_pen(accent);
+    border_pen.setWidthF(1.0);
+    painter.setPen(border_pen);
+    painter.setBrush(Qt::NoBrush);
+    painter.drawRoundedRect(badge_rect.adjusted(0.25, 0.25, -0.25, -0.25), 11.0, 11.0);
+
+    const QRectF content_rect = badge_rect.adjusted(
+        logical_size.width() * 0.18,
+        logical_size.height() * 0.18,
+        -logical_size.width() * 0.18,
+        -logical_size.height() * 0.18);
+    const QString icon_path = DeviceTypeIconPath(type);
+    QSvgRenderer renderer(icon_path);
+    if (renderer.isValid()) {
+        renderer.render(&painter, content_rect);
+    }
+
+    return pixmap;
 }
 
 QString RelativeTimeText(const QDateTime& from_time, const QDateTime& to_time) {
@@ -1556,12 +1705,8 @@ QFrame#deviceRow[dragOver="true"] {
     border-color: rgba(116, 190, 255, 0.85);
 }
 QLabel#deviceIcon {
-    background: #2B2F36;
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 11px;
-    color: #E8ECF3;
-    font-size: 11px;
-    font-weight: 700;
+    background: transparent;
+    border: none;
 }
 QLabel#deviceName {
     color: #F7FAFD;
@@ -2887,10 +3032,11 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
         row_layout->setContentsMargins(12, 10, 10, 10);
         row_layout->setSpacing(12);
 
-        auto* icon_label = new QLabel(DeviceTypeCode(device), row);
+        auto* icon_label = new QLabel(row);
         icon_label->setObjectName(QStringLiteral("deviceIcon"));
         icon_label->setAlignment(Qt::AlignCenter);
         icon_label->setFixedSize(34, 34);
+        icon_label->setPixmap(BuildDeviceTypePixmap(DetectDeviceVisualType(device), QSize(34, 34)));
 
         auto* center_widget = new QWidget(row);
         auto* center_layout = new QVBoxLayout(center_widget);

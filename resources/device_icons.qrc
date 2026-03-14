@@ -1,0 +1,13 @@
+<RCC>
+    <qresource prefix="/icons">
+        <file alias="generic.svg">../assets/icons/generic.svg</file>
+        <file alias="gamepad.svg">../assets/icons/gamepad.svg</file>
+        <file alias="headphones.svg">../assets/icons/headphones.svg</file>
+        <file alias="keyboard.svg">../assets/icons/keyboard.svg</file>
+        <file alias="laptop.svg">../assets/icons/laptop.svg</file>
+        <file alias="mouse.svg">../assets/icons/mouse.svg</file>
+        <file alias="phone.svg">../assets/icons/phone.svg</file>
+        <file alias="speaker.svg">../assets/icons/speaker.svg</file>
+        <file alias="watch.svg">../assets/icons/watch.svg</file>
+    </qresource>
+</RCC>
