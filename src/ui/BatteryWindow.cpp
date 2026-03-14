@@ -1034,7 +1034,7 @@ void SyncOrderQueue(const std::vector<DeviceEntry>& grouped, bool connected_queu
 
     std::unordered_set<std::string> present_ids;
     for (const auto& device : grouped) {
-        if (device.is_connected == connected_queue) {
+        if (connected_queue || device.is_connected == connected_queue) {
             present_ids.insert(device.device_id);
         }
     }
@@ -1047,7 +1047,7 @@ void SyncOrderQueue(const std::vector<DeviceEntry>& grouped, bool connected_queu
 
     std::unordered_set<std::string> ordered_ids(order->begin(), order->end());
     for (const auto& device : grouped) {
-        if (device.is_connected == connected_queue && !ordered_ids.contains(device.device_id)) {
+        if ((connected_queue || device.is_connected == connected_queue) && !ordered_ids.contains(device.device_id)) {
             order->push_back(device.device_id);
             ordered_ids.insert(device.device_id);
         }
@@ -1085,6 +1085,7 @@ std::vector<DeviceEntry> ApplyCustomOrder(const std::vector<DeviceEntry>& groupe
     };
 
     append_queue(connected_order, true);
+    append_queue(connected_order, false);
     append_queue(disconnected_order, false);
 
     for (const auto& device : grouped) {
