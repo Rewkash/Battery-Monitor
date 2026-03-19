@@ -1,4 +1,4 @@
-#include "platform/windows/WinRtBatteryProvider.h"
+﻿#include "platform/windows/WinRtBatteryProvider.h"
 
 #include <algorithm>
 #include <exception>
@@ -9,17 +9,14 @@
 #include <winrt/base.h>
 
 #include "core/NoiseControlVocabulary.h"
-#include "platform/windows/BleCandidateEnumeration.h"
-#include "platform/windows/BleGattDump.h"
-#include "platform/windows/RfcommServiceDump.h"
-#include "platform/windows/WindowsBatteryAggregation.h"
-#include "platform/windows/WindowsBatteryProviderSupport.h"
-#include "platform/windows/WindowsBatteryQueryReaders.h"
-#include "platform/windows/WindowsBleCandidateBatteryCollector.h"
-#include "platform/windows/WindowsBluetoothAddressUtils.h"
-#include "platform/windows/WindowsTwsCandidateBatteryCollector.h"
-#include "platform/windows/XiaomiBatteryCaches.h"
-#include "platform/windows/XiaomiControlActions.h"
+#include "platform/windows/shared/WindowsBatteryAggregation.h"
+#include "platform/windows/shared/WindowsBatteryProviderSupport.h"
+#include "platform/windows/shared/WindowsBatteryQueryReaders.h"
+#include "platform/windows/shared/WindowsBleCandidateBatteryCollector.h"
+#include "platform/windows/shared/WindowsBluetoothAddressUtils.h"
+#include "platform/windows/shared/WindowsTwsCandidateBatteryCollector.h"
+#include "platform/windows/devices/xiaomi/XiaomiBatteryCaches.h"
+#include "platform/windows/devices/xiaomi/XiaomiControlActions.h"
 
 namespace battery_monitor {
 
@@ -39,29 +36,20 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
             runtime_options.persistent_xiaomi_cache_read_enabled,
             runtime_options.xiaomi_cache_file_path,
             runtime_options.xiaomi_cache_ttl_minutes,
-            runtime_options.zmi_observe_ms,
-            runtime_options.debug_enabled,
-            &WindowsBatteryProviderDebugLog);
-        XiaomiAdvertisementBatteryCache xiaomi_advertisement_cache(
-            runtime_options.xiaomi_advertisement_scan_ms,
-            runtime_options.zmi_observe_ms,
-            &TryOpenBleDeviceByAddress,
             runtime_options.debug_enabled,
             &WindowsBatteryProviderDebugLog);
 
         CollectBleCandidateBatteryEntries(
             MakeWindowsBleCandidateBatteryCollectorContext(),
             &device_accumulator,
-            &xiaomi_classic_cache,
-            &xiaomi_advertisement_cache);
+            &xiaomi_classic_cache);
 
         try {
             CollectTwsCandidateBatteryEntries(
                 MakeWindowsTwsCandidateBatteryCollectorContext(options.include_disconnected),
                 query_reader_context,
                 &device_accumulator,
-                &xiaomi_classic_cache,
-                &xiaomi_advertisement_cache);
+                &xiaomi_classic_cache);
         } catch (const winrt::hresult_error&) {
             // Endpoint properties and endpoint BLE mapping are optional.
         }
@@ -134,65 +122,6 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
         WindowsBatteryProviderDebugLog("GetConnectedDevicesBattery failed with unknown exception.");
         return {};
     }
-}
-
-bool WinRtBatteryProvider::ProbeXiaomiNoiseControl(const std::string& device_hint) {
-    EnsureWindowsBatteryProviderApartmentInitialized();
-
-    const auto target = ResolveConnectedXiaomiControlTarget(this, device_hint);
-    if (!target.has_value()) {
-        std::cout << "No connected Xiaomi/Redmi earbuds candidates were found.\n";
-        return false;
-    }
-
-    return ProbeXiaomiNoiseControlForTarget(*target, MakeWindowsXiaomiControlActionContext());
-}
-
-bool WinRtBatteryProvider::ObserveXiaomiControlSession(const std::string& device_hint, int duration_seconds) {
-    EnsureWindowsBatteryProviderApartmentInitialized();
-
-    const auto target = ResolveConnectedXiaomiControlTarget(this, device_hint);
-    if (!target.has_value()) {
-        std::cout << "No connected Xiaomi/Redmi earbuds candidates were found.\n";
-        return false;
-    }
-
-    return ObserveXiaomiControlSessionForTarget(
-        *target,
-        duration_seconds,
-        MakeWindowsXiaomiControlActionContext());
-}
-
-bool WinRtBatteryProvider::ObserveZmiSerialSession(const std::string& device_hint, int duration_seconds) {
-    EnsureWindowsBatteryProviderApartmentInitialized();
-
-    const auto target = ResolveConnectedZmiControlTarget(this, device_hint);
-    if (!target.has_value()) {
-        std::cout << "No connected ZMI candidates were found.\n";
-        return false;
-    }
-
-    return ObserveZmiSerialSessionForTarget(*target, duration_seconds, MakeWindowsXiaomiControlActionContext());
-}
-
-bool WinRtBatteryProvider::DumpBluetoothServices(const std::string& device_hint) {
-    EnsureWindowsBatteryProviderApartmentInitialized();
-
-    const auto target = ResolveAnyBluetoothTarget(this, device_hint, true);
-    if (!target.has_value()) {
-        std::cout << "No Bluetooth candidates matched.\n";
-        return false;
-    }
-
-    return DumpBluetoothServicesForAddress(target->first, target->second);
-}
-
-bool WinRtBatteryProvider::DumpBleGatt(const std::string& device_hint) {
-    EnsureWindowsBatteryProviderApartmentInitialized();
-    const auto& runtime_options = GetWindowsBatteryProviderRuntimeOptions();
-    return DumpBleGattForCandidates(
-        EnumerateBleCandidateDevices(runtime_options.debug_enabled, &WindowsBatteryProviderDebugLog),
-        device_hint);
 }
 
 bool WinRtBatteryProvider::SetXiaomiNoiseMode(const std::string& mode, const std::string& device_hint) {
@@ -271,21 +200,6 @@ bool WinRtBatteryProvider::SetNoiseSubmode(const std::string& device_id,
     return false;
 }
 
-bool WinRtBatteryProvider::SendXiaomiControlCandidate(int candidate_id, const std::string& device_hint) {
-    EnsureWindowsBatteryProviderApartmentInitialized();
-
-    const auto target = ResolveConnectedXiaomiControlTarget(this, device_hint);
-    if (!target.has_value()) {
-        std::cout << "No connected Xiaomi/Redmi earbuds candidates were found.\n";
-        return false;
-    }
-
-    return SendXiaomiControlCandidateForTarget(
-        *target,
-        candidate_id,
-        MakeWindowsXiaomiControlActionContext());
-}
-
 bool WinRtBatteryProvider::SetXiaomiNoiseSubmode(const std::string& family,
                                                  int submode,
                                                  const std::string& device_hint) {
@@ -299,3 +213,4 @@ bool WinRtBatteryProvider::SetXiaomiNoiseSubmode(const std::string& family,
 }
 
 }  // namespace battery_monitor
+

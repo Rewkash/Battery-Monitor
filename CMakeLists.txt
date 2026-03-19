@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.21)
+﻿cmake_minimum_required(VERSION 3.21)
 
 project(BatteryMonitor VERSION 0.1.0 LANGUAGES CXX)
 
@@ -63,46 +63,39 @@ if(WIN32)
     target_sources(
         battery-monitor-app
         PRIVATE
-            src/platform/windows/BluetoothPnpHints.cpp
-            src/platform/windows/BluetoothPnpUtils.cpp
-            src/platform/windows/BluetoothSocketUtils.cpp
-            src/platform/windows/WindowsBluetoothAddressUtils.cpp
-            src/platform/windows/WindowsBatteryAggregation.cpp
-            src/platform/windows/WindowsBleCandidateBatteryCollector.cpp
-            src/platform/windows/WindowsBatteryEntryUtils.cpp
-            src/platform/windows/WindowsBatteryProviderSupport.cpp
-            src/platform/windows/WindowsBatteryQueryReaders.cpp
-            src/platform/windows/WindowsTwsCandidateBatteryCollector.cpp
-            src/platform/windows/BatteryComponentNaming.cpp
-            src/platform/windows/BleGattDump.cpp
-            src/platform/windows/BleCandidateEnumeration.cpp
-            src/platform/windows/BleStandardBatteryReader.cpp
-            src/platform/windows/BleVendorTripletReader.cpp
-            src/platform/windows/ClassicBluetoothBatteryFallback.cpp
-            src/platform/windows/HfpBatterySession.cpp
+            src/platform/windows/devices/phone/BluetoothPnpHints.cpp
+            src/platform/windows/bluetooth/BluetoothPnpUtils.cpp
+            src/platform/windows/bluetooth/BluetoothSocketUtils.cpp
+            src/platform/windows/shared/WindowsBluetoothAddressUtils.cpp
+            src/platform/windows/shared/WindowsBatteryAggregation.cpp
+            src/platform/windows/shared/WindowsBleCandidateBatteryCollector.cpp
+            src/platform/windows/shared/WindowsBatteryEntryUtils.cpp
+            src/platform/windows/shared/WindowsBatteryProviderSupport.cpp
+            src/platform/windows/shared/WindowsBatteryQueryReaders.cpp
+            src/platform/windows/shared/WindowsTwsCandidateBatteryCollector.cpp
+            src/platform/windows/shared/BatteryComponentNaming.cpp
+            src/platform/windows/bluetooth/BleCandidateEnumeration.cpp
+            src/platform/windows/bluetooth/BleStandardBatteryReader.cpp
+            src/platform/windows/bluetooth/BleVendorTripletReader.cpp
+            src/platform/windows/devices/xiaomi/ClassicBluetoothBatteryFallback.cpp
             src/platform/windows/PlatformCommandDispatcher.cpp
-            src/platform/windows/RfcommServiceDump.cpp
-            src/platform/windows/WindowsControllerBatteryReader.cpp
-            src/platform/windows/WindowsDeviceInfoProperties.cpp
-            src/platform/windows/XiaomiAdvertisementSnapshots.cpp
-            src/platform/windows/XiaomiAuth.cpp
-            src/platform/windows/XiaomiBatteryCaches.cpp
-            src/platform/windows/XiaomiBatteryCodec.cpp
-            src/platform/windows/XiaomiBatteryReadings.cpp
-            src/platform/windows/XiaomiClassicBatterySession.cpp
-            src/platform/windows/XiaomiControlActions.cpp
-            src/platform/windows/XiaomiControlConnection.cpp
-            src/platform/windows/XiaomiControlSession.cpp
-            src/platform/windows/XiaomiControlSocket.cpp
-            src/platform/windows/XiaomiHandshake.cpp
-            src/platform/windows/XiaomiModeCache.cpp
-            src/platform/windows/XiaomiNoiseModeCodec.cpp
-            src/platform/windows/XiaomiPersistentCache.cpp
-            src/platform/windows/XiaomiProtocol.cpp
+            src/platform/windows/devices/controller/WindowsControllerBatteryReader.cpp
+            src/platform/windows/shared/WindowsDeviceInfoProperties.cpp
+            src/platform/windows/devices/xiaomi/XiaomiAuth.cpp
+            src/platform/windows/devices/xiaomi/XiaomiBatteryCaches.cpp
+            src/platform/windows/devices/xiaomi/XiaomiBatteryCodec.cpp
+            src/platform/windows/devices/xiaomi/XiaomiBatteryReadings.cpp
+            src/platform/windows/devices/xiaomi/XiaomiClassicBatterySession.cpp
+            src/platform/windows/devices/xiaomi/XiaomiControlActions.cpp
+            src/platform/windows/devices/xiaomi/XiaomiControlConnection.cpp
+            src/platform/windows/devices/xiaomi/XiaomiControlSession.cpp
+            src/platform/windows/devices/xiaomi/XiaomiControlSocket.cpp
+            src/platform/windows/devices/xiaomi/XiaomiHandshake.cpp
+            src/platform/windows/devices/xiaomi/XiaomiModeCache.cpp
+            src/platform/windows/devices/xiaomi/XiaomiNoiseModeCodec.cpp
+            src/platform/windows/devices/xiaomi/XiaomiPersistentCache.cpp
+            src/platform/windows/devices/xiaomi/XiaomiProtocol.cpp
             src/platform/windows/WinRtBatteryProvider.cpp
-            src/platform/windows/ZmiBatteryCodec.cpp
-            src/platform/windows/ZmiVendorBatteryHints.cpp
-            src/platform/windows/ZmiSerialBatterySession.cpp
     )
 
     target_compile_definitions(
@@ -226,3 +219,4 @@ else()
     add_executable(battery-monitor src/cli_main.cpp)
     target_link_libraries(battery-monitor PRIVATE battery-monitor-app)
 endif()
+
