@@ -1,0 +1,16 @@
+#pragma once
+
+#include <string>
+#include <vector>
+
+#include <winrt/Windows.Devices.Enumeration.h>
+
+namespace battery_monitor {
+
+using BleEnumerationDebugLogFn = void (*)(const std::string&);
+
+std::vector<winrt::Windows::Devices::Enumeration::DeviceInformation> EnumerateBleCandidateDevices(
+    bool debug_enabled = false,
+    BleEnumerationDebugLogFn debug_log = nullptr);
+
+}  // namespace battery_monitor

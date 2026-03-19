@@ -19,6 +19,7 @@
 #include "core/IBluetoothBatteryProvider.h"
 #include "core/INoiseControlProvider.h"
 #include "ui/BatteryHistoryStore.h"
+#include "ui/BatteryWindowSettings.h"
 
 class QAction;
 class QLabel;
@@ -83,6 +84,7 @@ class BatteryWindow : public QWidget {
     static std::string FormatError(const std::exception& ex);
 
     std::unique_ptr<IBluetoothBatteryProvider> provider_;
+    INoiseControlProvider* noise_control_provider_ = nullptr;
     QWidget* cards_container_ = nullptr;
     QVBoxLayout* cards_layout_ = nullptr;
     QScrollArea* scroll_area_ = nullptr;
@@ -123,9 +125,9 @@ class BatteryWindow : public QWidget {
     bool refresh_pending_ = false;
     bool drag_in_progress_ = false;
     bool settings_panel_expanded_ = false;
-    int refresh_interval_ms_ = 15000;
-    int low_battery_threshold_percent_ = 10;
-    int low_battery_repeat_minutes_ = 10;
+    int refresh_interval_ms_ = kBatteryWindowDefaultRefreshIntervalMs;
+    int low_battery_threshold_percent_ = kBatteryWindowDefaultLowBatteryThresholdPercent;
+    int low_battery_repeat_minutes_ = kBatteryWindowDefaultLowBatteryRepeatMinutes;
     bool quitting_ = false;
     BatteryHistoryStore history_store_;
 };

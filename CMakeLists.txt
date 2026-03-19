@@ -20,6 +20,9 @@ if(BATTERY_MONITOR_ENABLE_QT)
 endif()
 
 set(BATTERY_MONITOR_APP_SOURCES
+    src/app/BatteryOutputFormatter.cpp
+    src/app/CommandLineOptions.cpp
+    src/core/NoiseControlVocabulary.cpp
     src/main.cpp
     src/core/ProviderFactory.cpp
 )
@@ -60,7 +63,46 @@ if(WIN32)
     target_sources(
         battery-monitor-app
         PRIVATE
+            src/platform/windows/BluetoothPnpHints.cpp
+            src/platform/windows/BluetoothPnpUtils.cpp
+            src/platform/windows/BluetoothSocketUtils.cpp
+            src/platform/windows/WindowsBluetoothAddressUtils.cpp
+            src/platform/windows/WindowsBatteryAggregation.cpp
+            src/platform/windows/WindowsBleCandidateBatteryCollector.cpp
+            src/platform/windows/WindowsBatteryEntryUtils.cpp
+            src/platform/windows/WindowsBatteryProviderSupport.cpp
+            src/platform/windows/WindowsBatteryQueryReaders.cpp
+            src/platform/windows/WindowsTwsCandidateBatteryCollector.cpp
+            src/platform/windows/BatteryComponentNaming.cpp
+            src/platform/windows/BleGattDump.cpp
+            src/platform/windows/BleCandidateEnumeration.cpp
+            src/platform/windows/BleStandardBatteryReader.cpp
+            src/platform/windows/BleVendorTripletReader.cpp
+            src/platform/windows/ClassicBluetoothBatteryFallback.cpp
+            src/platform/windows/HfpBatterySession.cpp
+            src/platform/windows/PlatformCommandDispatcher.cpp
+            src/platform/windows/RfcommServiceDump.cpp
+            src/platform/windows/WindowsControllerBatteryReader.cpp
+            src/platform/windows/WindowsDeviceInfoProperties.cpp
+            src/platform/windows/XiaomiAdvertisementSnapshots.cpp
+            src/platform/windows/XiaomiAuth.cpp
+            src/platform/windows/XiaomiBatteryCaches.cpp
+            src/platform/windows/XiaomiBatteryCodec.cpp
+            src/platform/windows/XiaomiBatteryReadings.cpp
+            src/platform/windows/XiaomiClassicBatterySession.cpp
+            src/platform/windows/XiaomiControlActions.cpp
+            src/platform/windows/XiaomiControlConnection.cpp
+            src/platform/windows/XiaomiControlSession.cpp
+            src/platform/windows/XiaomiControlSocket.cpp
+            src/platform/windows/XiaomiHandshake.cpp
+            src/platform/windows/XiaomiModeCache.cpp
+            src/platform/windows/XiaomiNoiseModeCodec.cpp
+            src/platform/windows/XiaomiPersistentCache.cpp
+            src/platform/windows/XiaomiProtocol.cpp
             src/platform/windows/WinRtBatteryProvider.cpp
+            src/platform/windows/ZmiBatteryCodec.cpp
+            src/platform/windows/ZmiVendorBatteryHints.cpp
+            src/platform/windows/ZmiSerialBatterySession.cpp
     )
 
     target_compile_definitions(
@@ -73,6 +115,9 @@ if(WIN32)
     target_link_libraries(
         battery-monitor-app
         PUBLIC
+            Cfgmgr32
+            Hid
+            Setupapi
             windowsapp
             Ws2_32
     )
@@ -83,6 +128,7 @@ elseif(UNIX AND NOT APPLE)
     target_sources(
         battery-monitor-app
         PRIVATE
+            src/platform/linux/PlatformCommandDispatcher.cpp
             src/platform/linux/BluezBatteryProvider.cpp
     )
 
@@ -119,8 +165,14 @@ if(BATTERY_MONITOR_QT_ENABLED)
             src/ui/BatteryHistoryStore.h
             src/ui/BatteryStatsDialog.cpp
             src/ui/BatteryStatsDialog.h
+            src/ui/DraggableDeviceRow.cpp
+            src/ui/DraggableDeviceRow.h
+            src/ui/NoiseControlUi.cpp
+            src/ui/NoiseControlUi.h
             src/ui/BatteryWindow.cpp
             src/ui/BatteryWindow.h
+            src/ui/BatteryWindowSettings.cpp
+            src/ui/BatteryWindowSettings.h
             resources/device_icons.qrc
     )
 

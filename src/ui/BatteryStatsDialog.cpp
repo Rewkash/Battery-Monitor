@@ -1,6 +1,7 @@
 #include "ui/BatteryStatsDialog.h"
 
 #include "ui/BatteryRuntimeEstimator.h"
+#include "ui/NoiseControlUi.h"
 
 #include <algorithm>
 #include <cmath>
@@ -36,7 +37,7 @@ QString DialogTitle(const BatteryHistoryData& history) {
 }
 
 QString ModeLabel(const QString& mode) {
-    const QString normalized = mode.trimmed().toLower();
+    const QString normalized = NormalizeNoiseToken(mode);
     if (normalized == QStringLiteral("off")) {
         return QString::fromUtf8(u8"Выключено");
     }
@@ -50,8 +51,8 @@ QString ModeLabel(const QString& mode) {
 }
 
 QString SubmodeLabel(const QString& submode) {
-    const QString normalized = submode.trimmed().toLower();
-    if (normalized == QStringLiteral("balance")) {
+    const QString normalized = NormalizeNoiseToken(submode);
+    if (normalized == QStringLiteral("balanced")) {
         return QString::fromUtf8(u8"Баланс");
     }
     if (normalized == QStringLiteral("weak")) {
@@ -63,7 +64,7 @@ QString SubmodeLabel(const QString& submode) {
     if (normalized == QStringLiteral("adaptive")) {
         return QString::fromUtf8(u8"Адаптивное");
     }
-    if (normalized == QStringLiteral("normal")) {
+    if (normalized == QStringLiteral("standard")) {
         return QString::fromUtf8(u8"Обычная прозрачность");
     }
     if (normalized == QStringLiteral("voice")) {
@@ -147,7 +148,7 @@ QString BuildCountdownStateKey(const QString& component_key,
                                const QString& submode) {
     return component_key + QChar('|') +
            (level.has_value() ? QString::number(*level) : QStringLiteral("na")) + QChar('|') +
-           mode.trimmed().toLower() + QChar('|') + submode.trimmed().toLower();
+           NormalizeNoiseToken(mode) + QChar('|') + NormalizeNoiseToken(submode);
 }
 
 QString FormatCountdownDuration(qint64 duration_ms) {
@@ -308,14 +309,14 @@ QString ActualModeToken(const BatteryHistoryData& history) {
     if (history.samples.isEmpty()) {
         return QString();
     }
-    return history.samples.back().device_mode.trimmed().toLower();
+    return NormalizeNoiseToken(history.samples.back().device_mode);
 }
 
 QString ActualSubmodeToken(const BatteryHistoryData& history) {
     if (history.samples.isEmpty()) {
         return QString();
     }
-    return history.samples.back().device_submode.trimmed().toLower();
+    return NormalizeNoiseToken(history.samples.back().device_submode);
 }
 
 QString ScenarioText(const QString& mode_token, const QString& submode_token, bool is_current) {
@@ -332,17 +333,11 @@ QString ScenarioText(const QString& mode_token, const QString& submode_token, bo
 }
 
 bool ScenarioNeedsSubmode(const QString& mode_token) {
-    return mode_token == QStringLiteral("anc") || mode_token == QStringLiteral("transparency");
+    return NoiseModeNeedsSubmode(mode_token);
 }
 
 QString DefaultSubmodeForMode(const QString& mode_token) {
-    if (mode_token == QStringLiteral("anc")) {
-        return QStringLiteral("balanced");
-    }
-    if (mode_token == QStringLiteral("transparency")) {
-        return QStringLiteral("standard");
-    }
-    return QString();
+    return DefaultNoiseSubmodeToken(mode_token);
 }
 
 BatteryHistoryData BuildScenarioHistory(const BatteryHistoryData& history,

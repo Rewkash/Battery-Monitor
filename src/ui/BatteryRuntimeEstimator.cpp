@@ -1,4 +1,5 @@
 #include "ui/BatteryRuntimeEstimator.h"
+#include "ui/NoiseControlUi.h"
 
 #include <algorithm>
 #include <array>
@@ -36,7 +37,7 @@ struct LiveRateEstimate {
 };
 
 QString NormalizeToken(const QString& value) {
-    return value.trimmed().toLower();
+    return NormalizeNoiseToken(value);
 }
 
 bool IsDisconnectedLevel(int level) {

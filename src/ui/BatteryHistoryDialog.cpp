@@ -1,5 +1,6 @@
 #include "ui/BatteryHistoryDialog.h"
 #include "ui/BatteryRuntimeEstimator.h"
+#include "ui/NoiseControlUi.h"
 
 #include <algorithm>
 #include <array>
@@ -150,7 +151,7 @@ QString FormatAxisLabel(qint64 timestamp_ms) {
 }
 
 QString ModeLabel(const QString& mode) {
-    const QString normalized = mode.trimmed().toLower();
+    const QString normalized = NormalizeNoiseToken(mode);
     if (normalized == QStringLiteral("off")) {
         return QString::fromUtf8(u8"выключено");
     }
@@ -164,8 +165,8 @@ QString ModeLabel(const QString& mode) {
 }
 
 QString SubmodeLabel(const QString& submode) {
-    const QString normalized = submode.trimmed().toLower();
-    if (normalized == QStringLiteral("balance")) {
+    const QString normalized = NormalizeNoiseToken(submode);
+    if (normalized == QStringLiteral("balanced")) {
         return QString::fromUtf8(u8"баланс");
     }
     if (normalized == QStringLiteral("weak")) {
@@ -177,7 +178,7 @@ QString SubmodeLabel(const QString& submode) {
     if (normalized == QStringLiteral("adaptive")) {
         return QString::fromUtf8(u8"адаптивное");
     }
-    if (normalized == QStringLiteral("normal")) {
+    if (normalized == QStringLiteral("standard")) {
         return QString::fromUtf8(u8"обычная");
     }
     if (normalized == QStringLiteral("voice")) {

@@ -1,7 +1,10 @@
 #include "ui/BatteryWindow.h"
 #include "ui/BatteryHistoryDialog.h"
 #include "ui/BatteryRuntimeEstimator.h"
+#include "ui/NoiseControlUi.h"
 #include "ui/BatteryStatsDialog.h"
+#include "ui/BatteryWindowSettings.h"
+#include "ui/DraggableDeviceRow.h"
 
 #include <algorithm>
 #include <cctype>
@@ -57,6 +60,8 @@
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <QWidget>
+
+#include "core/NoiseControlVocabulary.h"
 
 #ifdef _WIN32
 #include <winrt/base.h>
@@ -118,326 +123,6 @@ constexpr int kListSpacing = 10;
 constexpr int kListHeightSlack = 28;
 constexpr int kDefaultWindowWidth = 390;
 constexpr int kNoiseControlWindowWidth = 470;
-constexpr const char* kDeviceRowMimeType = "application/x-chargeview-device-row";
-constexpr const char* kSettingsGroupUi = "ui";
-constexpr const char* kSettingsConnectedOrderKey = "connected_order";
-constexpr const char* kSettingsDisconnectedOrderKey = "disconnected_order";
-constexpr const char* kSettingsRefreshIntervalMsKey = "refresh_interval_ms";
-constexpr const char* kSettingsLowBatteryThresholdPercentKey = "low_battery_threshold_percent";
-constexpr const char* kSettingsLowBatteryRepeatMinutesKey = "low_battery_repeat_minutes";
-constexpr int kDefaultRefreshIntervalMs = 15000;
-constexpr int kMinRefreshIntervalSeconds = 5;
-constexpr int kMaxRefreshIntervalSeconds = 600;
-constexpr int kDefaultLowBatteryThresholdPercent = 10;
-constexpr int kMinLowBatteryThresholdPercent = 1;
-constexpr int kMaxLowBatteryThresholdPercent = 100;
-constexpr int kDefaultLowBatteryRepeatMinutes = 10;
-constexpr int kMinLowBatteryRepeatMinutes = 1;
-constexpr int kMaxLowBatteryRepeatMinutes = 180;
-
-QSettings CreateUiSettings() {
-    return QSettings(QSettings::IniFormat, QSettings::UserScope, QStringLiteral("BatteryMonitor"),
-                     QStringLiteral("BatteryMonitor"));
-}
-
-int ClampRefreshIntervalMs(int interval_ms) {
-    const int min_ms = kMinRefreshIntervalSeconds * 1000;
-    const int max_ms = kMaxRefreshIntervalSeconds * 1000;
-    return std::clamp(interval_ms, min_ms, max_ms);
-}
-
-int ClampLowBatteryThresholdPercent(int percent) {
-    return std::clamp(percent, kMinLowBatteryThresholdPercent, kMaxLowBatteryThresholdPercent);
-}
-
-int ClampLowBatteryRepeatMinutes(int minutes) {
-    return std::clamp(minutes, kMinLowBatteryRepeatMinutes, kMaxLowBatteryRepeatMinutes);
-}
-
-int LoadRefreshIntervalMs() {
-    QSettings settings = CreateUiSettings();
-    settings.beginGroup(QString::fromLatin1(kSettingsGroupUi));
-    const int saved = settings.value(QString::fromLatin1(kSettingsRefreshIntervalMsKey), kDefaultRefreshIntervalMs)
-                          .toInt();
-    settings.endGroup();
-    return ClampRefreshIntervalMs(saved);
-}
-
-void SaveRefreshIntervalMs(int interval_ms) {
-    QSettings settings = CreateUiSettings();
-    settings.beginGroup(QString::fromLatin1(kSettingsGroupUi));
-    settings.setValue(QString::fromLatin1(kSettingsRefreshIntervalMsKey), ClampRefreshIntervalMs(interval_ms));
-    settings.endGroup();
-    settings.sync();
-}
-
-int LoadLowBatteryThresholdPercent() {
-    QSettings settings = CreateUiSettings();
-    settings.beginGroup(QString::fromLatin1(kSettingsGroupUi));
-    const int saved = settings
-                          .value(QString::fromLatin1(kSettingsLowBatteryThresholdPercentKey),
-                                 kDefaultLowBatteryThresholdPercent)
-                          .toInt();
-    settings.endGroup();
-    return ClampLowBatteryThresholdPercent(saved);
-}
-
-void SaveLowBatteryThresholdPercent(int percent) {
-    QSettings settings = CreateUiSettings();
-    settings.beginGroup(QString::fromLatin1(kSettingsGroupUi));
-    settings.setValue(QString::fromLatin1(kSettingsLowBatteryThresholdPercentKey),
-                      ClampLowBatteryThresholdPercent(percent));
-    settings.endGroup();
-    settings.sync();
-}
-
-int LoadLowBatteryRepeatMinutes() {
-    QSettings settings = CreateUiSettings();
-    settings.beginGroup(QString::fromLatin1(kSettingsGroupUi));
-    const int saved = settings
-                          .value(QString::fromLatin1(kSettingsLowBatteryRepeatMinutesKey),
-                                 kDefaultLowBatteryRepeatMinutes)
-                          .toInt();
-    settings.endGroup();
-    return ClampLowBatteryRepeatMinutes(saved);
-}
-
-void SaveLowBatteryRepeatMinutes(int minutes) {
-    QSettings settings = CreateUiSettings();
-    settings.beginGroup(QString::fromLatin1(kSettingsGroupUi));
-    settings.setValue(QString::fromLatin1(kSettingsLowBatteryRepeatMinutesKey),
-                      ClampLowBatteryRepeatMinutes(minutes));
-    settings.endGroup();
-    settings.sync();
-}
-
-std::vector<std::string> ReadOrderFromSettings(QSettings* settings, const char* key) {
-    if (settings == nullptr || key == nullptr) {
-        return {};
-    }
-
-    const QStringList saved_values = settings->value(QString::fromLatin1(key)).toStringList();
-    std::vector<std::string> order;
-    order.reserve(static_cast<std::size_t>(saved_values.size()));
-    std::unordered_set<std::string> seen;
-    for (const auto& value : saved_values) {
-        const std::string device_id = value.toUtf8().toStdString();
-        if (device_id.empty() || !seen.emplace(device_id).second) {
-            continue;
-        }
-        order.push_back(device_id);
-    }
-    return order;
-}
-
-void WriteOrderToSettings(QSettings* settings, const char* key, const std::vector<std::string>& order) {
-    if (settings == nullptr || key == nullptr) {
-        return;
-    }
-
-    QStringList values;
-    values.reserve(static_cast<qsizetype>(order.size()));
-    for (const auto& device_id : order) {
-        if (device_id.empty()) {
-            continue;
-        }
-        values.push_back(QString::fromUtf8(device_id.c_str()));
-    }
-    settings->setValue(QString::fromLatin1(key), values);
-}
-
-void LoadPersistedDeviceOrder(std::vector<std::string>* connected_order,
-                              std::vector<std::string>* disconnected_order) {
-    QSettings settings = CreateUiSettings();
-    settings.beginGroup(QString::fromLatin1(kSettingsGroupUi));
-    if (connected_order != nullptr) {
-        *connected_order = ReadOrderFromSettings(&settings, kSettingsConnectedOrderKey);
-    }
-    if (disconnected_order != nullptr) {
-        *disconnected_order = ReadOrderFromSettings(&settings, kSettingsDisconnectedOrderKey);
-    }
-    settings.endGroup();
-}
-
-void SavePersistedDeviceOrder(const std::vector<std::string>& connected_order,
-                              const std::vector<std::string>& disconnected_order) {
-    QSettings settings = CreateUiSettings();
-    settings.beginGroup(QString::fromLatin1(kSettingsGroupUi));
-    WriteOrderToSettings(&settings, kSettingsConnectedOrderKey, connected_order);
-    WriteOrderToSettings(&settings, kSettingsDisconnectedOrderKey, disconnected_order);
-    settings.endGroup();
-    settings.sync();
-}
-
-class DraggableDeviceRow final : public QFrame {
-   public:
-    using ReorderCallback = std::function<void(const std::string& dragged_device_id,
-                                               const std::string& target_device_id,
-                                               bool connected_queue,
-                                               bool insert_before_target)>;
-    using DragStateCallback = std::function<void(bool active)>;
-
-    DraggableDeviceRow(std::string device_id, bool is_connected, QWidget* parent = nullptr)
-        : QFrame(parent), device_id_(std::move(device_id)), is_connected_(is_connected) {
-        setAcceptDrops(true);
-        setCursor(Qt::OpenHandCursor);
-        setProperty("dragOver", false);
-    }
-
-    void SetReorderCallback(ReorderCallback callback) {
-        reorder_callback_ = std::move(callback);
-    }
-
-    void SetDragStateCallback(DragStateCallback callback) {
-        drag_state_callback_ = std::move(callback);
-    }
-
-   protected:
-    void mousePressEvent(QMouseEvent* event) override {
-        if (event != nullptr && event->button() == Qt::LeftButton) {
-            drag_start_pos_ = event->position().toPoint();
-            setCursor(Qt::ClosedHandCursor);
-        }
-        QFrame::mousePressEvent(event);
-    }
-
-    void mouseMoveEvent(QMouseEvent* event) override {
-        if (event == nullptr || !(event->buttons() & Qt::LeftButton)) {
-            QFrame::mouseMoveEvent(event);
-            return;
-        }
-        if ((event->position().toPoint() - drag_start_pos_).manhattanLength() < QApplication::startDragDistance()) {
-            QFrame::mouseMoveEvent(event);
-            return;
-        }
-
-        StartDrag();
-        event->accept();
-    }
-
-    void mouseReleaseEvent(QMouseEvent* event) override {
-        setCursor(Qt::OpenHandCursor);
-        QFrame::mouseReleaseEvent(event);
-    }
-
-    void dragEnterEvent(QDragEnterEvent* event) override {
-        if (CanAccept(event != nullptr ? event->mimeData() : nullptr)) {
-            event->acceptProposedAction();
-            SetDragOver(true);
-            return;
-        }
-        if (event != nullptr) {
-            event->ignore();
-        }
-    }
-
-    void dragMoveEvent(QDragMoveEvent* event) override {
-        if (CanAccept(event != nullptr ? event->mimeData() : nullptr)) {
-            event->acceptProposedAction();
-            return;
-        }
-        if (event != nullptr) {
-            event->ignore();
-        }
-    }
-
-    void dragLeaveEvent(QDragLeaveEvent* event) override {
-        Q_UNUSED(event);
-        SetDragOver(false);
-    }
-
-    void dropEvent(QDropEvent* event) override {
-        std::string dragged_device_id;
-        bool dragged_connected = false;
-        if (event == nullptr ||
-            !DecodePayload(event->mimeData(), &dragged_device_id, &dragged_connected) ||
-            dragged_device_id == device_id_ || dragged_connected != is_connected_) {
-            if (event != nullptr) {
-                event->ignore();
-            }
-            SetDragOver(false);
-            return;
-        }
-
-        SetDragOver(false);
-        const bool insert_before_target = event->position().y() < (static_cast<double>(height()) / 2.0);
-        if (reorder_callback_) {
-            reorder_callback_(dragged_device_id, device_id_, is_connected_, insert_before_target);
-        }
-        event->acceptProposedAction();
-    }
-
-   private:
-    static QByteArray BuildPayload(const std::string& device_id, bool is_connected) {
-        QByteArray payload;
-        QDataStream stream(&payload, QIODevice::WriteOnly);
-        stream << QString::fromUtf8(device_id.c_str()) << is_connected;
-        return payload;
-    }
-
-    static bool DecodePayload(const QMimeData* mime_data, std::string* device_id, bool* is_connected) {
-        if (mime_data == nullptr || device_id == nullptr || is_connected == nullptr ||
-            !mime_data->hasFormat(kDeviceRowMimeType)) {
-            return false;
-        }
-
-        QByteArray payload = mime_data->data(kDeviceRowMimeType);
-        QDataStream stream(&payload, QIODevice::ReadOnly);
-        QString decoded_id;
-        bool decoded_connected = false;
-        stream >> decoded_id >> decoded_connected;
-        if (stream.status() != QDataStream::Ok || decoded_id.isEmpty()) {
-            return false;
-        }
-
-        *device_id = decoded_id.toUtf8().toStdString();
-        *is_connected = decoded_connected;
-        return true;
-    }
-
-    bool CanAccept(const QMimeData* mime_data) const {
-        std::string dragged_device_id;
-        bool dragged_connected = false;
-        return DecodePayload(mime_data, &dragged_device_id, &dragged_connected) &&
-               dragged_connected == is_connected_ &&
-               dragged_device_id != device_id_;
-    }
-
-    void SetDragOver(bool enabled) {
-        if (property("dragOver").toBool() == enabled) {
-            return;
-        }
-        setProperty("dragOver", enabled);
-        if (auto* widget_style = style(); widget_style != nullptr) {
-            widget_style->unpolish(this);
-            widget_style->polish(this);
-        }
-        update();
-    }
-
-    void StartDrag() {
-        auto* drag = new QDrag(this);
-        auto* mime_data = new QMimeData();
-        mime_data->setData(kDeviceRowMimeType, BuildPayload(device_id_, is_connected_));
-        drag->setMimeData(mime_data);
-        drag->setHotSpot(rect().center());
-        if (drag_state_callback_) {
-            drag_state_callback_(true);
-        }
-        drag->exec(Qt::MoveAction);
-        if (drag_state_callback_) {
-            drag_state_callback_(false);
-        }
-        setCursor(Qt::OpenHandCursor);
-    }
-
-    std::string device_id_;
-    bool is_connected_ = false;
-    QPoint drag_start_pos_;
-    ReorderCallback reorder_callback_;
-    DragStateCallback drag_state_callback_;
-};
-
 QString ToQString(const std::string& value) {
     return QString::fromUtf8(value.c_str());
 }
@@ -618,10 +303,19 @@ QString BuildDeviceModeText(const DeviceEntry& device) {
         return {};
     }
 
-    const std::string mode = ToLowerAscii(*device.device_mode);
-    const std::string submode = device.device_submode.has_value() ? ToLowerAscii(*device.device_submode) : std::string();
+    const QString mode_label = NoiseModeLabel(ToQString(*device.device_mode));
+    if (mode_label.isEmpty()) {
+        return {};
+    }
+
+    const std::string mode = NormalizeNoiseControlToken(*device.device_mode);
+    const QString normalized_submode =
+        device.device_submode.has_value() ? NormalizeNoiseToken(ToQString(*device.device_submode)) : QString();
+    const QString submode_label =
+        device.device_submode.has_value() ? NoiseSubmodeLabel(ToQString(*device.device_submode)) : QString();
+    const std::string submode = normalized_submode.toStdString();
     auto append_submode = [&](QString base_text) {
-        if (submode.empty()) {
+        if (submode_label.isEmpty() || normalized_submode == QStringLiteral("standard")) {
             return base_text;
         }
 
@@ -659,7 +353,7 @@ QString BuildDeviceModeText(const DeviceEntry& device) {
             QString::fromUtf8(u8"\u0420\u0435\u0436\u0438\u043C: \u0448\u0443\u043C\u043E\u043F\u043E\u0434\u0430\u0432\u043B\u0435\u043D\u0438\u0435"));
     }
 
-    return append_submode(QString::fromUtf8(u8"\u0420\u0435\u0436\u0438\u043C: %1").arg(ToQString(*device.device_mode)));
+    return append_submode(QString::fromUtf8(u8"\u0420\u0435\u0436\u0438\u043C: %1").arg(mode_label));
 }
 
 QString FormatRuntimeCountdownNoSeconds(qint64 duration_ms) {
@@ -785,11 +479,11 @@ std::string BuildRuntimeStateKey(const DeviceEntry& device,
 
     stream << '|';
     if (device.device_mode.has_value()) {
-        stream << ToLowerAscii(*device.device_mode);
+        stream << NormalizeNoiseControlToken(*device.device_mode);
     }
     stream << '|';
     if (device.device_submode.has_value()) {
-        stream << ToLowerAscii(*device.device_submode);
+        stream << NormalizeNoiseControlToken(*device.device_submode);
     }
     return stream.str();
 }
@@ -1868,7 +1562,9 @@ QString FormatWinRtError(const winrt::hresult_error& error) {
 }  // namespace
 
 BatteryWindow::BatteryWindow(std::unique_ptr<IBluetoothBatteryProvider> provider, QWidget* parent)
-    : QWidget(parent), provider_(std::move(provider)) {
+    : QWidget(parent),
+      provider_(std::move(provider)),
+      noise_control_provider_(provider_ != nullptr ? provider_->GetNoiseControlProvider() : nullptr) {
     setObjectName(QStringLiteral("trayPanelWindow"));
     setWindowTitle(QStringLiteral("ChargeView"));
     setWindowFlag(Qt::Tool, true);
@@ -2130,7 +1826,8 @@ QWidget#listContainer {
 
     refresh_interval_spinbox_ = new QSpinBox(settings_panel_);
     refresh_interval_spinbox_->setObjectName(QStringLiteral("settingsSpinBox"));
-    refresh_interval_spinbox_->setRange(kMinRefreshIntervalSeconds, kMaxRefreshIntervalSeconds);
+    refresh_interval_spinbox_->setRange(
+        kBatteryWindowMinRefreshIntervalSeconds, kBatteryWindowMaxRefreshIntervalSeconds);
     refresh_interval_spinbox_->setSingleStep(5);
     refresh_interval_spinbox_->setSuffix(QString::fromUtf8(u8" с"));
 
@@ -2145,7 +1842,8 @@ QWidget#listContainer {
 
     low_battery_threshold_spinbox_ = new QSpinBox(settings_panel_);
     low_battery_threshold_spinbox_->setObjectName(QStringLiteral("settingsSpinBox"));
-    low_battery_threshold_spinbox_->setRange(kMinLowBatteryThresholdPercent, kMaxLowBatteryThresholdPercent);
+    low_battery_threshold_spinbox_->setRange(
+        kBatteryWindowMinLowBatteryThresholdPercent, kBatteryWindowMaxLowBatteryThresholdPercent);
     low_battery_threshold_spinbox_->setSingleStep(1);
     low_battery_threshold_spinbox_->setSuffix(QStringLiteral("%"));
 
@@ -2160,7 +1858,8 @@ QWidget#listContainer {
 
     low_battery_repeat_spinbox_ = new QSpinBox(settings_panel_);
     low_battery_repeat_spinbox_->setObjectName(QStringLiteral("settingsSpinBox"));
-    low_battery_repeat_spinbox_->setRange(kMinLowBatteryRepeatMinutes, kMaxLowBatteryRepeatMinutes);
+    low_battery_repeat_spinbox_->setRange(
+        kBatteryWindowMinLowBatteryRepeatMinutes, kBatteryWindowMaxLowBatteryRepeatMinutes);
     low_battery_repeat_spinbox_->setSingleStep(1);
     low_battery_repeat_spinbox_->setSuffix(QString::fromUtf8(u8" мин"));
 
@@ -2231,13 +1930,15 @@ QWidget#listContainer {
 
     refresh_timer_ = new QTimer(this);
     runtime_timer_ = new QTimer(this);
-    refresh_interval_ms_ = LoadRefreshIntervalMs();
-    low_battery_threshold_percent_ = LoadLowBatteryThresholdPercent();
-    low_battery_repeat_minutes_ = LoadLowBatteryRepeatMinutes();
+    const BatteryWindowPersistedState persisted_state = LoadBatteryWindowPersistedState();
+    refresh_interval_ms_ = persisted_state.refresh_interval_ms;
+    low_battery_threshold_percent_ = persisted_state.low_battery_threshold_percent;
+    low_battery_repeat_minutes_ = persisted_state.low_battery_repeat_minutes;
     refresh_timer_->setInterval(refresh_interval_ms_);
     if (refresh_interval_spinbox_ != nullptr) {
         refresh_interval_spinbox_->blockSignals(true);
-        refresh_interval_spinbox_->setValue(std::max(kMinRefreshIntervalSeconds, refresh_interval_ms_ / 1000));
+        refresh_interval_spinbox_->setValue(
+            std::max(kBatteryWindowMinRefreshIntervalSeconds, refresh_interval_ms_ / 1000));
         refresh_interval_spinbox_->blockSignals(false);
     }
     if (low_battery_threshold_spinbox_ != nullptr) {
@@ -2258,7 +1959,8 @@ QWidget#listContainer {
     UpdateRefreshSettingsTooltip();
     RunLowBatteryNotificationSelfCheck();
 
-    LoadPersistedDeviceOrder(&connected_device_order_, &disconnected_device_order_);
+    connected_device_order_ = persisted_state.connected_device_order;
+    disconnected_device_order_ = persisted_state.disconnected_device_order;
 
     AdjustWindowHeightForRows(kMaxVisibleRows);
     InitializeTray();
@@ -2493,9 +2195,12 @@ void BatteryWindow::UpdateTrayTooltip(const std::vector<DeviceBatteryInfo>& devi
 void BatteryWindow::NotifyLowBatteryIfNeeded(const std::vector<DeviceBatteryInfo>& devices) {
     std::unordered_map<std::string, LowBatteryDeviceState> device_states;
     const std::uint8_t threshold_percent =
-        static_cast<std::uint8_t>(ClampLowBatteryThresholdPercent(low_battery_threshold_percent_));
+        static_cast<std::uint8_t>(
+            ClampBatteryWindowLowBatteryThresholdPercent(low_battery_threshold_percent_));
     const std::int64_t repeat_interval_ms =
-        static_cast<std::int64_t>(ClampLowBatteryRepeatMinutes(low_battery_repeat_minutes_)) * 60LL * 1000LL;
+        static_cast<std::int64_t>(
+            ClampBatteryWindowLowBatteryRepeatMinutes(low_battery_repeat_minutes_)) *
+        60LL * 1000LL;
     const std::int64_t now_ms = QDateTime::currentMSecsSinceEpoch();
 
     for (const auto& entry : devices) {
@@ -2729,9 +2434,9 @@ void BatteryWindow::UpdateRefreshSettingsTooltip() {
     if (settings_button_ == nullptr) {
         return;
     }
-    const int seconds = std::max(kMinRefreshIntervalSeconds, refresh_interval_ms_ / 1000);
-    const int threshold = ClampLowBatteryThresholdPercent(low_battery_threshold_percent_);
-    const int repeat_minutes = ClampLowBatteryRepeatMinutes(low_battery_repeat_minutes_);
+    const int seconds = std::max(kBatteryWindowMinRefreshIntervalSeconds, refresh_interval_ms_ / 1000);
+    const int threshold = ClampBatteryWindowLowBatteryThresholdPercent(low_battery_threshold_percent_);
+    const int repeat_minutes = ClampBatteryWindowLowBatteryRepeatMinutes(low_battery_repeat_minutes_);
     settings_button_->setToolTip(
         QString::fromUtf8(u8"\u0410\u0432\u0442\u043E\u043E\u0431\u043D\u043E\u0432\u043B\u044F\u0442\u044C "
                           u8"\u043A\u0430\u0436\u0434\u044B\u0435 %1 \u0441\u0435\u043A\n"
@@ -2744,11 +2449,11 @@ void BatteryWindow::UpdateRefreshSettingsTooltip() {
 }
 
 void BatteryWindow::ApplyRefreshIntervalSeconds(int seconds, bool announce_status) {
-    refresh_interval_ms_ = ClampRefreshIntervalMs(seconds * 1000);
+    refresh_interval_ms_ = ClampBatteryWindowRefreshIntervalMs(seconds * 1000);
     if (refresh_timer_ != nullptr) {
         refresh_timer_->setInterval(refresh_interval_ms_);
     }
-    SaveRefreshIntervalMs(refresh_interval_ms_);
+    SaveBatteryWindowRefreshIntervalMs(refresh_interval_ms_);
     UpdateRefreshSettingsTooltip();
 
     if (!announce_status || status_label_ == nullptr) {
@@ -2761,10 +2466,10 @@ void BatteryWindow::ApplyRefreshIntervalSeconds(int seconds, bool announce_statu
 }
 
 void BatteryWindow::ApplyLowBatteryThresholdPercent(int percent, bool announce_status) {
-    const int new_threshold = ClampLowBatteryThresholdPercent(percent);
+    const int new_threshold = ClampBatteryWindowLowBatteryThresholdPercent(percent);
     const bool threshold_changed = new_threshold != low_battery_threshold_percent_;
     low_battery_threshold_percent_ = new_threshold;
-    SaveLowBatteryThresholdPercent(low_battery_threshold_percent_);
+    SaveBatteryWindowLowBatteryThresholdPercent(low_battery_threshold_percent_);
     UpdateRefreshSettingsTooltip();
 
     if (threshold_changed) {
@@ -2787,8 +2492,8 @@ void BatteryWindow::ApplyLowBatteryThresholdPercent(int percent, bool announce_s
 }
 
 void BatteryWindow::ApplyLowBatteryRepeatMinutes(int minutes, bool announce_status) {
-    low_battery_repeat_minutes_ = ClampLowBatteryRepeatMinutes(minutes);
-    SaveLowBatteryRepeatMinutes(low_battery_repeat_minutes_);
+    low_battery_repeat_minutes_ = ClampBatteryWindowLowBatteryRepeatMinutes(minutes);
+    SaveBatteryWindowLowBatteryRepeatMinutes(low_battery_repeat_minutes_);
     UpdateRefreshSettingsTooltip();
 
     if (!announce_status || status_label_ == nullptr) {
@@ -2814,19 +2519,20 @@ void BatteryWindow::ConfigureRefreshInterval() {
 
         if (refresh_interval_spinbox_ != nullptr) {
             refresh_interval_spinbox_->blockSignals(true);
-            refresh_interval_spinbox_->setValue(std::max(kMinRefreshIntervalSeconds, refresh_interval_ms_ / 1000));
+            refresh_interval_spinbox_->setValue(
+                std::max(kBatteryWindowMinRefreshIntervalSeconds, refresh_interval_ms_ / 1000));
             refresh_interval_spinbox_->blockSignals(false);
         }
         if (low_battery_threshold_spinbox_ != nullptr) {
             low_battery_threshold_spinbox_->blockSignals(true);
             low_battery_threshold_spinbox_->setValue(
-                ClampLowBatteryThresholdPercent(low_battery_threshold_percent_));
+                ClampBatteryWindowLowBatteryThresholdPercent(low_battery_threshold_percent_));
             low_battery_threshold_spinbox_->blockSignals(false);
         }
         if (low_battery_repeat_spinbox_ != nullptr) {
             low_battery_repeat_spinbox_->blockSignals(true);
             low_battery_repeat_spinbox_->setValue(
-                ClampLowBatteryRepeatMinutes(low_battery_repeat_minutes_));
+                ClampBatteryWindowLowBatteryRepeatMinutes(low_battery_repeat_minutes_));
             low_battery_repeat_spinbox_->blockSignals(false);
         }
 
@@ -2870,7 +2576,7 @@ void BatteryWindow::SetDeviceDragActive(bool active) {
 }
 
 void BatteryWindow::ApplyNoiseControlMode(const std::string& device_id, NoiseControlMode mode) {
-    auto* noise_provider = dynamic_cast<INoiseControlProvider*>(provider_.get());
+    auto* noise_provider = noise_control_provider_;
     if (noise_provider == nullptr) {
         if (status_label_ != nullptr) {
             status_label_->setText(QString::fromUtf8(u8"\u0423\u043F\u0440\u0430\u0432\u043B\u0435\u043D\u0438\u0435 "
@@ -2897,7 +2603,7 @@ void BatteryWindow::ApplyNoiseControlMode(const std::string& device_id, NoiseCon
         bool ok = false;
         std::string error_text;
         try {
-            if (auto* provider = dynamic_cast<INoiseControlProvider*>(provider_.get()); provider != nullptr) {
+            if (auto* provider = noise_control_provider_; provider != nullptr) {
                 ok = provider->SetNoiseControlMode(device_id, mode);
             }
             if (!ok) {
@@ -2936,7 +2642,7 @@ void BatteryWindow::ApplyNoiseControlMode(const std::string& device_id, NoiseCon
 void BatteryWindow::ApplyNoiseSubmode(const std::string& device_id,
                                       NoiseControlMode mode,
                                       const std::string& submode_id) {
-    auto* noise_provider = dynamic_cast<INoiseControlProvider*>(provider_.get());
+    auto* noise_provider = noise_control_provider_;
     if (noise_provider == nullptr || !noise_provider->SupportsNoiseSubmodes(device_id, mode)) {
         if (status_label_ != nullptr) {
             status_label_->setText(
@@ -2965,7 +2671,7 @@ void BatteryWindow::ApplyNoiseSubmode(const std::string& device_id,
         bool ok = false;
         std::string error_text;
         try {
-            if (auto* provider = dynamic_cast<INoiseControlProvider*>(provider_.get()); provider != nullptr) {
+            if (auto* provider = noise_control_provider_; provider != nullptr) {
                 ok = provider->SetNoiseSubmode(device_id, mode, submode_id);
             }
             if (!ok) {
@@ -3005,20 +2711,20 @@ void BatteryWindow::ShowNoiseSubmodeMenu(QWidget* anchor,
                                          const std::string& device_id,
                                          NoiseControlMode mode,
                                          const std::string& active_submode_id) {
-    auto* noise_provider = dynamic_cast<INoiseControlProvider*>(provider_.get());
+    auto* noise_provider = noise_control_provider_;
     if (anchor == nullptr || noise_provider == nullptr || !noise_provider->SupportsNoiseSubmodes(device_id, mode)) {
         return;
     }
 
     QMenu menu(anchor);
-    const std::string normalized_active_id = ToLowerAscii(active_submode_id);
-    std::vector<std::pair<std::string, std::string>> submodes;
-    if (mode == NoiseControlMode::Transparency) {
+    const std::string normalized_active_id = NormalizeNoiseControlToken(active_submode_id);
+    std::vector<std::pair<std::string, std::string>> submodes = noise_provider->GetNoiseSubmodes(device_id, mode);
+    if (submodes.empty() && mode == NoiseControlMode::Transparency) {
         submodes = {
             {"standard", "Прозрачность"},
             {"voice", "Усиление голоса"},
         };
-    } else if (mode == NoiseControlMode::Anc) {
+    } else if (submodes.empty() && mode == NoiseControlMode::Anc) {
         submodes = {
             {"balanced", "Баланс"},
             {"weak", "Слабое"},
@@ -3032,7 +2738,7 @@ void BatteryWindow::ShowNoiseSubmodeMenu(QWidget* anchor,
     for (const auto& [submode_id, submode_label] : submodes) {
         QAction* action = menu.addAction(ToQString(submode_label));
         action->setCheckable(true);
-        action->setChecked(ToLowerAscii(submode_id) == normalized_active_id);
+        action->setChecked(NormalizeNoiseControlToken(submode_id) == normalized_active_id);
         connect(action, &QAction::triggered, this,
                 [this, device_id, mode, submode_id]() { ApplyNoiseSubmode(device_id, mode, submode_id); });
     }
@@ -3162,7 +2868,7 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
     const bool has_noise_control_devices = std::any_of(
         ordered.begin(), ordered.end(),
         [this](const DeviceEntry& device) {
-            auto* noise_provider = dynamic_cast<INoiseControlProvider*>(provider_.get());
+            auto* noise_provider = noise_control_provider_;
             return noise_provider != nullptr &&
                    device.device_mode.has_value() &&
                    noise_provider->SupportsNoiseControl(device.device_id);
@@ -3201,7 +2907,7 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
         const bool is_active = IsDeviceConnected(device);
         auto* row = new DraggableDeviceRow(device.device_id, IsDeviceConnected(device), cards_container_);
         row->setObjectName(QStringLiteral("deviceRow"));
-        auto* noise_provider = dynamic_cast<INoiseControlProvider*>(provider_.get());
+        auto* noise_provider = noise_control_provider_;
         const bool supports_noise_control =
             noise_provider != nullptr &&
             is_active &&
@@ -3221,7 +2927,7 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
             if (!ReorderQueueItems(&queue, dragged_device_id, target_device_id, insert_before_target)) {
                 return;
             }
-            SavePersistedDeviceOrder(connected_device_order_, disconnected_device_order_);
+                    SaveBatteryWindowDeviceOrder(connected_device_order_, disconnected_device_order_);
             if (last_devices_snapshot_.empty()) {
                 return;
             }
@@ -3452,7 +3158,7 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
                 button->setMinimumHeight(24);
                 button->setMinimumWidth(74);
                 button->setCursor(Qt::PointingHandCursor);
-                const bool active_mode = ToLowerAscii(*device.device_mode) == mode_name;
+                const bool active_mode = NormalizeNoiseControlToken(*device.device_mode) == mode_name;
                 if (active_mode) {
                     button->setStyleSheet(QStringLiteral("QPushButton { font-weight: 600; }"));
                 }

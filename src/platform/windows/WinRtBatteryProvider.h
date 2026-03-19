@@ -8,6 +8,7 @@ namespace battery_monitor {
 class WinRtBatteryProvider final : public IBluetoothBatteryProvider, public INoiseControlProvider {
    public:
     std::vector<DeviceBatteryInfo> GetDevicesBattery(const BatteryQueryOptions& options) override;
+    INoiseControlProvider* GetNoiseControlProvider() override { return this; }
     bool SupportsNoiseControl(const std::string& device_id) override;
     bool SetNoiseControlMode(const std::string& device_id, NoiseControlMode mode) override;
     bool SupportsNoiseSubmodes(const std::string& device_id, NoiseControlMode mode) override;
