@@ -7,8 +7,11 @@
 #include <QDrag>
 #include <QDragEnterEvent>
 #include <QDropEvent>
+#include <QPainter>
+#include <QPainterPath>
 #include <QMimeData>
 #include <QMouseEvent>
+#include <QPaintEvent>
 #include <QStyle>
 
 namespace battery_monitor {
@@ -16,6 +19,7 @@ namespace battery_monitor {
 namespace {
 
 constexpr const char* kDeviceRowMimeType = "application/x-chargeview-device-row";
+constexpr qreal kDeviceRowRadius = 14.0;
 
 }  // namespace
 
@@ -24,6 +28,8 @@ DraggableDeviceRow::DraggableDeviceRow(std::string device_id, bool is_connected,
     setAcceptDrops(true);
     setCursor(Qt::OpenHandCursor);
     setProperty("dragOver", false);
+    setAttribute(Qt::WA_StyledBackground, false);
+    setAutoFillBackground(false);
 }
 
 void DraggableDeviceRow::SetReorderCallback(ReorderCallback callback) {
@@ -106,6 +112,32 @@ void DraggableDeviceRow::dropEvent(QDropEvent* event) {
         reorder_callback_(dragged_device_id, device_id_, is_connected_, insert_before_target);
     }
     event->acceptProposedAction();
+}
+
+void DraggableDeviceRow::paintEvent(QPaintEvent* event) {
+    Q_UNUSED(event);
+
+    QPainter painter(this);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+
+    const bool inactive = property("activeState").toString() == QStringLiteral("inactive");
+    const bool drag_over = property("dragOver").toBool();
+
+    QRectF frame_rect = rect();
+    frame_rect.adjust(0.5, 0.5, -0.5, -0.5);
+
+    QPainterPath path;
+    path.addRoundedRect(frame_rect, kDeviceRowRadius, kDeviceRowRadius);
+
+    const QColor fill = inactive ? QColor(QStringLiteral("#32363D")) : QColor(QStringLiteral("#3B3E44"));
+    const QColor border = drag_over
+                              ? QColor(116, 190, 255, 217)
+                              : (inactive ? QColor(255, 255, 255, 15) : QColor(255, 255, 255, 23));
+
+    painter.fillPath(path, fill);
+    painter.setPen(QPen(border, 1.0));
+    painter.drawPath(path);
 }
 
 QByteArray DraggableDeviceRow::BuildPayload(const std::string& device_id, bool is_connected) {

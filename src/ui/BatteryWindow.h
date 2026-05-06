@@ -21,6 +21,11 @@
 #include "ui/BatteryHistoryStore.h"
 #include "ui/BatteryWindowSettings.h"
 
+#ifdef _WIN32
+#include <winrt/Windows.Devices.Enumeration.h>
+#include <winrt/base.h>
+#endif
+
 class QAction;
 class QLabel;
 class QMenu;
@@ -53,7 +58,7 @@ class BatteryWindow : public QWidget {
     void paintEvent(QPaintEvent* event) override;
 
    private:
-    void RefreshBatteryData();
+    void RefreshBatteryData(bool include_disconnected = false, bool preserve_disconnected_snapshot = true);
     void PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& devices);
     void ClearDeviceCards();
     void InitializeTray();
@@ -75,6 +80,10 @@ class BatteryWindow : public QWidget {
     void UpdateRefreshSettingsTooltip();
     void UpdateRuntimeCountdownLabels();
     void SetDeviceDragActive(bool active);
+    void StartBluetoothDeviceWatcher();
+    void StopBluetoothDeviceWatcher();
+    void ScheduleBluetoothDeviceRefresh(const std::string& changed_device_id, bool connected);
+    bool ApplyBluetoothDeviceConnectionChange(const std::string& changed_device_id, bool connected);
     void ApplyNoiseControlMode(const std::string& device_id, NoiseControlMode mode);
     void ApplyNoiseSubmode(const std::string& device_id, NoiseControlMode mode, const std::string& submode_id);
     void ShowNoiseSubmodeMenu(QWidget* anchor,
@@ -106,6 +115,17 @@ class BatteryWindow : public QWidget {
     QAction* quit_action_ = nullptr;
     QTimer* refresh_timer_ = nullptr;
     QTimer* runtime_timer_ = nullptr;
+    QTimer* bluetooth_refresh_debounce_timer_ = nullptr;
+#ifdef _WIN32
+    winrt::Windows::Devices::Enumeration::DeviceWatcher bluetooth_classic_watcher_{nullptr};
+    winrt::Windows::Devices::Enumeration::DeviceWatcher bluetooth_le_watcher_{nullptr};
+    winrt::event_token bluetooth_classic_added_token_{};
+    winrt::event_token bluetooth_classic_updated_token_{};
+    winrt::event_token bluetooth_classic_removed_token_{};
+    winrt::event_token bluetooth_le_added_token_{};
+    winrt::event_token bluetooth_le_updated_token_{};
+    winrt::event_token bluetooth_le_removed_token_{};
+#endif
     std::unordered_set<std::string> hidden_device_ids_;
     std::unordered_map<std::string, QDateTime> last_live_update_;
     std::vector<std::string> connected_device_order_;
@@ -123,6 +143,8 @@ class BatteryWindow : public QWidget {
     std::thread refresh_worker_;
     std::atomic<bool> refresh_in_progress_{false};
     bool refresh_pending_ = false;
+    bool pending_include_disconnected_ = false;
+    bool pending_preserve_disconnected_snapshot_ = true;
     bool drag_in_progress_ = false;
     bool settings_panel_expanded_ = false;
     int refresh_interval_ms_ = kBatteryWindowDefaultRefreshIntervalMs;

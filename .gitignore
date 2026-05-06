@@ -2,7 +2,10 @@
 /build/
 /build-*/
 /cmake-build-*/
+/build_*/
 /out/
+/bin/
+/obj/
 
 # CMake generated files (in-source fallback)
 /CMakeCache.txt
@@ -12,6 +15,11 @@
 /CTestTestfile.cmake
 /Testing/
 /Makefile
+*.ninja
+/.ninja_deps
+/.ninja_log
+/compile_commands.json
+CMakeUserPresets.json
 
 # Compiled binaries and objects
 *.o
@@ -23,17 +31,41 @@
 *.dylib
 *.exe
 *.pdb
+*.ilk
+*.idb
+*.ipdb
+*.iobj
+*.exp
+*.map
 
 # Visual Studio
 /.vs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
 *.VC.db
 *.VC.opendb
 *.user
 *.suo
 
-# VS Code/Cursor local transient files
+# Local editor/assistant files
 /.cursor/
 /.vscode/
+/.idea/
+AGENTS.md
+CLAUDE.md
+.claude/
+.codex/
+.opencode/
+context.md
+autid.md
+*-audit.md
+*-map.md
+*-path.md
+pr-cycle.md
+provider-extracted-functions.md
+xiaomi-keep-vs-unverified.md
 
 # Runtime/debug artifacts
 *.log
@@ -44,6 +76,9 @@ debug*.txt
 logs/
 poco-debug*.log
 zmi-debug.log
+debug*.log
+*_debug.log
+*_debug.txt
 
 # Patch/merge leftovers
 *.bak

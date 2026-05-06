@@ -11,6 +11,7 @@ class QDragMoveEvent;
 class QDropEvent;
 class QMimeData;
 class QMouseEvent;
+class QPaintEvent;
 
 namespace battery_monitor {
 
@@ -35,6 +36,7 @@ class DraggableDeviceRow final : public QFrame {
     void dragMoveEvent(QDragMoveEvent* event) override;
     void dragLeaveEvent(QDragLeaveEvent* event) override;
     void dropEvent(QDropEvent* event) override;
+    void paintEvent(QPaintEvent* event) override;
 
    private:
     static QByteArray BuildPayload(const std::string& device_id, bool is_connected);

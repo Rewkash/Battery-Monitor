@@ -15,6 +15,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -64,7 +65,14 @@
 #include "core/NoiseControlVocabulary.h"
 
 #ifdef _WIN32
+#include <winrt/Windows.Devices.Bluetooth.h>
+#include <winrt/Windows.Devices.Enumeration.h>
+#include <winrt/Windows.Foundation.h>
 #include <winrt/base.h>
+#endif
+
+#ifdef _WIN32
+#include "platform/windows/shared/WindowsBluetoothAddressUtils.h"
 #endif
 
 namespace battery_monitor {
@@ -115,6 +123,13 @@ struct RefreshTaskResult {
     bool is_bluetooth_stack_error = false;
 };
 
+struct SmoothButtonColors {
+    QColor fill;
+    QColor border;
+    QColor text;
+    qreal radius = 10.0;
+};
+
 constexpr int kMaxVisibleRows = 3;
 constexpr int kCollapsedRowHeight = 88;
 constexpr int kNoiseControlRowHeight = 116;
@@ -123,8 +138,284 @@ constexpr int kListSpacing = 10;
 constexpr int kListHeightSlack = 28;
 constexpr int kDefaultWindowWidth = 390;
 constexpr int kNoiseControlWindowWidth = 470;
+constexpr int kBluetoothDeviceRefreshDebounceMs = 1200;
 QString ToQString(const std::string& value) {
     return QString::fromUtf8(value.c_str());
+}
+
+SmoothButtonColors ResolveSmoothButtonColors(const QWidget* button, bool pressed, bool hovered, bool enabled) {
+    const QString kind = button != nullptr ? button->property("smoothKind").toString() : QString();
+    if (kind == QStringLiteral("inline")) {
+        return SmoothButtonColors{
+            hovered || pressed ? QColor(255, 255, 255, pressed ? 34 : 20) : QColor(0, 0, 0, 0),
+            QColor(0, 0, 0, 0),
+            hovered || pressed ? QColor(QStringLiteral("#D6DCE7")) : QColor(QStringLiteral("#A7B0C0")),
+            8.0,
+        };
+    }
+
+    if (kind == QStringLiteral("settings")) {
+        return SmoothButtonColors{
+            QColor(pressed ? QStringLiteral("#383C43") : (hovered ? QStringLiteral("#4D525B") : QStringLiteral("#40444B"))),
+            QColor(255, 255, 255, 36),
+            QColor(QStringLiteral("#E7EDF8")),
+            10.0,
+        };
+    }
+
+    if (kind == QStringLiteral("noise")) {
+        const bool active = button != nullptr && button->property("activeMode").toBool();
+        return SmoothButtonColors{
+            QColor(active ? QStringLiteral("#4E5968")
+                          : (pressed ? QStringLiteral("#383C43")
+                                     : (hovered ? QStringLiteral("#4D525B") : QStringLiteral("#40444B")))),
+            active ? QColor(116, 190, 255, 130) : QColor(255, 255, 255, 34),
+            QColor(QStringLiteral("#F2F5FB")),
+            9.0,
+        };
+    }
+
+    return SmoothButtonColors{
+        QColor(!enabled ? QStringLiteral("#373A40")
+                        : (pressed ? QStringLiteral("#3C4149")
+                                   : (hovered ? QStringLiteral("#50555E") : QStringLiteral("#44484F")))),
+        QColor(255, 255, 255, enabled ? 36 : 20),
+        QColor(enabled ? QStringLiteral("#F8FAFC") : QStringLiteral("#9CA3AF")),
+        10.0,
+    };
+}
+
+void PaintSmoothButton(QPainter* painter,
+                       const QWidget* widget,
+                       const QString& text,
+                       const QFont& font,
+                       bool pressed,
+                       bool hovered,
+                       bool enabled) {
+    if (painter == nullptr || widget == nullptr) {
+        return;
+    }
+
+    painter->setRenderHint(QPainter::Antialiasing, true);
+    painter->setRenderHint(QPainter::TextAntialiasing, true);
+
+    const SmoothButtonColors colors = ResolveSmoothButtonColors(widget, pressed, hovered, enabled);
+    QRectF button_rect = widget->rect();
+    button_rect.adjust(0.5, 0.5, -0.5, -0.5);
+
+    QPainterPath path;
+    path.addRoundedRect(button_rect, colors.radius, colors.radius);
+    painter->fillPath(path, colors.fill);
+    if (colors.border.alpha() > 0) {
+        painter->setPen(QPen(colors.border, 1.0));
+        painter->drawPath(path);
+    }
+
+    painter->setFont(font);
+    painter->setPen(colors.text);
+    painter->drawText(widget->rect().adjusted(8, 0, -8, 0), Qt::AlignCenter, text);
+}
+
+class SmoothPushButton final : public QPushButton {
+   public:
+    using QPushButton::QPushButton;
+
+   protected:
+    void paintEvent(QPaintEvent* event) override {
+        Q_UNUSED(event);
+        QPainter painter(this);
+        PaintSmoothButton(&painter, this, text(), font(), isDown(), underMouse(), isEnabled());
+    }
+
+    void enterEvent(QEnterEvent* event) override {
+        QPushButton::enterEvent(event);
+        update();
+    }
+
+    void leaveEvent(QEvent* event) override {
+        QPushButton::leaveEvent(event);
+        update();
+    }
+
+    void mousePressEvent(QMouseEvent* event) override {
+        QPushButton::mousePressEvent(event);
+        update();
+    }
+
+    void mouseReleaseEvent(QMouseEvent* event) override {
+        QPushButton::mouseReleaseEvent(event);
+        update();
+    }
+};
+
+class SmoothToolButton final : public QToolButton {
+   public:
+    using QToolButton::QToolButton;
+
+   protected:
+    void paintEvent(QPaintEvent* event) override {
+        Q_UNUSED(event);
+        QPainter painter(this);
+        PaintSmoothButton(&painter, this, text(), font(), isDown(), underMouse(), isEnabled());
+    }
+
+    void enterEvent(QEnterEvent* event) override {
+        QToolButton::enterEvent(event);
+        update();
+    }
+
+    void leaveEvent(QEvent* event) override {
+        QToolButton::leaveEvent(event);
+        update();
+    }
+
+    void mousePressEvent(QMouseEvent* event) override {
+        QToolButton::mousePressEvent(event);
+        update();
+    }
+
+    void mouseReleaseEvent(QMouseEvent* event) override {
+        QToolButton::mouseReleaseEvent(event);
+        update();
+    }
+};
+
+class SmoothFrame final : public QFrame {
+   public:
+    using QFrame::QFrame;
+
+   protected:
+    void paintEvent(QPaintEvent* event) override {
+        Q_UNUSED(event);
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        QRectF frame_rect = rect();
+        frame_rect.adjust(0.5, 0.5, -0.5, -0.5);
+        QPainterPath path;
+        path.addRoundedRect(frame_rect, 10.0, 10.0);
+        painter.fillPath(path, QColor(QStringLiteral("#3A3E45")));
+        painter.setPen(QPen(QColor(255, 255, 255, 26), 1.0));
+        painter.drawPath(path);
+    }
+};
+
+class SmoothPercentChip final : public QLabel {
+   public:
+    using QLabel::QLabel;
+
+   protected:
+    void paintEvent(QPaintEvent* event) override {
+        Q_UNUSED(event);
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        painter.setRenderHint(QPainter::TextAntialiasing, true);
+
+        const bool inactive = property("activeState").toString() == QStringLiteral("inactive");
+        const bool low = property("levelState").toString() == QStringLiteral("low");
+        const QColor fill = inactive ? QColor(QStringLiteral("#262B33"))
+                                     : (low ? QColor(QStringLiteral("#41242A")) : QColor(QStringLiteral("#2A2F37")));
+        const QColor border = inactive ? QColor(255, 255, 255, 26)
+                                       : (low ? QColor(QStringLiteral("#8E404A")) : QColor(255, 255, 255, 36));
+        const QColor text_color = inactive ? QColor(QStringLiteral("#B7BFCD"))
+                                           : (low ? QColor(QStringLiteral("#FFD0D5")) : QColor(QStringLiteral("#E7ECF6")));
+
+        QRectF chip_rect = rect();
+        chip_rect.adjust(0.5, 0.5, -0.5, -0.5);
+        QPainterPath path;
+        path.addRoundedRect(chip_rect, 9.0, 9.0);
+        painter.fillPath(path, fill);
+        painter.setPen(QPen(border, 1.0));
+        painter.drawPath(path);
+        painter.setFont(font());
+        painter.setPen(text_color);
+        painter.drawText(rect().adjusted(7, 0, -7, 0), Qt::AlignCenter, text());
+    }
+};
+
+class SmoothProgressBar final : public QProgressBar {
+   public:
+    using QProgressBar::QProgressBar;
+
+   protected:
+    void paintEvent(QPaintEvent* event) override {
+        Q_UNUSED(event);
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+
+        const bool inactive = property("activeState").toString() == QStringLiteral("inactive");
+        const QString state = property("levelState").toString();
+        QColor chunk(QStringLiteral("#30C26E"));
+        if (state == QStringLiteral("warn")) {
+            chunk = QColor(QStringLiteral("#D7B446"));
+        } else if (state == QStringLiteral("low")) {
+            chunk = QColor(QStringLiteral("#E06767"));
+        } else if (state == QStringLiteral("na") || inactive) {
+            chunk = QColor(QStringLiteral("#5F6876"));
+        }
+
+        QRectF track_rect = rect();
+        track_rect.adjust(0.5, 0.5, -0.5, -0.5);
+        QPainterPath track_path;
+        track_path.addRoundedRect(track_rect, 6.0, 6.0);
+        painter.fillPath(track_path, QColor(QStringLiteral("#171A20")));
+        painter.setPen(QPen(inactive ? QColor(255, 255, 255, 13) : QColor(255, 255, 255, 20), 1.0));
+        painter.drawPath(track_path);
+
+        if (maximum() <= minimum() || value() <= minimum()) {
+            return;
+        }
+        const double ratio = std::clamp(
+            static_cast<double>(value() - minimum()) / static_cast<double>(maximum() - minimum()), 0.0, 1.0);
+        QRectF chunk_rect = track_rect.adjusted(1.0, 1.0, -1.0, -1.0);
+        chunk_rect.setWidth(std::max<qreal>(chunk_rect.height(), chunk_rect.width() * ratio));
+        QPainterPath chunk_path;
+        chunk_path.addRoundedRect(chunk_rect, 5.0, 5.0);
+        painter.fillPath(chunk_path, chunk);
+    }
+};
+
+class SmoothSpinBox final : public QSpinBox {
+   public:
+    using QSpinBox::QSpinBox;
+
+   protected:
+    void paintEvent(QPaintEvent* event) override {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        QRectF box_rect = rect();
+        box_rect.adjust(0.5, 0.5, -0.5, -0.5);
+        QPainterPath path;
+        path.addRoundedRect(box_rect, 8.0, 8.0);
+        painter.fillPath(path, QColor(QStringLiteral("#2E3238")));
+        painter.setPen(QPen(QColor(255, 255, 255, 36), 1.0));
+        painter.drawPath(path);
+        QSpinBox::paintEvent(event);
+    }
+};
+
+std::string ToLowerAsciiCopy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return value;
+}
+
+bool DeviceIdsReferToSameBluetoothDevice(std::string_view lhs, std::string_view rhs) {
+    if (lhs.empty() || rhs.empty()) {
+        return false;
+    }
+    if (lhs == rhs) {
+        return true;
+    }
+#ifdef _WIN32
+    const auto lhs_address = ParseBluetoothAddressFromDeviceId(std::string(lhs));
+    const auto rhs_address = ParseBluetoothAddressFromDeviceId(std::string(rhs));
+    if (lhs_address.has_value() && rhs_address.has_value()) {
+        return *lhs_address == *rhs_address;
+    }
+#endif
+    const std::string lowered_lhs = ToLowerAsciiCopy(std::string(lhs));
+    const std::string lowered_rhs = ToLowerAsciiCopy(std::string(rhs));
+    return lowered_lhs.find(lowered_rhs) != std::string::npos || lowered_rhs.find(lowered_lhs) != std::string::npos;
 }
 
 std::string ToLowerAscii(std::string value) {
@@ -1392,16 +1683,16 @@ class LowBatteryToast final : public QFrame {
         setWindowFlag(Qt::FramelessWindowHint, true);
         setWindowFlag(Qt::WindowStaysOnTopHint, true);
         setAttribute(Qt::WA_ShowWithoutActivating, true);
-        setAttribute(Qt::WA_TranslucentBackground, false);
-        setAttribute(Qt::WA_StyledBackground, true);
+        setAttribute(Qt::WA_TranslucentBackground, true);
+        setAttribute(Qt::WA_StyledBackground, false);
+        setAutoFillBackground(false);
         setFocusPolicy(Qt::NoFocus);
         setWindowOpacity(1.0);
 
         setStyleSheet(R"(
 QFrame#lowBatteryToast {
-    background: #3B3E44;
-    border: 1px solid rgba(255, 255, 255, 0.09);
-    border-radius: 12px;
+    background: transparent;
+    border: none;
 }
 QLabel#toastTitle {
     color: #F8FAFC;
@@ -1497,6 +1788,20 @@ QLabel#toastLine2 {
         slide_in_animation_->start();
     }
 
+   protected:
+    void paintEvent(QPaintEvent* event) override {
+        Q_UNUSED(event);
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        QRectF frame_rect = rect();
+        frame_rect.adjust(0.5, 0.5, -0.5, -0.5);
+        QPainterPath path;
+        path.addRoundedRect(frame_rect, 12.0, 12.0);
+        painter.fillPath(path, QColor(QStringLiteral("#3B3E44")));
+        painter.setPen(QPen(QColor(255, 255, 255, 23), 1.0));
+        painter.drawPath(path);
+    }
+
    private:
     void StartHideAnimation() {
         if (!isVisible()) {
@@ -1587,40 +1892,36 @@ QLabel#titleLabel {
     color: #F8FAFC;
 }
 QPushButton#topButton {
-    background: #44484F;
     color: #F8FAFC;
-    border: 1px solid rgba(255, 255, 255, 0.14);
-    border-radius: 10px;
+    background: transparent;
+    border: none;
     padding: 4px 10px;
     font-size: 11px;
     font-weight: 600;
 }
 QPushButton#topButton:hover {
-    background: #50555E;
+    background: transparent;
 }
 QPushButton#topButton:disabled {
     color: #9CA3AF;
-    background: #373A40;
-    border-color: rgba(255, 255, 255, 0.08);
+    background: transparent;
 }
 QLabel#summaryLabel {
     color: #D1D5DB;
     font-size: 10px;
 }
 QFrame#deviceRow {
-    background: #3B3E44;
-    border: 1px solid rgba(255, 255, 255, 0.09);
-    border-radius: 14px;
+    background: transparent;
+    border: none;
 }
 QFrame#deviceRow[activeState="inactive"] {
-    background: #32363D;
-    border-color: rgba(255, 255, 255, 0.06);
+    background: transparent;
 }
 QFrame#deviceRow:hover {
-    border-color: rgba(255, 255, 255, 0.16);
+    background: transparent;
 }
 QFrame#deviceRow[dragOver="true"] {
-    border-color: rgba(116, 190, 255, 0.85);
+    background: transparent;
 }
 QLabel#deviceIcon {
     background: transparent;
@@ -1643,52 +1944,47 @@ QLabel#technicalMeta[activeState="inactive"] {
     color: #7F8795;
 }
 QLabel#percentChip {
-    background: #2A2F37;
     color: #E7ECF6;
-    border: 1px solid rgba(255, 255, 255, 0.14);
-    border-radius: 9px;
+    background: transparent;
+    border: none;
     padding: 1px 7px;
     font-size: 12px;
     font-weight: 700;
 }
 QLabel#percentChip[levelState="low"] {
-    background: #41242A;
-    border-color: #8E404A;
+    background: transparent;
     color: #FFD0D5;
 }
 QLabel#percentChip[activeState="inactive"] {
-    background: #262B33;
-    border-color: rgba(255, 255, 255, 0.10);
+    background: transparent;
     color: #B7BFCD;
 }
 QProgressBar#deviceProgress {
-    background: #171A20;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 6px;
+    background: transparent;
+    border: none;
     min-height: 10px;
     max-height: 10px;
 }
 QProgressBar#deviceProgress::chunk {
-    border-radius: 5px;
-    background: #30C26E;
+    background: transparent;
 }
 QProgressBar#deviceProgress[levelState="ok"]::chunk {
-    background: #30C26E;
+    background: transparent;
 }
 QProgressBar#deviceProgress[levelState="warn"]::chunk {
-    background: #D7B446;
+    background: transparent;
 }
 QProgressBar#deviceProgress[levelState="low"]::chunk {
-    background: #E06767;
+    background: transparent;
 }
 QProgressBar#deviceProgress[levelState="na"]::chunk {
-    background: #5F6876;
+    background: transparent;
 }
 QProgressBar#deviceProgress[activeState="inactive"] {
-    border-color: rgba(255, 255, 255, 0.05);
+    background: transparent;
 }
 QProgressBar#deviceProgress[activeState="inactive"]::chunk {
-    background: #5F6876;
+    background: transparent;
 }
 QToolButton#inlineMenuButton {
     background: transparent;
@@ -1698,19 +1994,17 @@ QToolButton#inlineMenuButton {
     max-width: 28px;
     min-height: 28px;
     max-height: 28px;
-    border-radius: 8px;
     font-size: 15px;
     font-weight: 600;
 }
 QToolButton#inlineMenuButton:hover {
-    background: rgba(255, 255, 255, 0.08);
+    background: transparent;
     color: #D6DCE7;
 }
 QToolButton#settingsButton {
-    background: #40444B;
+    background: transparent;
     color: #E7EDF8;
-    border: 1px solid rgba(255, 255, 255, 0.14);
-    border-radius: 10px;
+    border: none;
     min-width: 30px;
     max-width: 30px;
     min-height: 30px;
@@ -1719,12 +2013,11 @@ QToolButton#settingsButton {
     font-weight: 700;
 }
 QToolButton#settingsButton:hover {
-    background: #4D525B;
+    background: transparent;
 }
 QFrame#settingsPanel {
-    background: #3A3E45;
-    border: 1px solid rgba(255, 255, 255, 0.10);
-    border-radius: 10px;
+    background: transparent;
+    border: none;
 }
 QLabel#settingsLabel {
     color: #D8DEE9;
@@ -1732,10 +2025,9 @@ QLabel#settingsLabel {
     font-weight: 500;
 }
 QSpinBox#settingsSpinBox {
-    background: #2E3238;
+    background: transparent;
     color: #F2F5FB;
-    border: 1px solid rgba(255, 255, 255, 0.14);
-    border-radius: 8px;
+    border: none;
     padding: 2px 6px;
     min-height: 24px;
     min-width: 90px;
@@ -1772,10 +2064,10 @@ QWidget#listContainer {
     auto* title_label = new QLabel(QStringLiteral("ChargeView"), this);
     title_label->setObjectName(QStringLiteral("titleLabel"));
 
-    refresh_button_ = new QPushButton(QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u0438\u0442\u044C"), this);
+    refresh_button_ = new SmoothPushButton(QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u0438\u0442\u044C"), this);
     refresh_button_->setObjectName(QStringLiteral("topButton"));
 
-    show_all_button_ = new QPushButton(QString::fromUtf8(u8"\u041F\u043E\u043A\u0430\u0437\u0430\u0442\u044C "
+    show_all_button_ = new SmoothPushButton(QString::fromUtf8(u8"\u041F\u043E\u043A\u0430\u0437\u0430\u0442\u044C "
                                                          u8"\u0441\u043A\u0440\u044B\u0442\u044B\u0435"), this);
     show_all_button_->setObjectName(QStringLiteral("topButton"));
     show_all_button_->setEnabled(false);
@@ -1804,7 +2096,7 @@ QWidget#listContainer {
 
     scroll_area_->setWidget(cards_container_);
 
-    settings_panel_ = new QFrame(this);
+    settings_panel_ = new SmoothFrame(this);
     settings_panel_->setObjectName(QStringLiteral("settingsPanel"));
     settings_panel_->setVisible(false);
     settings_panel_->setMinimumHeight(0);
@@ -1824,7 +2116,7 @@ QWidget#listContainer {
                    settings_panel_);
     refresh_settings_label->setObjectName(QStringLiteral("settingsLabel"));
 
-    refresh_interval_spinbox_ = new QSpinBox(settings_panel_);
+    refresh_interval_spinbox_ = new SmoothSpinBox(settings_panel_);
     refresh_interval_spinbox_->setObjectName(QStringLiteral("settingsSpinBox"));
     refresh_interval_spinbox_->setRange(
         kBatteryWindowMinRefreshIntervalSeconds, kBatteryWindowMaxRefreshIntervalSeconds);
@@ -1840,7 +2132,7 @@ QWidget#listContainer {
         settings_panel_);
     threshold_settings_label->setObjectName(QStringLiteral("settingsLabel"));
 
-    low_battery_threshold_spinbox_ = new QSpinBox(settings_panel_);
+    low_battery_threshold_spinbox_ = new SmoothSpinBox(settings_panel_);
     low_battery_threshold_spinbox_->setObjectName(QStringLiteral("settingsSpinBox"));
     low_battery_threshold_spinbox_->setRange(
         kBatteryWindowMinLowBatteryThresholdPercent, kBatteryWindowMaxLowBatteryThresholdPercent);
@@ -1856,7 +2148,7 @@ QWidget#listContainer {
         settings_panel_);
     repeat_settings_label->setObjectName(QStringLiteral("settingsLabel"));
 
-    low_battery_repeat_spinbox_ = new QSpinBox(settings_panel_);
+    low_battery_repeat_spinbox_ = new SmoothSpinBox(settings_panel_);
     low_battery_repeat_spinbox_->setObjectName(QStringLiteral("settingsSpinBox"));
     low_battery_repeat_spinbox_->setRange(
         kBatteryWindowMinLowBatteryRepeatMinutes, kBatteryWindowMaxLowBatteryRepeatMinutes);
@@ -1896,8 +2188,9 @@ QWidget#listContainer {
     status_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
     status_label_->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
 
-    settings_button_ = new QToolButton(this);
+    settings_button_ = new SmoothToolButton(this);
     settings_button_->setObjectName(QStringLiteral("settingsButton"));
+    settings_button_->setProperty("smoothKind", QStringLiteral("settings"));
     settings_button_->setText(QString::fromUtf8(u8"\u2699"));
     settings_button_->setCursor(Qt::PointingHandCursor);
     settings_button_->setToolButtonStyle(Qt::ToolButtonTextOnly);
@@ -1930,6 +2223,11 @@ QWidget#listContainer {
 
     refresh_timer_ = new QTimer(this);
     runtime_timer_ = new QTimer(this);
+    bluetooth_refresh_debounce_timer_ = new QTimer(this);
+    bluetooth_refresh_debounce_timer_->setSingleShot(true);
+    bluetooth_refresh_debounce_timer_->setInterval(kBluetoothDeviceRefreshDebounceMs);
+    connect(bluetooth_refresh_debounce_timer_, &QTimer::timeout, this, [this]() { RefreshBatteryData(false, true); });
+
     const BatteryWindowPersistedState persisted_state = LoadBatteryWindowPersistedState();
     refresh_interval_ms_ = persisted_state.refresh_interval_ms;
     low_battery_threshold_percent_ = persisted_state.low_battery_threshold_percent;
@@ -1951,7 +2249,7 @@ QWidget#listContainer {
         low_battery_repeat_spinbox_->setValue(low_battery_repeat_minutes_);
         low_battery_repeat_spinbox_->blockSignals(false);
     }
-    connect(refresh_timer_, &QTimer::timeout, this, [this]() { RefreshBatteryData(); });
+    connect(refresh_timer_, &QTimer::timeout, this, [this]() { RefreshBatteryData(false, true); });
     connect(runtime_timer_, &QTimer::timeout, this, [this]() { UpdateRuntimeCountdownLabels(); });
     refresh_timer_->start();
     runtime_timer_->setInterval(1000);
@@ -1964,11 +2262,13 @@ QWidget#listContainer {
 
     AdjustWindowHeightForRows(kMaxVisibleRows);
     InitializeTray();
-    RefreshBatteryData();
+    StartBluetoothDeviceWatcher();
+    RefreshBatteryData(true, false);
 }
 
 BatteryWindow::~BatteryWindow() {
     quitting_ = true;
+    StopBluetoothDeviceWatcher();
     if (refresh_worker_.joinable()) {
         if (refresh_worker_.get_id() == std::this_thread::get_id()) {
             refresh_worker_.detach();
@@ -2571,8 +2871,155 @@ void BatteryWindow::SetDeviceDragActive(bool active) {
 
     if (refresh_pending_ && !refresh_in_progress_.load(std::memory_order_acquire)) {
         refresh_pending_ = false;
-        QMetaObject::invokeMethod(this, [this]() { RefreshBatteryData(); }, Qt::QueuedConnection);
+        const bool next_include_disconnected = pending_include_disconnected_;
+        const bool next_preserve_disconnected_snapshot = pending_preserve_disconnected_snapshot_;
+        pending_include_disconnected_ = false;
+        pending_preserve_disconnected_snapshot_ = true;
+        QMetaObject::invokeMethod(
+            this,
+            [this, next_include_disconnected, next_preserve_disconnected_snapshot]() {
+                RefreshBatteryData(next_include_disconnected, next_preserve_disconnected_snapshot);
+            },
+            Qt::QueuedConnection);
     }
+}
+
+void BatteryWindow::StartBluetoothDeviceWatcher() {
+#ifdef _WIN32
+    try {
+        using winrt::Windows::Devices::Bluetooth::BluetoothConnectionStatus;
+        using winrt::Windows::Devices::Bluetooth::BluetoothDevice;
+        using winrt::Windows::Devices::Bluetooth::BluetoothLEDevice;
+        using winrt::Windows::Devices::Enumeration::DeviceInformation;
+
+        auto attach_watcher = [this](auto* watcher,
+                                     winrt::event_token* added_token,
+                                     winrt::event_token* updated_token,
+                                     winrt::event_token* removed_token,
+                                     const winrt::hstring& selector) {
+            *watcher = DeviceInformation::CreateWatcher(selector);
+            *added_token = watcher->Added([this](auto&&, const auto& info) {
+                ScheduleBluetoothDeviceRefresh(winrt::to_string(info.Id()), true);
+            });
+            *updated_token = watcher->Updated([this](auto&&, const auto& info) {
+                ScheduleBluetoothDeviceRefresh(winrt::to_string(info.Id()), true);
+            });
+            *removed_token = watcher->Removed([this](auto&&, const auto& info) {
+                ScheduleBluetoothDeviceRefresh(winrt::to_string(info.Id()), false);
+            });
+            watcher->Start();
+        };
+
+        attach_watcher(&bluetooth_classic_watcher_,
+                       &bluetooth_classic_added_token_,
+                       &bluetooth_classic_updated_token_,
+                       &bluetooth_classic_removed_token_,
+                       BluetoothDevice::GetDeviceSelectorFromConnectionStatus(BluetoothConnectionStatus::Connected));
+        attach_watcher(&bluetooth_le_watcher_,
+                       &bluetooth_le_added_token_,
+                       &bluetooth_le_updated_token_,
+                       &bluetooth_le_removed_token_,
+                       BluetoothLEDevice::GetDeviceSelectorFromConnectionStatus(BluetoothConnectionStatus::Connected));
+    } catch (...) {
+        bluetooth_classic_watcher_ = nullptr;
+        bluetooth_le_watcher_ = nullptr;
+    }
+#endif
+}
+
+void BatteryWindow::StopBluetoothDeviceWatcher() {
+#ifdef _WIN32
+    auto stop_watcher = [](auto* watcher,
+                           winrt::event_token added_token,
+                           winrt::event_token updated_token,
+                           winrt::event_token removed_token) {
+        if (*watcher == nullptr) {
+            return;
+        }
+        try {
+            watcher->Added(added_token);
+            watcher->Updated(updated_token);
+            watcher->Removed(removed_token);
+            watcher->Stop();
+        } catch (...) {
+        }
+        *watcher = nullptr;
+    };
+
+    stop_watcher(&bluetooth_classic_watcher_,
+                 bluetooth_classic_added_token_,
+                 bluetooth_classic_updated_token_,
+                 bluetooth_classic_removed_token_);
+    stop_watcher(&bluetooth_le_watcher_,
+                 bluetooth_le_added_token_,
+                 bluetooth_le_updated_token_,
+                 bluetooth_le_removed_token_);
+#endif
+}
+
+void BatteryWindow::ScheduleBluetoothDeviceRefresh(const std::string& changed_device_id, bool connected) {
+    QMetaObject::invokeMethod(
+        this,
+        [this, changed_device_id, connected]() {
+            if (quitting_) {
+                return;
+            }
+
+            const bool applied_locally = ApplyBluetoothDeviceConnectionChange(changed_device_id, connected);
+            if (applied_locally && !connected) {
+                return;
+            }
+
+            if (bluetooth_refresh_debounce_timer_ == nullptr) {
+                return;
+            }
+            // Connected devices need a discovery pass to pull fresh battery/mode data.
+            // Unknown devices also need it before later events can update only that row.
+            bluetooth_refresh_debounce_timer_->start();
+        },
+        Qt::QueuedConnection);
+}
+
+bool BatteryWindow::ApplyBluetoothDeviceConnectionChange(const std::string& changed_device_id, bool connected) {
+    if (changed_device_id.empty() || last_devices_snapshot_.empty()) {
+        return false;
+    }
+
+    auto devices = last_devices_snapshot_;
+    bool changed = false;
+    for (auto& device : devices) {
+        if (!DeviceIdsReferToSameBluetoothDevice(device.device_id, changed_device_id)) {
+            continue;
+        }
+        device.is_connected = connected;
+        if (!connected) {
+            device.battery_level_percent.reset();
+            device.device_mode.reset();
+            device.device_submode.reset();
+            device.is_cached = false;
+            last_live_update_.erase(device.device_id);
+            runtime_deadline_ms_by_device_.erase(device.device_id);
+            runtime_state_key_by_device_.erase(device.device_id);
+            runtime_deadline_ms_by_component_.erase(device.device_id);
+            runtime_state_key_by_component_.erase(device.device_id);
+        }
+        changed = true;
+    }
+
+    if (!changed) {
+        return false;
+    }
+
+    last_devices_snapshot_ = std::move(devices);
+    PopulateDeviceCards(last_devices_snapshot_);
+    UpdateTrayTooltip(last_devices_snapshot_);
+    if (status_label_ != nullptr) {
+        const auto now = QDateTime::currentDateTime();
+        status_label_->setText(
+            QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u043E \u0432 %1")
+                .arg(now.toString(QStringLiteral("HH:mm:ss"))));
+    }
+    return true;
 }
 
 void BatteryWindow::ApplyNoiseControlMode(const std::string& device_id, NoiseControlMode mode) {
@@ -2750,9 +3197,11 @@ void BatteryWindow::ShowNoiseSubmodeMenu(QWidget* anchor,
     menu.exec(anchor->mapToGlobal(QPoint(0, anchor->height())));
 }
 
-void BatteryWindow::RefreshBatteryData() {
+void BatteryWindow::RefreshBatteryData(bool include_disconnected, bool preserve_disconnected_snapshot) {
     if (drag_in_progress_) {
         refresh_pending_ = true;
+        pending_include_disconnected_ = pending_include_disconnected_ || include_disconnected;
+        pending_preserve_disconnected_snapshot_ = pending_preserve_disconnected_snapshot_ || preserve_disconnected_snapshot;
         status_label_->setText(QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435 "
                                                  u8"\u043E\u0442\u043B\u043E\u0436\u0435\u043D\u043E: "
                                                  u8"\u0438\u0434\u0451\u0442 \u043F\u0435\u0440\u0435\u0442\u0430\u0441\u043A\u0438\u0432\u0430\u043D\u0438\u0435"));
@@ -2761,6 +3210,8 @@ void BatteryWindow::RefreshBatteryData() {
 
     if (refresh_in_progress_.load(std::memory_order_acquire)) {
         refresh_pending_ = true;
+        pending_include_disconnected_ = pending_include_disconnected_ || include_disconnected;
+        pending_preserve_disconnected_snapshot_ = pending_preserve_disconnected_snapshot_ || preserve_disconnected_snapshot;
         status_label_->setText(QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435..."));
         return;
     }
@@ -2774,11 +3225,11 @@ void BatteryWindow::RefreshBatteryData() {
     show_all_button_->setEnabled(false);
     status_label_->setText(QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435..."));
 
-    refresh_worker_ = std::thread([this]() {
+    refresh_worker_ = std::thread([this, include_disconnected, preserve_disconnected_snapshot]() {
         RefreshTaskResult result;
         try {
             BatteryQueryOptions query_options;
-            query_options.include_disconnected = true;
+            query_options.include_disconnected = include_disconnected;
             result.devices = provider_->GetDevicesBattery(query_options);
 #ifdef _WIN32
         } catch (const winrt::hresult_error& error) {
@@ -2793,7 +3244,9 @@ void BatteryWindow::RefreshBatteryData() {
 
         QMetaObject::invokeMethod(
             this,
-            [this, result = std::move(result)]() mutable {
+            [this,
+             result = std::move(result),
+             preserve_disconnected_snapshot]() mutable {
                 refresh_in_progress_.store(false, std::memory_order_release);
 
                 if (quitting_) {
@@ -2813,6 +3266,23 @@ void BatteryWindow::RefreshBatteryData() {
                 }
 
                 if (result.error_text.isEmpty()) {
+                    if (preserve_disconnected_snapshot) {
+                        std::vector<DeviceBatteryInfo> merged_devices = result.devices;
+                        for (const auto& previous : last_devices_snapshot_) {
+                            if (previous.is_connected) {
+                                continue;
+                            }
+                            const bool replaced = std::any_of(
+                                merged_devices.begin(), merged_devices.end(),
+                                [&](const DeviceBatteryInfo& current) {
+                                    return DeviceIdsReferToSameBluetoothDevice(current.device_id, previous.device_id);
+                                });
+                            if (!replaced) {
+                                merged_devices.push_back(previous);
+                            }
+                        }
+                        result.devices = std::move(merged_devices);
+                    }
                     NotifyLowBatteryIfNeeded(result.devices);
                     RecordBatteryHistory(result.devices);
                     last_devices_snapshot_ = result.devices;
@@ -2850,8 +3320,12 @@ void BatteryWindow::RefreshBatteryData() {
                 UpdateToggleActionText();
 
                 if (refresh_pending_) {
+                    const bool next_include_disconnected = pending_include_disconnected_;
+                    const bool next_preserve_disconnected_snapshot = pending_preserve_disconnected_snapshot_;
                     refresh_pending_ = false;
-                    RefreshBatteryData();
+                    pending_include_disconnected_ = true;
+                    pending_preserve_disconnected_snapshot_ = false;
+                    RefreshBatteryData(next_include_disconnected, next_preserve_disconnected_snapshot);
                 }
             },
             Qt::QueuedConnection);
@@ -3080,7 +3554,7 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
             runtime_state_key_by_component_.erase(device.device_id);
         }
 
-        auto* progress = new QProgressBar(center_widget);
+        auto* progress = new SmoothProgressBar(center_widget);
         progress->setObjectName(QStringLiteral("deviceProgress"));
         progress->setRange(0, 100);
         progress->setTextVisible(false);
@@ -3091,7 +3565,7 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
         const QString percent_text = primary.level.has_value()
                                          ? QStringLiteral("%1%").arg(*primary.level)
                                          : QString::fromUtf8(u8"\u041D/\u0414");
-        auto* percent_chip = new QLabel(percent_text, center_widget);
+        auto* percent_chip = new SmoothPercentChip(percent_text, center_widget);
         percent_chip->setObjectName(QStringLiteral("percentChip"));
         percent_chip->setAlignment(Qt::AlignCenter);
         percent_chip->setMinimumWidth(44);
@@ -3109,8 +3583,7 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
         }
         if (!is_active) {
             const QString inactive_marker = QString::fromUtf8(u8"\u041D\u0435 \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u043E");
-            technical_text = technical_text.isEmpty() ? inactive_marker
-                                                      : technical_text + QStringLiteral("  \u00B7  ") + inactive_marker;
+            technical_text = inactive_marker;
         }
 
         auto* technical_label =
@@ -3154,14 +3627,14 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
             noise_layout->setSpacing(4);
 
             auto make_mode_button = [&](const QString& text, NoiseControlMode mode, const char* mode_name) {
-                auto* button = new QPushButton(text, noise_controls);
+                auto* button = new SmoothPushButton(text, noise_controls);
+                button->setProperty("smoothKind", QStringLiteral("noise"));
                 button->setMinimumHeight(24);
                 button->setMinimumWidth(74);
                 button->setCursor(Qt::PointingHandCursor);
                 const bool active_mode = NormalizeNoiseControlToken(*device.device_mode) == mode_name;
-                if (active_mode) {
-                    button->setStyleSheet(QStringLiteral("QPushButton { font-weight: 600; }"));
-                }
+                button->setProperty("activeMode", active_mode);
+                button->setStyleSheet(QStringLiteral("QPushButton { background: transparent; border: none; color: #F2F5FB; font-weight: 600; }"));
                 connect(button, &QPushButton::clicked, this, [this, device_id = device.device_id, mode]() {
                     ApplyNoiseControlMode(device_id, mode);
                 });
@@ -3187,8 +3660,9 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
             center_layout->addWidget(noise_controls);
         }
 
-        auto* actions_button = new QToolButton(row);
+        auto* actions_button = new SmoothToolButton(row);
         actions_button->setObjectName(QStringLiteral("inlineMenuButton"));
+        actions_button->setProperty("smoothKind", QStringLiteral("inline"));
         actions_button->setText(QString::fromUtf8(u8"\u22EF"));
         actions_button->setPopupMode(QToolButton::InstantPopup);
         actions_button->setToolTip(QString::fromUtf8(u8"\u0414\u0435\u0439\u0441\u0442\u0432\u0438\u044F"));
