@@ -230,7 +230,7 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
                         persisted_result.from_persistent_cache,
                         candidate.is_connected);
                     LogDebug(context.debug_log,
-                             "AEP fallback: persisted TWS snapshot used for '" +
+                             "AEP fallback: last successful live snapshot used for '" +
                                  ResolveCandidateDeviceName(candidate) + "'");
                     continue;
                 }
@@ -304,7 +304,7 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
                 resolved_readings = persisted_result.readings;
                 resolved_from_persistent_cache = persisted_result.from_persistent_cache;
                 LogDebug(context.debug_log,
-                         "AEP Xiaomi fallback: persisted TWS snapshot accepted for '" +
+                         "AEP Xiaomi fallback: last successful live snapshot accepted for '" +
                              candidate.endpoint_name + "'");
             }
         }

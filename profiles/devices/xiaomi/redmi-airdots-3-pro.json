@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "xiaomi.redmi_airdots_3_pro",
+  "displayName": "Redmi AirDots 3 Pro",
+  "platforms": ["windows"],
+  "vendor": "xiaomi",
+  "family": "xiaomi_earbuds",
+  "deviceCategories": ["tws"],
+  "match": {
+    "nameContains": ["Redmi AirDots 3 Pro", "AirDots 3 Pro"],
+    "deviceIdContains": ["bluetooth"]
+  },
+  "battery": {
+    "enabled": true,
+    "reader": "xiaomi_classic_fd2d",
+    "transport": "rfcomm"
+  },
+  "noiseControl": {
+    "enabled": true,
+    "strategy": "xiaomi_classic_fd2d"
+  }
+}

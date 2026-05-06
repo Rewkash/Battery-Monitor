@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "xiaomi.redmi_buds_4_pro",
+  "displayName": "Redmi Buds 4 Pro",
+  "platforms": ["windows"],
+  "vendor": "xiaomi",
+  "family": "xiaomi_earbuds",
+  "deviceCategories": ["tws"],
+  "match": {
+    "nameContains": ["Redmi Buds 4 Pro"],
+    "deviceIdContains": ["bluetooth"]
+  },
+  "battery": {
+    "enabled": true,
+    "reader": "xiaomi_classic_fd2d",
+    "transport": "rfcomm"
+  },
+  "noiseControl": {
+    "enabled": true,
+    "strategy": "xiaomi_classic_fd2d"
+  }
+}

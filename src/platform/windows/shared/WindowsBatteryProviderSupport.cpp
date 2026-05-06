@@ -16,6 +16,7 @@
 
 #include <winrt/Windows.Foundation.h>
 
+#include "core/DeviceProfiles.h"
 #include "platform/windows/devices/phone/BluetoothPnpHints.h"
 #include "platform/windows/shared/WindowsBluetoothAddressUtils.h"
 #include "platform/windows/devices/controller/WindowsControllerBatteryReader.h"
@@ -33,6 +34,59 @@ std::string ToLowerAscii(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(),
                    [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
     return value;
+}
+
+bool ReadBooleanEnvEqualsOne(const char* key, bool fallback);
+
+DeviceProfileQuery MakeWindowsDeviceProfileQuery(const std::string& primary_name,
+                                                 const std::string& secondary_name,
+                                                 const std::string& device_id) {
+    return DeviceProfileQuery{
+        .platform = "windows",
+        .primary_name = primary_name,
+        .secondary_name = secondary_name,
+        .device_id = device_id,
+    };
+}
+
+const LoadedDeviceProfiles& GetWindowsDeviceProfiles() {
+    static const LoadedDeviceProfiles& loaded_profiles = GetCachedDeviceProfiles();
+    static const bool logged = []() {
+        const auto& profiles = GetCachedDeviceProfiles();
+        if (!ReadBooleanEnvEqualsOne("BATTERY_MONITOR_DEBUG", false)) {
+            return true;
+        }
+
+        std::cerr << "[battery-monitor][debug] Device profiles directory: "
+                  << profiles.directory.string()
+                  << " loaded=" << profiles.profiles.size() << '\n';
+        for (const auto& warning : profiles.warnings) {
+            std::cerr << "[battery-monitor][debug] " << warning << '\n';
+        }
+        return true;
+    }();
+    (void)logged;
+    return loaded_profiles;
+}
+
+bool HasDeviceProfileFamily(const std::string& primary_name,
+                            const std::string& secondary_name,
+                            const std::string& device_id,
+                            const std::string& family) {
+    return AnyMatchingDeviceProfileHasFamily(
+        GetWindowsDeviceProfiles(),
+        MakeWindowsDeviceProfileQuery(primary_name, secondary_name, device_id),
+        family);
+}
+
+bool HasDeviceProfileCategory(const std::string& primary_name,
+                              const std::string& secondary_name,
+                              const std::string& device_id,
+                              const std::string& category) {
+    return AnyMatchingDeviceProfileHasCategory(
+        GetWindowsDeviceProfiles(),
+        MakeWindowsDeviceProfileQuery(primary_name, secondary_name, device_id),
+        category);
 }
 
 bool ReadBooleanEnvEqualsOne(const char* key, bool fallback) {
@@ -119,7 +173,8 @@ bool IsLikelyTwsDevice(const std::string& primary_name,
                        const std::string& device_id) {
     return LooksLikeTwsDeviceByName(primary_name) ||
            LooksLikeTwsDeviceByName(secondary_name) ||
-           LooksLikeTwsDeviceByName(device_id);
+           LooksLikeTwsDeviceByName(device_id) ||
+           HasDeviceProfileCategory(primary_name, secondary_name, device_id, "tws");
 }
 
 bool IsLikelyXiaomiEarbuds(const std::string& primary_name,
@@ -136,7 +191,8 @@ bool IsLikelyXiaomiEarbuds(const std::string& primary_name,
                                   probe.find("airdot") != std::string::npos ||
                                   probe.find("ear") != std::string::npos ||
                                   probe.find("pod") != std::string::npos;
-    return has_brand_hint && has_earbuds_hint;
+    return (has_brand_hint && has_earbuds_hint) ||
+           HasDeviceProfileFamily(primary_name, secondary_name, device_id, "xiaomi_earbuds");
 }
 
 bool IsLikelyPhoneDevice(const std::string& primary_name,
@@ -155,7 +211,8 @@ bool IsLikelyPhoneDevice(const std::string& primary_name,
     const bool generic_phone_hint =
         probe.find(" phone") != std::string::npos || probe.find("android") != std::string::npos;
     const bool earbuds_hint = LooksLikeTwsDeviceByName(probe);
-    return (likely_phone_brand || generic_phone_hint) && !earbuds_hint;
+    return ((likely_phone_brand || generic_phone_hint) && !earbuds_hint) ||
+           HasDeviceProfileCategory(primary_name, secondary_name, device_id, "phone");
 }
 
 bool IsLikelyGameControllerDevice(const std::string& primary_name,
@@ -170,7 +227,8 @@ bool IsLikelyGameControllerDevice(const std::string& primary_name,
            probe.find("xbox") != std::string::npos ||
            probe.find("playstation") != std::string::npos ||
            probe.find("ps4") != std::string::npos ||
-           probe.find("ps5") != std::string::npos;
+           probe.find("ps5") != std::string::npos ||
+           HasDeviceProfileCategory(primary_name, secondary_name, device_id, "controller");
 }
 
 bool ShouldAggressiveXiaomiClassicRetry(const std::string& primary_name,

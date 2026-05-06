@@ -22,6 +22,7 @@ endif()
 set(BATTERY_MONITOR_APP_SOURCES
     src/app/BatteryOutputFormatter.cpp
     src/app/CommandLineOptions.cpp
+    src/core/DeviceProfiles.cpp
     src/core/NoiseControlVocabulary.cpp
     src/main.cpp
     src/core/ProviderFactory.cpp

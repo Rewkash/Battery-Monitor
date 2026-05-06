@@ -219,7 +219,7 @@ void CollectBleCandidateBatteryEntries(const WindowsBleCandidateBatteryCollector
                     resolved_readings = persisted_result.readings;
                     resolved_from_persistent_cache = persisted_result.from_persistent_cache;
                     LogDebug(context.debug_log,
-                             "BLE Xiaomi fallback: persisted TWS snapshot accepted for '" + device_name + "'");
+                             "BLE Xiaomi fallback: last successful live snapshot accepted for '" + device_name + "'");
                 }
             }
 
