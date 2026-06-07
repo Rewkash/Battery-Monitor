@@ -1,9 +1,11 @@
 ﻿#include "platform/windows/shared/WindowsBleCandidateBatteryCollector.h"
 
 #include <chrono>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <winrt/Windows.Devices.Bluetooth.h>
@@ -15,6 +17,7 @@
 #include "platform/windows/bluetooth/BleStandardBatteryReader.h"
 #include "platform/windows/bluetooth/BleVendorTripletReader.h"
 #include "platform/windows/shared/WindowsBatteryEntryUtils.h"
+#include "platform/windows/shared/WindowsBatteryProviderSupport.h"
 #include "platform/windows/shared/WindowsBluetoothAddressUtils.h"
 #include "platform/windows/shared/WindowsDeviceInfoProperties.h"
 #include "platform/windows/devices/xiaomi/XiaomiBatteryReadings.h"
@@ -26,6 +29,11 @@ namespace {
 using winrt::Windows::Devices::Bluetooth::BluetoothConnectionStatus;
 using winrt::Windows::Devices::Bluetooth::BluetoothLEDevice;
 using winrt::Windows::Foundation::AsyncStatus;
+
+constexpr auto kEmptyBleCandidateBackoff = std::chrono::seconds(20);
+
+std::mutex g_empty_ble_candidate_mutex;
+std::unordered_map<std::string, std::chrono::steady_clock::time_point> g_empty_ble_candidate_until;
 
 std::string ToUtf8(const winrt::hstring& value) {
     return winrt::to_string(value);
@@ -40,10 +48,39 @@ std::string ToLowerAscii(std::string value) {
     return value;
 }
 
+bool IsLikelyZmiPurpodsProbe(const std::string& value) {
+    const std::string lowered = ToLowerAscii(value);
+    return lowered.find("zmi") != std::string::npos || lowered.find("purpods") != std::string::npos;
+}
+
 void LogDebug(XiaomiDebugLogFn debug_log, const std::string& message) {
     if (debug_log != nullptr) {
         debug_log(message);
     }
+}
+
+bool ShouldSkipRecentEmptyBleCandidate(const std::string& candidate_id) {
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(g_empty_ble_candidate_mutex);
+    const auto known = g_empty_ble_candidate_until.find(candidate_id);
+    if (known == g_empty_ble_candidate_until.end()) {
+        return false;
+    }
+    if (known->second <= now) {
+        g_empty_ble_candidate_until.erase(known);
+        return false;
+    }
+    return true;
+}
+
+void RememberEmptyBleCandidate(const std::string& candidate_id) {
+    std::lock_guard<std::mutex> lock(g_empty_ble_candidate_mutex);
+    g_empty_ble_candidate_until[candidate_id] = std::chrono::steady_clock::now() + kEmptyBleCandidateBackoff;
+}
+
+void ForgetEmptyBleCandidate(const std::string& candidate_id) {
+    std::lock_guard<std::mutex> lock(g_empty_ble_candidate_mutex);
+    g_empty_ble_candidate_until.erase(candidate_id);
 }
 
 template <typename TResult>
@@ -86,6 +123,17 @@ void CollectBleCandidateBatteryEntries(const WindowsBleCandidateBatteryCollector
     for (const auto& device_info : device_infos) {
         try {
             const std::string candidate_id = ToUtf8(device_info.Id());
+            if (!context.target_device_id.empty() &&
+                !DeviceIdMatchesBluetoothTarget(candidate_id, context.target_device_id)) {
+                continue;
+            }
+            if (ShouldSkipRecentEmptyBleCandidate(candidate_id)) {
+                if (context.debug_enabled) {
+                    LogDebug(context.debug_log,
+                             "BLE candidate skipped after recent empty read id='" + candidate_id + "'");
+                }
+                continue;
+            }
             if (context.debug_enabled) {
                 LogDebug(context.debug_log, "BLE candidate begin id='" + candidate_id + "'");
             }
@@ -104,6 +152,15 @@ void CollectBleCandidateBatteryEntries(const WindowsBleCandidateBatteryCollector
                 continue;
             }
             const auto ble_device = *maybe_ble_device;
+            const auto opened_ble_address = TryGetBluetoothAddress(ble_device);
+            if (opened_ble_address.has_value() &&
+                accumulator->AddressesWithRealBattery().contains(*opened_ble_address)) {
+                if (context.debug_enabled) {
+                    LogDebug(context.debug_log,
+                             "BLE candidate skipped because fast battery already exists id='" + candidate_id + "'");
+                }
+                continue;
+            }
             if (context.debug_enabled) {
                 const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - open_started_at);
@@ -125,15 +182,18 @@ void CollectBleCandidateBatteryEntries(const WindowsBleCandidateBatteryCollector
             const bool likely_tws =
                 context.is_likely_tws_device != nullptr &&
                 context.is_likely_tws_device(device_name, ble_name, device_id);
+            const std::string lowered_probe = ToLowerAscii(device_name + " " + ble_name + " " + device_id);
+            const bool likely_zmi = IsLikelyZmiPurpodsProbe(lowered_probe);
+            const bool target_is_likely_zmi = IsLikelyZmiPurpodsProbe(context.target_device_id);
             const bool likely_xiaomi_tws =
                 likely_tws &&
+                (likely_zmi || !target_is_likely_zmi) &&
                 context.is_likely_xiaomi_earbuds != nullptr &&
                 context.is_likely_xiaomi_earbuds(device_name, ble_name, device_id);
             const bool aggressive_xiaomi_retry =
                 context.should_aggressive_xiaomi_classic_retry != nullptr &&
                 context.should_aggressive_xiaomi_classic_retry(device_name, ble_name, device_id);
             if (context.debug_enabled) {
-                const std::string lowered_probe = ToLowerAscii(device_name + " " + ble_name + " " + device_id);
                 if (lowered_probe.find("redmi") != std::string::npos ||
                     lowered_probe.find("buds") != std::string::npos ||
                     lowered_probe.find("zmi") != std::string::npos ||
@@ -143,7 +203,21 @@ void CollectBleCandidateBatteryEntries(const WindowsBleCandidateBatteryCollector
                              "BLE device opened: name='" + device_name + "' bleName='" + ble_name + "' id='" + device_id +
                                  "' tws=" + (likely_tws ? "true" : "false") +
                                  " xiaomiTws=" + (likely_xiaomi_tws ? "true" : "false") +
-                                 " address=" + (ble_address.has_value() ? std::to_string(*ble_address) : "n/a"));
+                                  " address=" + (ble_address.has_value() ? std::to_string(*ble_address) : "n/a"));
+                }
+            }
+
+            if (context.debug_enabled) {
+                CaptureBleNotifyDebugSnapshot(
+                    ble_device,
+                    std::chrono::milliseconds(1600),
+                    context.debug_enabled,
+                    context.debug_log);
+                if (likely_zmi) {
+                    CaptureBleGattLayoutDebugSnapshot(
+                        ble_device,
+                        context.debug_enabled,
+                        context.debug_log);
                 }
             }
 
@@ -183,6 +257,15 @@ void CollectBleCandidateBatteryEntries(const WindowsBleCandidateBatteryCollector
                 } else {
                     LogDebug(context.debug_log,
                              "BLE Xiaomi fallback skipped because address could not be resolved for '" + device_name + "'");
+                }
+            }
+
+            if (resolved_readings.empty()) {
+                const auto fff1_readings = TryReadBleFff1Battery(ble_device, context.debug_enabled, context.debug_log);
+                if (!fff1_readings.empty()) {
+                    resolved_readings = fff1_readings;
+                    resolved_from_persistent_cache = false;
+                    LogDebug(context.debug_log, "BLE FFF1 fallback accepted for '" + device_name + "'");
                 }
             }
 
@@ -239,11 +322,11 @@ void CollectBleCandidateBatteryEntries(const WindowsBleCandidateBatteryCollector
 
             if (resolved_readings.empty()) {
                 if (context.debug_enabled) {
-                    const std::string lowered_probe = ToLowerAscii(device_name + " " + ble_name + " " + device_id);
-                    if (lowered_probe.find("redmi") != std::string::npos ||
-                        lowered_probe.find("buds") != std::string::npos ||
-                        lowered_probe.find("zmi") != std::string::npos ||
-                        lowered_probe.find("purpods") != std::string::npos) {
+                    const std::string lowered_probe_missing = ToLowerAscii(device_name + " " + ble_name + " " + device_id);
+                    if (lowered_probe_missing.find("redmi") != std::string::npos ||
+                        lowered_probe_missing.find("buds") != std::string::npos ||
+                        lowered_probe_missing.find("zmi") != std::string::npos ||
+                        lowered_probe_missing.find("purpods") != std::string::npos) {
                         LogDebug(context.debug_log, "BLE battery not found for '" + device_name + "'");
                     }
                 }
@@ -258,8 +341,11 @@ void CollectBleCandidateBatteryEntries(const WindowsBleCandidateBatteryCollector
                     unknown_entry.is_connected = ble_is_connected;
                     accumulator->AddEntry(std::move(unknown_entry));
                 }
+                RememberEmptyBleCandidate(candidate_id);
                 continue;
             }
+
+            ForgetEmptyBleCandidate(candidate_id);
 
             if (likely_xiaomi_tws &&
                 resolved_address_for_fallback.has_value() &&

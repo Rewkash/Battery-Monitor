@@ -96,8 +96,13 @@ std::vector<BatteryReading> TryReadXiaomiClassicBattery(std::uint64_t bluetooth_
     address.port = BT_PORT_ANY;
     std::string connected_path;
 
-    const bool connected = TryConnectServiceSocket(address, kXiaomiDeviceCtrlServiceUuid, "FD2D", 280,
-                                                   debug_enabled, debug_log, &socket_handle, &connected_path);
+    const bool connected =
+        TryConnectServiceSocket(address, kXiaomiDeviceCtrlServiceUuid, "FD2D", 280,
+                                debug_enabled, debug_log, &socket_handle, &connected_path) ||
+        TryConnectServiceSocket(address, kBluetoothSerialPortServiceUuid, "SPP-1101", 280,
+                                debug_enabled, debug_log, &socket_handle, &connected_path) ||
+        TryConnectServiceSocket(address, kZmiPurPodsSerialServiceUuid, "ZMI-1101", 280,
+                                debug_enabled, debug_log, &socket_handle, &connected_path);
     if (!connected) {
         return {};
     }

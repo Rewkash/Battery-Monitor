@@ -22,6 +22,7 @@ struct WindowsTwsCandidateBatteryCollectorContext {
     bool debug_enabled = false;
     XiaomiDebugLogFn debug_log = nullptr;
     bool include_disconnected = false;
+    std::string target_device_id;
     bool force_aep_scan = false;
     TwsDeviceHeuristicFn is_likely_xiaomi_earbuds = nullptr;
     TwsDeviceHeuristicFn should_aggressive_xiaomi_classic_retry = nullptr;

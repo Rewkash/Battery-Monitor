@@ -2,7 +2,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -39,7 +41,10 @@ class XiaomiClassicBatteryCache {
     int ttl_minutes_ = 180;
     bool debug_enabled_ = false;
     XiaomiDebugLogFn debug_log_ = nullptr;
+    std::mutex mutex_;
     std::unordered_map<std::uint64_t, XiaomiReadResult> cache_;
+    std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> last_failed_live_read_;
+    std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> live_read_in_progress_;
 };
 
 }  // namespace battery_monitor

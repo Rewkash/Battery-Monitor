@@ -14,7 +14,7 @@ struct BatteryWindowPersistedState {
 };
 
 inline constexpr int kBatteryWindowDefaultRefreshIntervalMs = 15000;
-inline constexpr int kBatteryWindowMinRefreshIntervalSeconds = 5;
+inline constexpr int kBatteryWindowMinRefreshIntervalSeconds = 1;
 inline constexpr int kBatteryWindowMaxRefreshIntervalSeconds = 600;
 inline constexpr int kBatteryWindowDefaultLowBatteryThresholdPercent = 10;
 inline constexpr int kBatteryWindowMinLowBatteryThresholdPercent = 1;

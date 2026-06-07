@@ -1,5 +1,6 @@
 ﻿#pragma once
 
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -12,6 +13,22 @@ namespace battery_monitor {
 using BleVendorTripletDebugLogFn = void (*)(const std::string&);
 
 std::vector<BatteryReading> TryReadBleVendorTripletBattery(
+    const winrt::Windows::Devices::Bluetooth::BluetoothLEDevice& device,
+    bool debug_enabled = false,
+    BleVendorTripletDebugLogFn debug_log = nullptr);
+
+std::vector<BatteryReading> TryReadBleFff1Battery(
+    const winrt::Windows::Devices::Bluetooth::BluetoothLEDevice& device,
+    bool debug_enabled = false,
+    BleVendorTripletDebugLogFn debug_log = nullptr);
+
+void CaptureBleNotifyDebugSnapshot(
+    const winrt::Windows::Devices::Bluetooth::BluetoothLEDevice& device,
+    std::chrono::milliseconds listen_window,
+    bool debug_enabled = false,
+    BleVendorTripletDebugLogFn debug_log = nullptr);
+
+void CaptureBleGattLayoutDebugSnapshot(
     const winrt::Windows::Devices::Bluetooth::BluetoothLEDevice& device,
     bool debug_enabled = false,
     BleVendorTripletDebugLogFn debug_log = nullptr);

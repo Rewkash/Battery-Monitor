@@ -8,7 +8,9 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -178,15 +180,23 @@ bool IsLikelyTwsDevice(const std::string& primary_name,
 }
 
 bool IsLikelyXiaomiEarbuds(const std::string& primary_name,
-                           const std::string& secondary_name,
-                           const std::string& device_id) {
+                            const std::string& secondary_name,
+                            const std::string& device_id) {
     const std::string probe = ToLowerAscii(primary_name + " " + secondary_name + " " + device_id);
+
+    // ZMI PurPods and other ZMI-branded earbuds do not speak the Xiaomi RFCOMM FD2D
+    // protocol. They use the standard BLE battery service instead. Exclude them from
+    // the Xiaomi TWS classification so the BLE standard path is used.
+    const bool is_zmi_family = probe.find("zmi") != std::string::npos ||
+                               probe.find("purpods") != std::string::npos;
+    if (is_zmi_family) {
+        return HasDeviceProfileFamily(primary_name, secondary_name, device_id, "xiaomi_earbuds");
+    }
+
     const bool has_brand_hint = probe.find("redmi") != std::string::npos ||
                                 probe.find("xiaomi") != std::string::npos ||
                                 probe.find("mi buds") != std::string::npos ||
-                                probe.find("airdots") != std::string::npos ||
-                                probe.find("zmi") != std::string::npos ||
-                                probe.find("purpods") != std::string::npos;
+                                probe.find("airdots") != std::string::npos;
     const bool has_earbuds_hint = probe.find("bud") != std::string::npos ||
                                   probe.find("airdot") != std::string::npos ||
                                   probe.find("ear") != std::string::npos ||
@@ -278,6 +288,20 @@ std::optional<std::uint8_t> ReadPhoneHfpBatteryHintFromPnpAdapter(std::uint64_t 
         &WindowsBatteryProviderDebugLog);
 }
 
+std::optional<std::uint8_t> ReadZmiVendorBatteryHintFromPnpAdapter(std::uint64_t address) {
+    return ReadZmiVendorBatteryHintFromPnpAddress(
+        address,
+        GetWindowsBatteryProviderRuntimeOptions().debug_enabled,
+        &WindowsBatteryProviderDebugLog);
+}
+
+bool IsLikelyZmiDevice(const std::string& primary_name,
+                        const std::string& secondary_name,
+                        const std::string& device_id) {
+    const std::string probe = ToLowerAscii(primary_name + " " + secondary_name + " " + device_id);
+    return probe.find("zmi") != std::string::npos || probe.find("purpods") != std::string::npos;
+}
+
 std::optional<std::uint8_t> ReadControllerBatteryCachedAdapter(const std::string& device_name,
                                                                const std::string& device_id) {
     return ReadControllerBatteryCached(
@@ -328,6 +352,28 @@ const WindowsBatteryProviderRuntimeOptions& GetWindowsBatteryProviderRuntimeOpti
 void WindowsBatteryProviderDebugLog(const std::string& message) {
     if (GetWindowsBatteryProviderRuntimeOptions().debug_enabled) {
         std::cerr << "[battery-monitor][debug] " << message << '\n';
+
+        static std::mutex log_mutex;
+        std::lock_guard<std::mutex> lock(log_mutex);
+
+        char* appdata = nullptr;
+        std::size_t length = 0;
+        const errno_t status = _dupenv_s(&appdata, &length, "APPDATA");
+        std::filesystem::path base_path = ".";
+        if (status == 0 && appdata != nullptr && std::string(appdata).size() > 0U) {
+            base_path = appdata;
+        }
+        free(appdata);
+
+        const auto diagnostics_dir = base_path / "battery-monitor" / "diagnostics";
+        std::error_code ec;
+        std::filesystem::create_directories(diagnostics_dir, ec);
+        const auto log_path = diagnostics_dir / "provider-debug.log";
+
+        std::ofstream stream(log_path.string(), std::ios::out | std::ios::app);
+        if (stream.is_open()) {
+            stream << "[battery-monitor][debug] " << message << '\n';
+        }
     }
 }
 
@@ -363,15 +409,19 @@ WindowsBatteryQueryReaderContext MakeWindowsBatteryQueryReaderContext() {
         .is_likely_game_controller_device = &IsLikelyGameControllerDevice,
         .looks_like_tws_device_by_name = &LooksLikeTwsDeviceByName,
         .read_phone_hfp_pnp_hint = &ReadPhoneHfpBatteryHintFromPnpAdapter,
+        .read_zmi_vendor_pnp_hint = &ReadZmiVendorBatteryHintFromPnpAdapter,
+        .is_likely_zmi_device = &IsLikelyZmiDevice,
         .read_controller_battery = &ReadControllerBatteryCachedAdapter,
     };
 }
 
-WindowsBleCandidateBatteryCollectorContext MakeWindowsBleCandidateBatteryCollectorContext() {
+WindowsBleCandidateBatteryCollectorContext MakeWindowsBleCandidateBatteryCollectorContext(
+    const std::string& target_device_id) {
     const auto& runtime_options = GetWindowsBatteryProviderRuntimeOptions();
     return WindowsBleCandidateBatteryCollectorContext{
         .debug_enabled = runtime_options.debug_enabled,
         .debug_log = &WindowsBatteryProviderDebugLog,
+        .target_device_id = target_device_id,
         .is_likely_tws_device = &IsLikelyTwsDevice,
         .is_likely_xiaomi_earbuds = &IsLikelyXiaomiEarbuds,
         .should_aggressive_xiaomi_classic_retry = &ShouldAggressiveXiaomiClassicRetry,
@@ -379,12 +429,14 @@ WindowsBleCandidateBatteryCollectorContext MakeWindowsBleCandidateBatteryCollect
 }
 
 WindowsTwsCandidateBatteryCollectorContext MakeWindowsTwsCandidateBatteryCollectorContext(
-    bool include_disconnected) {
+    bool include_disconnected,
+    const std::string& target_device_id) {
     const auto& runtime_options = GetWindowsBatteryProviderRuntimeOptions();
     return WindowsTwsCandidateBatteryCollectorContext{
         .debug_enabled = runtime_options.debug_enabled,
         .debug_log = &WindowsBatteryProviderDebugLog,
         .include_disconnected = include_disconnected,
+        .target_device_id = target_device_id,
         .force_aep_scan = runtime_options.force_aep_scan,
         .is_likely_xiaomi_earbuds = &IsLikelyXiaomiEarbuds,
         .should_aggressive_xiaomi_classic_retry = &ShouldAggressiveXiaomiClassicRetry,
@@ -454,6 +506,33 @@ std::optional<BluetoothLEDevice> TryOpenBleDeviceByAddress(std::uint64_t address
     return std::nullopt;
 }
 
+bool DeviceIdMatchesBluetoothTarget(std::string_view device_id, std::string_view target_device_id) {
+    if (device_id.empty() || target_device_id.empty()) {
+        return false;
+    }
+    if (device_id == target_device_id) {
+        return true;
+    }
+
+    const auto device_address = ParseBluetoothAddressFromDeviceId(std::string(device_id));
+    const auto target_address = ParseBluetoothAddressFromDeviceId(std::string(target_device_id));
+    if (device_address.has_value() && target_address.has_value()) {
+        return *device_address == *target_address;
+    }
+
+    // If exactly one side has a resolved Bluetooth address, avoid fuzzy substring
+    // matching. Substring matching can falsely match by local adapter address prefix
+    // (for example, different remote devices behind the same host adapter id).
+    if (device_address.has_value() != target_address.has_value()) {
+        return false;
+    }
+
+    const std::string lowered_device_id = ToLowerAscii(std::string(device_id));
+    const std::string lowered_target_id = ToLowerAscii(std::string(target_device_id));
+    return lowered_device_id.find(lowered_target_id) != std::string::npos ||
+           lowered_target_id.find(lowered_device_id) != std::string::npos;
+}
+
 std::optional<ResolvedBluetoothTarget> ResolveConnectedXiaomiControlTarget(
     IBluetoothBatteryProvider* provider,
     const std::string& device_hint) {
@@ -473,4 +552,3 @@ std::optional<ResolvedBluetoothTarget> ResolveConnectedXiaomiControlTarget(
 }
 
 }  // namespace battery_monitor
-

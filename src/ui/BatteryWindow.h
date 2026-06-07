@@ -45,6 +45,7 @@ namespace battery_monitor {
 
 class BatteryHistoryDialog;
 class BatteryStatsDialog;
+class DeviceDiagnosticsDialog;
 
 class BatteryWindow : public QWidget {
    public:
@@ -58,7 +59,9 @@ class BatteryWindow : public QWidget {
     void paintEvent(QPaintEvent* event) override;
 
    private:
-    void RefreshBatteryData(bool include_disconnected = false, bool preserve_disconnected_snapshot = true);
+     void RefreshBatteryData(bool include_disconnected = false, bool preserve_disconnected_snapshot = true);
+     void RefreshBatteryDataFromUser();
+     void RefreshBatteryDataForDevice(const std::string& device_id);
     void PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& devices);
     void ClearDeviceCards();
     void InitializeTray();
@@ -72,6 +75,7 @@ class BatteryWindow : public QWidget {
     void RecordBatteryHistory(const std::vector<DeviceBatteryInfo>& devices);
     void ShowBatteryHistory(const std::string& device_id, const std::string& fallback_name);
     void ShowBatteryStats(const std::string& device_id, const std::string& fallback_name);
+    void ShowDeviceDiagnostics(const std::string& device_id);
     void AdjustWindowHeightForRows(int visible_rows);
     void ApplyRefreshIntervalSeconds(int seconds, bool announce_status);
     void ApplyLowBatteryThresholdPercent(int percent, bool announce_status);
@@ -130,11 +134,13 @@ class BatteryWindow : public QWidget {
     std::unordered_map<std::string, QDateTime> last_live_update_;
     std::vector<std::string> connected_device_order_;
     std::vector<std::string> disconnected_device_order_;
+    std::string pending_bluetooth_refresh_device_id_;
     std::vector<DeviceBatteryInfo> last_devices_snapshot_;
     std::unordered_map<std::string, std::uint8_t> last_live_component_levels_;
     std::unordered_map<std::string, std::int64_t> last_low_battery_alert_ms_;
     std::unordered_map<std::string, QPointer<BatteryHistoryDialog>> history_dialogs_;
     std::unordered_map<std::string, QPointer<BatteryStatsDialog>> stats_dialogs_;
+    std::unordered_map<std::string, QPointer<DeviceDiagnosticsDialog>> diagnostics_dialogs_;
     std::vector<QPointer<QLabel>> runtime_labels_;
     std::unordered_map<std::string, qint64> runtime_deadline_ms_by_device_;
     std::unordered_map<std::string, std::string> runtime_state_key_by_device_;

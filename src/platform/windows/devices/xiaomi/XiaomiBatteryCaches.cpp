@@ -1,6 +1,7 @@
 ﻿#include "platform/windows/devices/xiaomi/XiaomiBatteryCaches.h"
 
 #include <chrono>
+#include <mutex>
 #include <thread>
 #include <utility>
 
@@ -11,6 +12,8 @@
 namespace battery_monitor {
 
 namespace {
+
+constexpr auto kFailedClassicLiveReadBackoff = std::chrono::seconds(10);
 
 void LogDebug(XiaomiDebugLogFn debug_log, const std::string& message) {
     if (debug_log != nullptr) {
@@ -34,17 +37,9 @@ XiaomiClassicBatteryCache::XiaomiClassicBatteryCache(bool persist_write_enabled,
       debug_log_(debug_log) {}
 
 const XiaomiReadResult& XiaomiClassicBatteryCache::Read(std::uint64_t address,
-                                                        bool aggressive_retry,
-                                                        std::size_t min_tws_components) {
-    auto found = cache_.find(address);
-    const bool has_cached_result = found != cache_.end();
-
-    XiaomiReadResult read_result;
-    auto readings = TryReadXiaomiClassicBattery(
-        address,
-        &PutXiaomiModeCacheEntry,
-        debug_enabled_,
-        debug_log_);
+                                                         bool aggressive_retry,
+                                                         std::size_t min_tws_components) {
+    const auto now = std::chrono::steady_clock::now();
     const auto is_sufficient = [&](const std::vector<BatteryReading>& candidate_readings) {
         if (candidate_readings.empty()) {
             return false;
@@ -55,7 +50,46 @@ const XiaomiReadResult& XiaomiClassicBatteryCache::Read(std::uint64_t address,
         return XiaomiResolvedTwsComponentCount(candidate_readings) >= min_tws_components;
     };
 
-    if (aggressive_retry && !is_sufficient(readings)) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = cache_.find(address);
+        const bool has_cached_result = found != cache_.end();
+        if (has_cached_result && is_sufficient(found->second.readings)) {
+            return found->second;
+        }
+        if (const auto in_progress = live_read_in_progress_.find(address);
+            in_progress != live_read_in_progress_.end()) {
+            LogDebug(debug_log_,
+                     "Xiaomi classic fallback: skipping live read already in progress for address=" +
+                         std::to_string(address));
+            if (has_cached_result) {
+                return found->second;
+            }
+            auto inserted = cache_.emplace(address, XiaomiReadResult{});
+            return inserted.first->second;
+        }
+        if (const auto failed = last_failed_live_read_.find(address);
+            failed != last_failed_live_read_.end() && now - failed->second < kFailedClassicLiveReadBackoff) {
+            LogDebug(debug_log_,
+                     "Xiaomi classic fallback: skipping recent failed live read for address=" +
+                         std::to_string(address));
+            if (has_cached_result) {
+                return found->second;
+            }
+            auto inserted = cache_.emplace(address, XiaomiReadResult{});
+            return inserted.first->second;
+        }
+
+        live_read_in_progress_[address] = now;
+    }
+
+    XiaomiReadResult read_result;
+    auto readings = TryReadXiaomiClassicBattery(
+        address,
+        &PutXiaomiModeCacheEntry,
+        debug_enabled_,
+        debug_log_);
+    if (aggressive_retry && !readings.empty() && !is_sufficient(readings)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(180));
         auto retried = TryReadXiaomiClassicBattery(
             address,
@@ -66,7 +100,7 @@ const XiaomiReadResult& XiaomiClassicBatteryCache::Read(std::uint64_t address,
             readings = std::move(retried);
         }
     }
-    if (aggressive_retry && !is_sufficient(readings)) {
+    if (aggressive_retry && !readings.empty() && !is_sufficient(readings)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(260));
         auto retried = TryReadXiaomiClassicBattery(
             address,
@@ -83,6 +117,16 @@ const XiaomiReadResult& XiaomiClassicBatteryCache::Read(std::uint64_t address,
         read_result.from_persistent_cache = false;
     }
 
+    std::lock_guard<std::mutex> lock(mutex_);
+    live_read_in_progress_.erase(address);
+    if (!readings.empty()) {
+        last_failed_live_read_.erase(address);
+    } else {
+        last_failed_live_read_[address] = std::chrono::steady_clock::now();
+    }
+
+    auto found = cache_.find(address);
+    const bool has_cached_result = found != cache_.end();
     if (has_cached_result) {
         if (XiaomiReadingsRichnessScore(found->second.readings) >
             XiaomiReadingsRichnessScore(read_result.readings)) {

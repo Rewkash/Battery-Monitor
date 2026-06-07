@@ -20,6 +20,53 @@
 
 namespace battery_monitor {
 
+namespace {
+
+std::string BatteryPercentText(const std::optional<std::uint8_t>& value) {
+    if (!value.has_value()) {
+        return "na";
+    }
+    return std::to_string(*value);
+}
+
+void LogProviderEntry(const std::string& prefix, const DeviceBatteryInfo& entry) {
+    WindowsBatteryProviderDebugLog(
+        prefix + " name='" + entry.device_name + "' component='" + entry.battery_component +
+        "' battery=" + BatteryPercentText(entry.battery_level_percent) +
+        " connected=" + (entry.is_connected ? "true" : "false") +
+        " cached=" + (entry.is_cached ? "true" : "false") +
+        " id='" + entry.device_id + "'");
+}
+
+void LogProviderEntriesSince(const std::string& stage,
+                             const std::vector<DeviceBatteryInfo>& entries,
+                             std::size_t first_index) {
+    WindowsBatteryProviderDebugLog(
+        stage + " added=" + std::to_string(entries.size() - std::min(first_index, entries.size())) +
+        " total=" + std::to_string(entries.size()));
+    for (std::size_t i = first_index; i < entries.size(); ++i) {
+        LogProviderEntry(stage + " entry", entries[i]);
+    }
+}
+
+void LogProviderEntries(const std::string& stage, const std::vector<DeviceBatteryInfo>& entries) {
+    WindowsBatteryProviderDebugLog(stage + " count=" + std::to_string(entries.size()));
+    for (const auto& entry : entries) {
+        LogProviderEntry(stage + " entry", entry);
+    }
+}
+
+}  // namespace
+
+WinRtBatteryProvider::WinRtBatteryProvider()
+    : xiaomi_classic_cache_(
+          GetWindowsBatteryProviderRuntimeOptions().persistent_xiaomi_cache_write_enabled,
+          GetWindowsBatteryProviderRuntimeOptions().persistent_xiaomi_cache_read_enabled,
+          GetWindowsBatteryProviderRuntimeOptions().xiaomi_cache_file_path,
+          GetWindowsBatteryProviderRuntimeOptions().xiaomi_cache_ttl_minutes,
+          GetWindowsBatteryProviderRuntimeOptions().debug_enabled,
+          &WindowsBatteryProviderDebugLog) {}
+
 std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const BatteryQueryOptions& options) {
     EnsureWindowsBatteryProviderApartmentInitialized();
     const auto& runtime_options = GetWindowsBatteryProviderRuntimeOptions();
@@ -31,38 +78,38 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
             device_accumulator.AddEntry(std::move(entry));
         };
 
-        XiaomiClassicBatteryCache xiaomi_classic_cache(
-            runtime_options.persistent_xiaomi_cache_write_enabled,
-            runtime_options.persistent_xiaomi_cache_read_enabled,
-            runtime_options.xiaomi_cache_file_path,
-            runtime_options.xiaomi_cache_ttl_minutes,
-            runtime_options.debug_enabled,
-            &WindowsBatteryProviderDebugLog);
-
-        CollectBleCandidateBatteryEntries(
-            MakeWindowsBleCandidateBatteryCollectorContext(),
-            &device_accumulator,
-            &xiaomi_classic_cache);
+        const bool has_target = !options.target_device_id.empty();
 
         try {
+            const std::size_t before_tws = device_accumulator.Entries().size();
             CollectTwsCandidateBatteryEntries(
-                MakeWindowsTwsCandidateBatteryCollectorContext(options.include_disconnected),
+                MakeWindowsTwsCandidateBatteryCollectorContext(options.include_disconnected, options.target_device_id),
                 query_reader_context,
                 &device_accumulator,
-                &xiaomi_classic_cache);
+                &xiaomi_classic_cache_);
+            LogProviderEntriesSince("Provider stage TWS", device_accumulator.Entries(), before_tws);
         } catch (const winrt::hresult_error&) {
             // Endpoint properties and endpoint BLE mapping are optional.
         }
 
-        const bool run_generic_scan = runtime_options.generic_scan_enabled || device_accumulator.Empty();
+        const std::size_t before_ble = device_accumulator.Entries().size();
+        CollectBleCandidateBatteryEntries(
+            MakeWindowsBleCandidateBatteryCollectorContext(options.target_device_id),
+            &device_accumulator,
+            &xiaomi_classic_cache_);
+        LogProviderEntriesSince("Provider stage BLE", device_accumulator.Entries(), before_ble);
+
+        const bool run_generic_scan = !has_target && (runtime_options.generic_scan_enabled || device_accumulator.Empty());
         if (run_generic_scan) {
             try {
                 const auto generic_entries = ReadGenericDeviceBattery(query_reader_context);
                 WindowsBatteryProviderDebugLog(
                     "Generic battery entries: " + std::to_string(generic_entries.size()));
+                const std::size_t before_generic = device_accumulator.Entries().size();
                 for (const auto& generic_entry : generic_entries) {
                     try_add_entry(generic_entry);
                 }
+                LogProviderEntriesSince("Provider stage generic", device_accumulator.Entries(), before_generic);
             } catch (const winrt::hresult_error&) {
                 // Generic device battery properties may be unavailable.
             }
@@ -72,11 +119,12 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
         }
 
         DisconnectedPairedCollection paired_collection;
-        if (options.include_disconnected) {
+        if (options.include_disconnected && !has_target) {
             try {
                 paired_collection = CollectDisconnectedPairedBluetoothEntries(
                     runtime_options.debug_enabled,
                     &WindowsBatteryProviderDebugLog);
+                const std::size_t before_disconnected = device_accumulator.Entries().size();
                 for (auto& entry : paired_collection.offline_entries) {
                     const auto entry_address = ParseBluetoothAddressFromDeviceId(entry.device_id);
                     const bool already_known = std::any_of(
@@ -96,19 +144,25 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
                     }
                     try_add_entry(std::move(entry));
                 }
+                LogProviderEntriesSince(
+                    "Provider stage disconnected", device_accumulator.Entries(), before_disconnected);
             } catch (const winrt::hresult_error&) {
                 // Paired fallback for disconnected devices is best-effort.
             }
         }
 
         auto devices_with_battery = device_accumulator.TakeEntries();
+        LogProviderEntries("Provider before PnP hints", devices_with_battery);
         ApplyPnpVisualHints(&devices_with_battery);
+        LogProviderEntries("Provider before final", devices_with_battery);
         const PairedBluetoothSnapshot* paired_snapshot =
             paired_collection.snapshot.loaded ? &paired_collection.snapshot : nullptr;
-        return FinalizeCollectedEntries(
+        auto finalized_entries = FinalizeCollectedEntries(
             std::move(devices_with_battery),
             options.include_disconnected,
             paired_snapshot);
+        LogProviderEntries("Provider final", finalized_entries);
+        return finalized_entries;
     } catch (const winrt::hresult_error& error) {
         WindowsBatteryProviderDebugLog(
             "GetConnectedDevicesBattery failed with WinRT error: " +

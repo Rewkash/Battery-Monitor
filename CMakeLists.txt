@@ -161,6 +161,8 @@ if(BATTERY_MONITOR_QT_ENABLED)
             src/ui/BatteryStatsDialog.h
             src/ui/DraggableDeviceRow.cpp
             src/ui/DraggableDeviceRow.h
+            src/ui/DeviceDiagnosticsDialog.cpp
+            src/ui/DeviceDiagnosticsDialog.h
             src/ui/NoiseControlUi.cpp
             src/ui/NoiseControlUi.h
             src/ui/BatteryWindow.cpp

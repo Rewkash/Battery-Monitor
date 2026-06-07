@@ -1,7 +1,9 @@
 ﻿#include "platform/windows/bluetooth/BleVendorTripletReader.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -21,6 +23,7 @@ namespace {
 using winrt::Windows::Devices::Bluetooth::BluetoothCacheMode;
 using winrt::Windows::Devices::Bluetooth::BluetoothLEDevice;
 using winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattCharacteristicProperties;
+using winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattClientCharacteristicConfigurationDescriptorValue;
 using winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattCommunicationStatus;
 using winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattServiceUuids;
 using winrt::Windows::Foundation::AsyncStatus;
@@ -59,6 +62,24 @@ std::string BytesToHex(const std::vector<std::uint8_t>& bytes) {
         output.push_back(' ');
     }
     return output;
+}
+
+std::string TrimmedHexPrefix(const std::vector<std::uint8_t>& bytes, std::size_t max_bytes) {
+    if (bytes.empty()) {
+        return {};
+    }
+
+    const std::size_t to_take = std::min(max_bytes, bytes.size());
+    std::vector<std::uint8_t> prefix;
+    prefix.reserve(to_take);
+    for (std::size_t i = 0; i < to_take; ++i) {
+        prefix.push_back(bytes[i]);
+    }
+    std::string hex = BytesToHex(prefix);
+    if (bytes.size() > to_take) {
+        hex += "...";
+    }
+    return hex;
 }
 
 std::vector<std::uint8_t> ReadBufferBytes(const winrt::Windows::Storage::Streams::IBuffer& buffer) {
@@ -278,6 +299,217 @@ std::vector<BatteryReading> TryReadBleVendorTripletBattery(const BluetoothLEDevi
     readings.push_back(BatteryReading{"case", best_triplet[2]});
 
     return readings;
+}
+
+std::vector<BatteryReading> TryReadBleFff1Battery(const BluetoothLEDevice& device,
+                                                  bool debug_enabled,
+                                                  BleVendorTripletDebugLogFn debug_log) {
+    std::vector<BatteryReading> readings;
+
+    const auto services_result =
+        WaitForAsyncResult(device.GetGattServicesAsync(), std::chrono::milliseconds(1500));
+    if (!services_result.has_value() || services_result->Status() != GattCommunicationStatus::Success) {
+        return readings;
+    }
+
+    const std::string target_service = "{0000fff0-0000-1000-8000-00805f9b34fb}";
+    const std::string target_char = "{0000fff1-0000-1000-8000-00805f9b34fb}";
+
+    for (const auto& service : services_result->Services()) {
+        const std::string service_uuid = ToLowerAscii(ToUtf8(winrt::to_hstring(service.Uuid())));
+        if (service_uuid != target_service) {
+            continue;
+        }
+
+        const auto characteristics_result =
+            WaitForAsyncResult(service.GetCharacteristicsAsync(), std::chrono::milliseconds(1200));
+        if (!characteristics_result.has_value() ||
+            characteristics_result->Status() != GattCommunicationStatus::Success) {
+            continue;
+        }
+
+        for (const auto& characteristic : characteristics_result->Characteristics()) {
+            const std::string characteristic_uuid = ToLowerAscii(ToUtf8(winrt::to_hstring(characteristic.Uuid())));
+            if (characteristic_uuid != target_char) {
+                continue;
+            }
+
+            const auto read_result =
+                WaitForAsyncResult(characteristic.ReadValueAsync(BluetoothCacheMode::Uncached),
+                                   std::chrono::milliseconds(900));
+            auto resolved_read_result = read_result;
+            if (!resolved_read_result.has_value() ||
+                resolved_read_result->Status() != GattCommunicationStatus::Success) {
+                resolved_read_result = WaitForAsyncResult(
+                    characteristic.ReadValueAsync(BluetoothCacheMode::Cached),
+                    std::chrono::milliseconds(900));
+            }
+            if (!resolved_read_result.has_value() ||
+                resolved_read_result->Status() != GattCommunicationStatus::Success) {
+                continue;
+            }
+
+            const auto bytes = ReadBufferBytes(resolved_read_result->Value());
+            LogDebug(debug_enabled,
+                     debug_log,
+                     "FFF1 read len=" + std::to_string(bytes.size()) +
+                         " data=" + TrimmedHexPrefix(bytes, 48));
+
+            std::optional<std::uint8_t> best_percent;
+            for (const auto value : bytes) {
+                if (value <= 100U) {
+                    if (!best_percent.has_value() || value > *best_percent) {
+                        best_percent = value;
+                    }
+                }
+            }
+
+            if (best_percent.has_value()) {
+                readings.push_back(BatteryReading{"main", *best_percent});
+                LogDebug(debug_enabled,
+                         debug_log,
+                         "FFF1 battery candidate accepted: " + std::to_string(*best_percent));
+                return readings;
+            }
+        }
+    }
+
+    return readings;
+}
+
+void CaptureBleNotifyDebugSnapshot(const BluetoothLEDevice& device,
+                                   std::chrono::milliseconds listen_window,
+                                   bool debug_enabled,
+                                   BleVendorTripletDebugLogFn debug_log) {
+    const auto services_result =
+        WaitForAsyncResult(device.GetGattServicesAsync(), std::chrono::milliseconds(1500));
+    if (!services_result.has_value() || services_result->Status() != GattCommunicationStatus::Success) {
+        LogDebug(debug_enabled, debug_log, "BLE notify debug: GetGattServicesAsync failed");
+        return;
+    }
+
+    std::vector<winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattCharacteristic> subscriptions;
+    std::vector<winrt::event_token> tokens;
+    std::atomic<int> events_seen{0};
+
+    for (const auto& service : services_result->Services()) {
+        const auto service_uuid = ToLowerAscii(ToUtf8(winrt::to_hstring(service.Uuid())));
+        if (service.Uuid() == GattServiceUuids::Battery() || IsLikelyStandardServiceForMetadata(service_uuid)) {
+            continue;
+        }
+
+        const auto characteristics_result =
+            WaitForAsyncResult(service.GetCharacteristicsAsync(), std::chrono::milliseconds(1200));
+        if (!characteristics_result.has_value() ||
+            characteristics_result->Status() != GattCommunicationStatus::Success) {
+            continue;
+        }
+
+        for (const auto& characteristic : characteristics_result->Characteristics()) {
+            const auto properties = characteristic.CharacteristicProperties();
+            const bool can_notify =
+                (properties & GattCharacteristicProperties::Notify) == GattCharacteristicProperties::Notify;
+            const bool can_indicate =
+                (properties & GattCharacteristicProperties::Indicate) == GattCharacteristicProperties::Indicate;
+            if (!can_notify && !can_indicate) {
+                continue;
+            }
+
+            const std::string characteristic_uuid = ToLowerAscii(ToUtf8(winrt::to_hstring(characteristic.Uuid())));
+            LogDebug(debug_enabled,
+                     debug_log,
+                     "BLE notify debug: subscribe service=" + service_uuid + " char=" + characteristic_uuid);
+
+            const auto token = characteristic.ValueChanged([debug_enabled, debug_log, service_uuid, characteristic_uuid, &events_seen](auto&&, auto&& args) {
+                const auto bytes = ReadBufferBytes(args.CharacteristicValue());
+                const int event_index = ++events_seen;
+                LogDebug(debug_enabled,
+                         debug_log,
+                         "BLE notify debug: event #" + std::to_string(event_index) +
+                             " service=" + service_uuid +
+                             " char=" + characteristic_uuid +
+                             " len=" + std::to_string(bytes.size()) +
+                             " data=" + TrimmedHexPrefix(bytes, 40));
+            });
+
+            auto cccd_value = GattClientCharacteristicConfigurationDescriptorValue::Notify;
+            if (!can_notify && can_indicate) {
+                cccd_value = GattClientCharacteristicConfigurationDescriptorValue::Indicate;
+            }
+            const auto cccd_result = WaitForAsyncResult(
+                characteristic.WriteClientCharacteristicConfigurationDescriptorAsync(cccd_value),
+                std::chrono::milliseconds(900));
+            if (!cccd_result.has_value() || *cccd_result != GattCommunicationStatus::Success) {
+                characteristic.ValueChanged(token);
+                continue;
+            }
+
+            subscriptions.push_back(characteristic);
+            tokens.push_back(token);
+        }
+    }
+
+    if (subscriptions.empty()) {
+        LogDebug(debug_enabled, debug_log, "BLE notify debug: no subscribable characteristics");
+        return;
+    }
+
+    if (listen_window.count() < 200) {
+        listen_window = std::chrono::milliseconds(200);
+    }
+    std::this_thread::sleep_for(listen_window);
+
+    for (std::size_t i = 0; i < subscriptions.size(); ++i) {
+        auto& ch = subscriptions[i];
+        ch.WriteClientCharacteristicConfigurationDescriptorAsync(
+            GattClientCharacteristicConfigurationDescriptorValue::None);
+        ch.ValueChanged(tokens[i]);
+    }
+
+    LogDebug(debug_enabled,
+             debug_log,
+             "BLE notify debug: done, events=" + std::to_string(events_seen.load()));
+}
+
+void CaptureBleGattLayoutDebugSnapshot(const BluetoothLEDevice& device,
+                                       bool debug_enabled,
+                                       BleVendorTripletDebugLogFn debug_log) {
+    const auto services_result =
+        WaitForAsyncResult(device.GetGattServicesAsync(), std::chrono::milliseconds(1500));
+    if (!services_result.has_value() || services_result->Status() != GattCommunicationStatus::Success) {
+        LogDebug(debug_enabled, debug_log, "BLE GATT debug: GetGattServicesAsync failed");
+        return;
+    }
+
+    const auto services = services_result->Services();
+    LogDebug(debug_enabled,
+             debug_log,
+             "BLE GATT debug: services=" + std::to_string(services.Size()));
+
+    for (const auto& service : services) {
+        const std::string service_uuid = ToLowerAscii(ToUtf8(winrt::to_hstring(service.Uuid())));
+        const auto characteristics_result =
+            WaitForAsyncResult(service.GetCharacteristicsAsync(), std::chrono::milliseconds(1200));
+        if (!characteristics_result.has_value() ||
+            characteristics_result->Status() != GattCommunicationStatus::Success) {
+            LogDebug(debug_enabled, debug_log, "BLE GATT debug: service=" + service_uuid + " characteristics read failed");
+            continue;
+        }
+
+        const auto characteristics = characteristics_result->Characteristics();
+        LogDebug(debug_enabled,
+                 debug_log,
+                 "BLE GATT debug: service=" + service_uuid + " characteristics=" + std::to_string(characteristics.Size()));
+
+        for (const auto& characteristic : characteristics) {
+            const std::string characteristic_uuid = ToLowerAscii(ToUtf8(winrt::to_hstring(characteristic.Uuid())));
+            const auto properties = characteristic.CharacteristicProperties();
+            LogDebug(debug_enabled,
+                     debug_log,
+                     "BLE GATT debug: char=" + characteristic_uuid +
+                         " props=" + std::to_string(static_cast<unsigned int>(properties)));
+        }
+    }
 }
 
 }  // namespace battery_monitor

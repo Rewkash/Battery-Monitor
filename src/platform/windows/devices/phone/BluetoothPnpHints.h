@@ -17,8 +17,11 @@ struct PnpBluetoothVisualHints {
 
 std::optional<PnpBluetoothVisualHints> ReadBluetoothVisualHintsFromPnpAddress(std::uint64_t address);
 std::optional<std::uint8_t> ReadPhoneHfpBatteryHintFromPnpAddress(std::uint64_t address,
-                                                                  bool debug_enabled = false,
-                                                                  XiaomiDebugLogFn debug_log = nullptr);
+                                                                   bool debug_enabled = false,
+                                                                   XiaomiDebugLogFn debug_log = nullptr);
+std::optional<std::uint8_t> ReadZmiVendorBatteryHintFromPnpAddress(std::uint64_t address,
+                                                                    bool debug_enabled = false,
+                                                                    XiaomiDebugLogFn debug_log = nullptr);
 
 }  // namespace battery_monitor
 

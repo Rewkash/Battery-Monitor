@@ -24,54 +24,18 @@ void MaybeDebugLog(bool debug_enabled, XiaomiDebugLogFn debug_log, const std::st
     }
 }
 
-void MergeSnapshotCandidate(std::optional<XiaomiBatterySnapshot>* target,
-                            const std::optional<XiaomiBatterySnapshot>& candidate) {
-    if (target == nullptr || !candidate.has_value()) {
-        return;
-    }
-
-    if (target->has_value()) {
-        *target = MergeXiaomiSnapshots(*candidate, **target);
-        return;
-    }
-
-    *target = candidate;
-}
-
 std::optional<XiaomiBatterySnapshot> ResolveSessionSnapshot(
     const std::optional<XiaomiBatterySnapshot>& status_snapshot,
-    const std::optional<XiaomiBatterySnapshot>& device_info_snapshot,
-    const std::optional<XiaomiBatterySnapshot>& generic_snapshot,
-    bool debug_enabled,
-    XiaomiDebugLogFn debug_log) {
-    if (!status_snapshot.has_value() && !device_info_snapshot.has_value() && !generic_snapshot.has_value()) {
+    const std::optional<XiaomiBatterySnapshot>& device_info_snapshot) {
+    if (!status_snapshot.has_value() && !device_info_snapshot.has_value()) {
         return std::nullopt;
     }
 
-    XiaomiBatterySnapshot merged{};
-    if (status_snapshot.has_value() && device_info_snapshot.has_value()) {
-        merged = MergeXiaomiSnapshots(*status_snapshot, *device_info_snapshot);
-    } else if (status_snapshot.has_value()) {
-        merged = *status_snapshot;
-    } else if (device_info_snapshot.has_value()) {
-        merged = *device_info_snapshot;
-    } else {
-        merged = *generic_snapshot;
+    if (status_snapshot.has_value()) {
+        return *status_snapshot;
     }
 
-    if (generic_snapshot.has_value()) {
-        const bool has_preferred_snapshot = status_snapshot.has_value() || device_info_snapshot.has_value();
-        if (!has_preferred_snapshot) {
-            merged = MergeXiaomiSnapshots(merged, *generic_snapshot);
-        } else {
-            MaybeDebugLog(
-                debug_enabled,
-                debug_log,
-                "Xiaomi classic fallback: generic snapshot ignored because preferred snapshot is available");
-        }
-    }
-
-    return merged;
+    return *device_info_snapshot;
 }
 
 void LogMergedSnapshot(bool debug_enabled,
@@ -144,7 +108,6 @@ XiaomiClassicBatterySessionResult RunXiaomiClassicBatterySession(
     bool init_requests_sent = false;
     std::optional<XiaomiBatterySnapshot> device_info_snapshot;
     std::optional<XiaomiBatterySnapshot> status_snapshot;
-    std::optional<XiaomiBatterySnapshot> generic_snapshot;
     std::optional<std::chrono::steady_clock::time_point> device_info_received_at;
     std::optional<std::chrono::steady_clock::time_point> report_status_seen_at;
     std::vector<std::uint8_t> rx_buffer;
@@ -164,10 +127,6 @@ XiaomiClassicBatterySessionResult RunXiaomiClassicBatterySession(
         if (!chunk.has_value()) {
             continue;
         }
-
-        MergeSnapshotCandidate(
-            &generic_snapshot,
-            ExtractPreferredXiaomiBatterySnapshot(*chunk, debug_enabled, debug_log));
 
         const auto messages = AppendAndDecodeXiaomiMessages(&rx_buffer, *chunk);
         for (const auto& message : messages) {
@@ -248,11 +207,6 @@ XiaomiClassicBatterySessionResult RunXiaomiClassicBatterySession(
                 continue;
             }
 
-            if (!message.payload.empty()) {
-                MergeSnapshotCandidate(
-                    &generic_snapshot,
-                    ExtractPreferredXiaomiBatterySnapshot(message.payload, debug_enabled, debug_log));
-            }
         }
 
         if (status_snapshot.has_value()) {
@@ -260,8 +214,7 @@ XiaomiClassicBatterySessionResult RunXiaomiClassicBatterySession(
         }
     }
 
-    const auto merged_snapshot = ResolveSessionSnapshot(
-        status_snapshot, device_info_snapshot, generic_snapshot, debug_enabled, debug_log);
+    const auto merged_snapshot = ResolveSessionSnapshot(status_snapshot, device_info_snapshot);
     if (!merged_snapshot.has_value()) {
         return result;
     }

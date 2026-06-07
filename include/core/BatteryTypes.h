@@ -24,6 +24,7 @@ struct DeviceBatteryInfo {
 
 struct BatteryQueryOptions {
     bool include_disconnected = false;
+    std::string target_device_id;
 };
 
 }  // namespace battery_monitor

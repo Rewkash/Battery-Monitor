@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include <winrt/Windows.Devices.Bluetooth.h>
 #include <winrt/base.h>
@@ -34,14 +35,17 @@ std::string DescribeWinrtBatteryProviderError(const winrt::hresult_error& error)
 void EnsureWindowsBatteryProviderApartmentInitialized();
 
 WindowsBatteryQueryReaderContext MakeWindowsBatteryQueryReaderContext();
-WindowsBleCandidateBatteryCollectorContext MakeWindowsBleCandidateBatteryCollectorContext();
+WindowsBleCandidateBatteryCollectorContext MakeWindowsBleCandidateBatteryCollectorContext(
+    const std::string& target_device_id = std::string());
 WindowsTwsCandidateBatteryCollectorContext MakeWindowsTwsCandidateBatteryCollectorContext(
-    bool include_disconnected);
+    bool include_disconnected,
+    const std::string& target_device_id = std::string());
 XiaomiControlActionContext MakeWindowsXiaomiControlActionContext();
 
 std::optional<winrt::Windows::Devices::Bluetooth::BluetoothLEDevice> TryOpenBleDeviceByAddress(
     std::uint64_t address,
     std::chrono::milliseconds timeout);
+bool DeviceIdMatchesBluetoothTarget(std::string_view device_id, std::string_view target_device_id);
 
 std::optional<ResolvedBluetoothTarget> ResolveConnectedXiaomiControlTarget(
     IBluetoothBatteryProvider* provider,

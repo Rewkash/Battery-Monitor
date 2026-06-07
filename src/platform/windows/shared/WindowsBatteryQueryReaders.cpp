@@ -12,6 +12,7 @@
 #include <winrt/base.h>
 
 #include "platform/windows/shared/BluetoothVisualHintProperties.h"
+#include "platform/windows/shared/WindowsBatteryProviderSupport.h"
 #include "platform/windows/shared/WindowsBluetoothAddressUtils.h"
 #include "platform/windows/shared/WindowsBatteryEntryUtils.h"
 #include "platform/windows/shared/WindowsDeviceInfoProperties.h"
@@ -76,7 +77,8 @@ auto WaitForAsyncResult(TOperation operation, std::chrono::milliseconds timeout)
 
 std::vector<DeviceBatteryInfo> ReadConnectedBluetoothDeviceBatteryFast(
     const WindowsBatteryQueryReaderContext& context,
-    std::vector<EndpointCandidate>* tws_candidates) {
+    std::vector<EndpointCandidate>* tws_candidates,
+    const std::string& target_device_id) {
     std::vector<DeviceBatteryInfo> entries;
     std::unordered_set<std::uint64_t> seen_addresses;
     std::unordered_set<std::string> seen_device_ids;
@@ -96,6 +98,24 @@ std::vector<DeviceBatteryInfo> ReadConnectedBluetoothDeviceBatteryFast(
         }
 
         hfp_phone_cache.insert_or_assign(address, std::nullopt);
+        return std::nullopt;
+    };
+    std::unordered_map<std::uint64_t, std::optional<std::uint8_t>> zmi_vendor_cache;
+    auto read_zmi_vendor_battery_cached = [&](std::uint64_t address) -> std::optional<std::uint8_t> {
+        const auto found = zmi_vendor_cache.find(address);
+        if (found != zmi_vendor_cache.end()) {
+            return found->second;
+        }
+
+        if (context.read_zmi_vendor_pnp_hint != nullptr) {
+            const auto pnp_hint = context.read_zmi_vendor_pnp_hint(address);
+            if (pnp_hint.has_value()) {
+                zmi_vendor_cache.insert_or_assign(address, pnp_hint);
+                return pnp_hint;
+            }
+        }
+
+        zmi_vendor_cache.insert_or_assign(address, std::nullopt);
         return std::nullopt;
     };
     auto read_controller_battery_cached =
@@ -140,6 +160,9 @@ std::vector<DeviceBatteryInfo> ReadConnectedBluetoothDeviceBatteryFast(
             TryGetStringProperty(device_info, L"System.ItemNameDisplay", &device_name);
         }
         const std::string device_id = ToUtf8(device_info.Id());
+        if (!target_device_id.empty() && !DeviceIdMatchesBluetoothTarget(device_id, target_device_id)) {
+            continue;
+        }
         seen_device_ids.insert(device_id);
         const bool likely_tws =
             context.is_likely_tws_device != nullptr &&
@@ -191,6 +214,12 @@ std::vector<DeviceBatteryInfo> ReadConnectedBluetoothDeviceBatteryFast(
             context.is_likely_game_controller_device(device_name, device_name, device_id)) {
             battery_percent = read_controller_battery_cached(device_name, device_id);
         }
+        if (!battery_percent.has_value() &&
+            address.has_value() &&
+            context.is_likely_zmi_device != nullptr &&
+            context.is_likely_zmi_device(device_name, device_name, device_id)) {
+            battery_percent = read_zmi_vendor_battery_cached(*address);
+        }
         AppendSingleBatteryEntry(&entries, device_info, device_id, device_name, battery_percent, true);
     }
 
@@ -212,6 +241,9 @@ std::vector<DeviceBatteryInfo> ReadConnectedBluetoothDeviceBatteryFast(
                     TryGetStringProperty(device_info, L"System.ItemNameDisplay", &device_name);
                 }
                 const std::string device_id = ToUtf8(device_info.Id());
+                if (!target_device_id.empty() && !DeviceIdMatchesBluetoothTarget(device_id, target_device_id)) {
+                    continue;
+                }
                 if (!seen_device_ids.insert(device_id).second) {
                     continue;
                 }
@@ -262,7 +294,8 @@ std::vector<DeviceBatteryInfo> ReadConnectedBluetoothDeviceBatteryFast(
 }
 
 std::vector<DeviceBatteryInfo> ReadAssociationEndpointBattery(const WindowsBatteryQueryReaderContext& context,
-                                                             std::vector<EndpointCandidate>* tws_candidates) {
+                                                              std::vector<EndpointCandidate>* tws_candidates,
+                                                              const std::string& target_device_id) {
     std::vector<DeviceBatteryInfo> endpoint_entries;
     std::unordered_set<std::string> seen_tws_addresses;
 
@@ -312,6 +345,9 @@ OR (System.Devices.Aep.ProtocolId:="{BB7BB05E-5972-42B5-94FC-76EAA7084D49}")))";
             endpoint_name = "Unknown";
         }
         const std::string endpoint_id = ToUtf8(endpoint_info.Id());
+        if (!target_device_id.empty() && !DeviceIdMatchesBluetoothTarget(endpoint_id, target_device_id)) {
+            continue;
+        }
         bool endpoint_is_connected = false;
         TryGetBooleanProperty(endpoint_info, L"System.Devices.Aep.IsConnected", &endpoint_is_connected);
         const std::string endpoint_name_lower = ToLowerAscii(endpoint_name);

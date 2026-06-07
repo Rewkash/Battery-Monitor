@@ -314,5 +314,129 @@ std::optional<std::uint8_t> ReadPhoneHfpBatteryHintFromPnpAddress(std::uint64_t 
     return std::nullopt;
 }
 
+std::optional<std::uint8_t> ReadZmiVendorBatteryHintFromPnpAddress(std::uint64_t address,
+                                                                    bool debug_enabled,
+                                                                    XiaomiDebugLogFn debug_log) {
+    if (address <= 0xFFFFULL) {
+        return std::nullopt;
+    }
+
+    std::vector<std::wstring> instance_ids;
+    std::unordered_set<std::wstring> seen_instance_ids;
+    auto append_instance_ids = [&](const std::vector<std::wstring>& ids) {
+        for (const auto& instance_id : ids) {
+            std::wstring normalized = instance_id;
+            std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](wchar_t value) {
+                return static_cast<wchar_t>(std::towupper(value));
+            });
+            if (seen_instance_ids.insert(std::move(normalized)).second) {
+                instance_ids.push_back(instance_id);
+            }
+        }
+    };
+
+    append_instance_ids(FindBthEnumInstanceIdsByAddress(address));
+    append_instance_ids(FindBthLeInstanceIdsByAddress(address));
+
+    if (instance_ids.empty()) {
+        LogDebug(debug_enabled, debug_log,
+                 "ZMI PnP battery hint: instance id not found for address=" + std::to_string(address));
+        return std::nullopt;
+    }
+
+    for (const auto& instance_id : instance_ids) {
+        DEVINST dev_inst = 0;
+        const auto locate_result =
+            CM_Locate_DevNodeW(&dev_inst, const_cast<wchar_t*>(instance_id.c_str()), CM_LOCATE_DEVNODE_NORMAL);
+        if (locate_result != CR_SUCCESS) {
+            continue;
+        }
+
+        // Try the known ZMI vendor battery property key first.
+        std::vector<DEVPROPKEY> keys_to_probe = {kZmiVendorBatteryHintPropKey};
+
+        // Also scan all properties under the same GUID family for other PIDs.
+        ULONG key_count = 0;
+        const auto key_count_result = CM_Get_DevNode_Property_Keys(dev_inst, nullptr, &key_count, 0);
+        if ((key_count_result == CR_SUCCESS || key_count_result == CR_BUFFER_SMALL) && key_count > 0U) {
+            std::vector<DEVPROPKEY> property_keys(key_count);
+            if (CM_Get_DevNode_Property_Keys(dev_inst, property_keys.data(), &key_count, 0) == CR_SUCCESS) {
+                property_keys.resize(key_count);
+                for (const auto& property_key : property_keys) {
+                    if (std::memcmp(&property_key.fmtid, &kZmiVendorBatteryHintPropKey.fmtid, sizeof(GUID)) != 0) {
+                        continue;
+                    }
+                    const bool already_added = std::any_of(
+                        keys_to_probe.begin(), keys_to_probe.end(), [&property_key](const DEVPROPKEY& existing) {
+                            return std::memcmp(&existing, &property_key, sizeof(DEVPROPKEY)) == 0;
+                        });
+                    if (!already_added) {
+                        keys_to_probe.push_back(property_key);
+                    }
+                }
+            }
+        }
+
+        std::sort(keys_to_probe.begin(), keys_to_probe.end(),
+                  [](const DEVPROPKEY& lhs, const DEVPROPKEY& rhs) { return lhs.pid < rhs.pid; });
+        keys_to_probe.erase(
+            std::unique(keys_to_probe.begin(), keys_to_probe.end(),
+                        [](const DEVPROPKEY& lhs, const DEVPROPKEY& rhs) {
+                            return std::memcmp(&lhs, &rhs, sizeof(DEVPROPKEY)) == 0;
+                        }),
+            keys_to_probe.end());
+
+        for (const auto& property_key : keys_to_probe) {
+            DEVPROPTYPE property_type = DEVPROP_TYPE_EMPTY;
+            const auto raw_data = ReadDevNodePropertyRaw(dev_inst, property_key, &property_type);
+            if (!raw_data.has_value()) {
+                continue;
+            }
+
+            if (debug_enabled) {
+                const std::size_t preview_len = std::min<std::size_t>(raw_data->size(), 24U);
+                std::vector<std::uint8_t> preview(raw_data->begin(),
+                                                  raw_data->begin() + static_cast<std::ptrdiff_t>(preview_len));
+                LogDebug(debug_enabled, debug_log,
+                         "ZMI PnP raw pid=" + std::to_string(property_key.pid) +
+                             " type=" + std::to_string(property_type) +
+                             " size=" + std::to_string(raw_data->size()) +
+                             " data=" + BytesToHex(preview));
+            }
+
+            const auto value = NormalizePhoneBatteryHintScalar(
+                [&]() -> int {
+                    if (property_type == DEVPROP_TYPE_BYTE && !raw_data->empty()) {
+                        return static_cast<int>((*raw_data)[0]);
+                    }
+                    if (property_type == DEVPROP_TYPE_UINT32 && raw_data->size() >= sizeof(std::uint32_t)) {
+                        std::uint32_t v = 0;
+                        std::memcpy(&v, raw_data->data(), sizeof(v));
+                        return static_cast<int>(v);
+                    }
+                    if (property_type == DEVPROP_TYPE_INT32 && raw_data->size() >= sizeof(std::int32_t)) {
+                        std::int32_t v = 0;
+                        std::memcpy(&v, raw_data->data(), sizeof(v));
+                        return static_cast<int>(v);
+                    }
+                    return -1;
+                }());
+            if (!value.has_value()) {
+                continue;
+            }
+
+            LogDebug(debug_enabled, debug_log,
+                     "ZMI PnP battery hint accepted value=" + std::to_string(*value) +
+                         " pid=" + std::to_string(property_key.pid) +
+                         " instance='" + ToUtf8(instance_id) + "'");
+            return value;
+        }
+    }
+
+    LogDebug(debug_enabled, debug_log,
+             "ZMI PnP battery hint was not found for address=" + std::to_string(address));
+    return std::nullopt;
+}
+
 }  // namespace battery_monitor
 

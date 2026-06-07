@@ -4,14 +4,19 @@
 #include "ui/NoiseControlUi.h"
 #include "ui/BatteryStatsDialog.h"
 #include "ui/BatteryWindowSettings.h"
+#include "ui/DeviceDiagnosticsDialog.h"
 #include "ui/DraggableDeviceRow.h"
 
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <iomanip>
 #include <initializer_list>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -49,6 +54,7 @@
 #include <QPixmap>
 #include <QPushButton>
 #include <QResource>
+#include <QStandardPaths>
 #include <QScrollArea>
 #include <QScreen>
 #include <QSettings>
@@ -79,6 +85,76 @@ namespace battery_monitor {
 
 namespace {
 
+bool UiDebugEnabled() {
+    const QByteArray value = qgetenv("BATTERY_MONITOR_DEBUG");
+    return !value.isEmpty() && value != "0" && value.toLower() != "false";
+}
+
+std::filesystem::path UiDebugLogPath() {
+    QString base_path = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (!base_path.trimmed().isEmpty()) {
+        return std::filesystem::path(base_path.toStdWString()) / "diagnostics" / "ui-debug.log";
+    }
+    return std::filesystem::current_path() / "ui-debug.log";
+}
+
+void UiDebugLog(const std::string& message) {
+    if (!UiDebugEnabled()) {
+        return;
+    }
+
+    static std::mutex log_mutex;
+    std::lock_guard lock(log_mutex);
+
+    const auto path = UiDebugLogPath();
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    std::ofstream stream(path, std::ios::out | std::ios::app);
+    if (!stream) {
+        return;
+    }
+    stream << QDateTime::currentDateTime().toString(Qt::ISODateWithMs).toStdString()
+           << " [ui] " << message << '\n';
+}
+
+std::string OptionalLevelText(const std::optional<std::uint8_t>& value) {
+    if (!value.has_value()) {
+        return "na";
+    }
+    return std::to_string(static_cast<int>(*value));
+}
+
+std::string OptionalText(const std::optional<std::string>& value) {
+    return value.has_value() ? *value : "na";
+}
+
+void UiDebugLogDevices(const std::string& stage, const std::vector<DeviceBatteryInfo>& devices) {
+    if (!UiDebugEnabled()) {
+        return;
+    }
+
+    UiDebugLog(stage + " devices=" + std::to_string(devices.size()));
+    for (std::size_t index = 0; index < devices.size(); ++index) {
+        const auto& device = devices[index];
+        std::ostringstream line;
+        line << stage << "[" << index << "]"
+             << " id='" << device.device_id << "'"
+             << " name='" << device.device_name << "'"
+             << " component='" << device.battery_component << "'"
+             << " level=" << OptionalLevelText(device.battery_level_percent)
+             << " cached=" << (device.is_cached ? "true" : "false")
+             << " connected=" << (device.is_connected ? "true" : "false")
+             << " mode='" << OptionalText(device.device_mode) << "'"
+             << " submode='" << OptionalText(device.device_submode) << "'";
+        UiDebugLog(line.str());
+    }
+}
+
+std::uint64_t NextUiRefreshId() {
+    static std::atomic<std::uint64_t> next_id{1};
+    return next_id.fetch_add(1, std::memory_order_relaxed);
+}
+
 const bool kDeviceIconsResourceInitialized = []() {
     Q_INIT_RESOURCE(device_icons);
     return true;
@@ -103,6 +179,30 @@ struct DeviceEntry {
     std::vector<ComponentEntry> components;
     bool is_connected = false;
 };
+
+void UiDebugLogGroupedDevices(const std::string& stage, const std::vector<DeviceEntry>& devices) {
+    if (!UiDebugEnabled()) {
+        return;
+    }
+
+    UiDebugLog(stage + " grouped=" + std::to_string(devices.size()));
+    for (std::size_t index = 0; index < devices.size(); ++index) {
+        const auto& device = devices[index];
+        std::ostringstream line;
+        line << stage << "[" << index << "]"
+             << " id='" << device.device_id << "'"
+             << " name='" << device.device_name << "'"
+             << " connected=" << (device.is_connected ? "true" : "false")
+             << " mode='" << OptionalText(device.device_mode) << "'"
+             << " components=";
+        for (const auto& component : device.components) {
+            line << component.component << ":" << OptionalLevelText(component.battery_level_percent)
+                 << (component.is_cached ? ":cached" : ":live")
+                 << (component.is_connected ? ":connected" : ":disconnected") << ";";
+        }
+        UiDebugLog(line.str());
+    }
+}
 
 struct PrimaryBattery {
     std::optional<std::uint8_t> level;
@@ -138,7 +238,6 @@ constexpr int kListSpacing = 10;
 constexpr int kListHeightSlack = 28;
 constexpr int kDefaultWindowWidth = 390;
 constexpr int kNoiseControlWindowWidth = 470;
-constexpr int kBluetoothDeviceRefreshDebounceMs = 1200;
 QString ToQString(const std::string& value) {
     return QString::fromUtf8(value.c_str());
 }
@@ -399,6 +498,26 @@ std::string ToLowerAsciiCopy(std::string value) {
     return value;
 }
 
+#ifdef _WIN32
+bool DeviceIdContainsBluetoothAddress(std::string_view device_id, std::uint64_t address) {
+    std::ostringstream compact_builder;
+    compact_builder << std::nouppercase << std::hex << std::setw(12) << std::setfill('0') << address;
+    const std::string compact = compact_builder.str();
+
+    std::ostringstream colon_builder;
+    for (std::size_t i = 0; i < compact.size(); i += 2) {
+        if (i != 0) {
+            colon_builder << ':';
+        }
+        colon_builder << compact.substr(i, 2);
+    }
+
+    const std::string lowered_id = ToLowerAsciiCopy(std::string(device_id));
+    return lowered_id.find(compact) != std::string::npos ||
+           lowered_id.find(colon_builder.str()) != std::string::npos;
+}
+#endif
+
 bool DeviceIdsReferToSameBluetoothDevice(std::string_view lhs, std::string_view rhs) {
     if (lhs.empty() || rhs.empty()) {
         return false;
@@ -412,10 +531,26 @@ bool DeviceIdsReferToSameBluetoothDevice(std::string_view lhs, std::string_view 
     if (lhs_address.has_value() && rhs_address.has_value()) {
         return *lhs_address == *rhs_address;
     }
+    if (lhs_address.has_value()) {
+        return DeviceIdContainsBluetoothAddress(rhs, *lhs_address);
+    }
+    if (rhs_address.has_value()) {
+        return DeviceIdContainsBluetoothAddress(lhs, *rhs_address);
+    }
 #endif
     const std::string lowered_lhs = ToLowerAsciiCopy(std::string(lhs));
     const std::string lowered_rhs = ToLowerAsciiCopy(std::string(rhs));
     return lowered_lhs.find(lowered_rhs) != std::string::npos || lowered_rhs.find(lowered_lhs) != std::string::npos;
+}
+
+std::string DeviceGroupingKey(const std::string& device_id) {
+#ifdef _WIN32
+    const auto address = ParseBluetoothAddressFromDeviceId(device_id);
+    if (address.has_value()) {
+        return "btaddr:" + std::to_string(*address);
+    }
+#endif
+    return device_id.empty() ? "UnknownDevice" : device_id;
 }
 
 std::string ToLowerAscii(std::string value) {
@@ -458,7 +593,6 @@ int ComponentQualityScore(const ComponentEntry& entry) {
     int score = 0;
     if (entry.battery_level_percent.has_value()) {
         score += 1000;
-        score += static_cast<int>(*entry.battery_level_percent);
     }
     if (!entry.is_cached) {
         score += 100;
@@ -1285,12 +1419,13 @@ std::vector<DeviceEntry> GroupDevices(const std::vector<DeviceBatteryInfo>& devi
         }
 
         const std::string device_name = item.device_name.empty() ? "Unknown device" : item.device_name;
+        const std::string grouping_key = DeviceGroupingKey(device_id);
 
         std::size_t index = 0;
-        const auto found = index_by_id.find(device_id);
+        const auto found = index_by_id.find(grouping_key);
         if (found == index_by_id.end()) {
             index = grouped.size();
-            index_by_id.emplace(device_id, index);
+            index_by_id.emplace(grouping_key, index);
 
             DeviceEntry device;
             device.device_id = device_id;
@@ -1348,7 +1483,7 @@ std::vector<DeviceEntry> GroupDevices(const std::vector<DeviceBatteryInfo>& devi
 
         if (existing == target.end()) {
             target.push_back(std::move(incoming));
-        } else if (ComponentQualityScore(incoming) > ComponentQualityScore(*existing)) {
+        } else if (ComponentQualityScore(incoming) >= ComponentQualityScore(*existing)) {
             *existing = std::move(incoming);
         }
     }
@@ -2120,7 +2255,7 @@ QWidget#listContainer {
     refresh_interval_spinbox_->setObjectName(QStringLiteral("settingsSpinBox"));
     refresh_interval_spinbox_->setRange(
         kBatteryWindowMinRefreshIntervalSeconds, kBatteryWindowMaxRefreshIntervalSeconds);
-    refresh_interval_spinbox_->setSingleStep(5);
+    refresh_interval_spinbox_->setSingleStep(1);
     refresh_interval_spinbox_->setSuffix(QString::fromUtf8(u8" с"));
 
     auto* threshold_row_layout = new QHBoxLayout();
@@ -2208,7 +2343,7 @@ QWidget#listContainer {
     root_layout->addWidget(settings_panel_);
     root_layout->addLayout(footer_layout);
 
-    connect(refresh_button_, &QPushButton::clicked, this, [this]() { RefreshBatteryData(); });
+    connect(refresh_button_, &QPushButton::clicked, this, [this]() { RefreshBatteryDataFromUser(); });
     connect(show_all_button_, &QPushButton::clicked, this, [this]() { ResetHiddenDevices(); });
     connect(settings_button_, &QToolButton::clicked, this, [this]() { ConfigureRefreshInterval(); });
     connect(refresh_interval_spinbox_,
@@ -2225,9 +2360,7 @@ QWidget#listContainer {
     runtime_timer_ = new QTimer(this);
     bluetooth_refresh_debounce_timer_ = new QTimer(this);
     bluetooth_refresh_debounce_timer_->setSingleShot(true);
-    bluetooth_refresh_debounce_timer_->setInterval(kBluetoothDeviceRefreshDebounceMs);
-    connect(bluetooth_refresh_debounce_timer_, &QTimer::timeout, this, [this]() { RefreshBatteryData(false, true); });
-
+    bluetooth_refresh_debounce_timer_->setInterval(250);
     const BatteryWindowPersistedState persisted_state = LoadBatteryWindowPersistedState();
     refresh_interval_ms_ = persisted_state.refresh_interval_ms;
     low_battery_threshold_percent_ = persisted_state.low_battery_threshold_percent;
@@ -2251,6 +2384,14 @@ QWidget#listContainer {
     }
     connect(refresh_timer_, &QTimer::timeout, this, [this]() { RefreshBatteryData(false, true); });
     connect(runtime_timer_, &QTimer::timeout, this, [this]() { UpdateRuntimeCountdownLabels(); });
+    connect(bluetooth_refresh_debounce_timer_, &QTimer::timeout, this, [this]() {
+        if (pending_bluetooth_refresh_device_id_.empty()) {
+            RefreshBatteryData(false, true);
+            return;
+        }
+        RefreshBatteryDataForDevice(pending_bluetooth_refresh_device_id_);
+        pending_bluetooth_refresh_device_id_.clear();
+    });
     refresh_timer_->start();
     runtime_timer_->setInterval(1000);
     runtime_timer_->start();
@@ -2369,7 +2510,7 @@ void BatteryWindow::InitializeTray() {
             ShowWindowFromTray();
         }
     });
-    connect(refresh_action_, &QAction::triggered, this, [this]() { RefreshBatteryData(); });
+    connect(refresh_action_, &QAction::triggered, this, [this]() { RefreshBatteryDataFromUser(); });
     connect(reset_hidden_action_, &QAction::triggered, this, [this]() { ResetHiddenDevices(); });
     connect(quit_action_, &QAction::triggered, this, [this]() { QuitFromTray(); });
 
@@ -2611,6 +2752,14 @@ void BatteryWindow::RecordBatteryHistory(const std::vector<DeviceBatteryInfo>& d
         it->second->SetHistory(history_store_.LoadHistory(ToQString(it->first)));
         ++it;
     }
+
+    for (auto it = diagnostics_dialogs_.begin(); it != diagnostics_dialogs_.end();) {
+        if (it->second.isNull()) {
+            it = diagnostics_dialogs_.erase(it);
+            continue;
+        }
+        ++it;
+    }
 }
 
 void BatteryWindow::ShowBatteryHistory(const std::string& device_id, const std::string& fallback_name) {
@@ -2678,6 +2827,37 @@ void BatteryWindow::ShowBatteryStats(const std::string& device_id, const std::st
     auto* dialog = new BatteryStatsDialog(std::move(history), this);
     stats_dialogs_[device_id] = dialog;
     connect(dialog, &QObject::destroyed, this, [this, device_id]() { stats_dialogs_.erase(device_id); });
+    dialog->show();
+    dialog->raise();
+    dialog->activateWindow();
+}
+
+void BatteryWindow::ShowDeviceDiagnostics(const std::string& device_id) {
+    if (device_id.empty()) {
+        return;
+    }
+
+    const auto existing_dialog = diagnostics_dialogs_.find(device_id);
+    if (existing_dialog != diagnostics_dialogs_.end() && !existing_dialog->second.isNull()) {
+        existing_dialog->second->show();
+        existing_dialog->second->raise();
+        existing_dialog->second->activateWindow();
+        return;
+    }
+
+    std::vector<DeviceBatteryInfo> entries;
+    for (const auto& entry : last_devices_snapshot_) {
+        if (DeviceIdsReferToSameBluetoothDevice(entry.device_id, device_id)) {
+            entries.push_back(entry);
+        }
+    }
+    if (entries.empty()) {
+        return;
+    }
+
+    auto* dialog = new DeviceDiagnosticsDialog(std::move(entries), this);
+    diagnostics_dialogs_[device_id] = dialog;
+    connect(dialog, &QObject::destroyed, this, [this, device_id]() { diagnostics_dialogs_.erase(device_id); });
     dialog->show();
     dialog->raise();
     dialog->activateWindow();
@@ -2898,14 +3078,24 @@ void BatteryWindow::StartBluetoothDeviceWatcher() {
                                      winrt::event_token* removed_token,
                                      const winrt::hstring& selector) {
             *watcher = DeviceInformation::CreateWatcher(selector);
-            *added_token = watcher->Added([this](auto&&, const auto& info) {
-                ScheduleBluetoothDeviceRefresh(winrt::to_string(info.Id()), true);
+            QPointer<BatteryWindow> self(this);
+            *added_token = watcher->Added([self](auto&&, const auto& info) {
+                if (self == nullptr) {
+                    return;
+                }
+                self->ScheduleBluetoothDeviceRefresh(winrt::to_string(info.Id()), true);
             });
-            *updated_token = watcher->Updated([this](auto&&, const auto& info) {
-                ScheduleBluetoothDeviceRefresh(winrt::to_string(info.Id()), true);
+            *updated_token = watcher->Updated([self](auto&&, const auto& info) {
+                if (self == nullptr) {
+                    return;
+                }
+                self->ScheduleBluetoothDeviceRefresh(winrt::to_string(info.Id()), true);
             });
-            *removed_token = watcher->Removed([this](auto&&, const auto& info) {
-                ScheduleBluetoothDeviceRefresh(winrt::to_string(info.Id()), false);
+            *removed_token = watcher->Removed([self](auto&&, const auto& info) {
+                if (self == nullptr) {
+                    return;
+                }
+                self->ScheduleBluetoothDeviceRefresh(winrt::to_string(info.Id()), false);
             });
             watcher->Start();
         };
@@ -2971,10 +3161,15 @@ void BatteryWindow::ScheduleBluetoothDeviceRefresh(const std::string& changed_de
             }
 
             if (bluetooth_refresh_debounce_timer_ == nullptr) {
+                RefreshBatteryDataForDevice(changed_device_id);
                 return;
             }
-            // Connected devices need a discovery pass to pull fresh battery/mode data.
-            // Unknown devices also need it before later events can update only that row.
+
+            if (pending_bluetooth_refresh_device_id_.empty()) {
+                pending_bluetooth_refresh_device_id_ = changed_device_id;
+            } else if (!DeviceIdsReferToSameBluetoothDevice(pending_bluetooth_refresh_device_id_, changed_device_id)) {
+                pending_bluetooth_refresh_device_id_.clear();
+            }
             bluetooth_refresh_debounce_timer_->start();
         },
         Qt::QueuedConnection);
@@ -3020,6 +3215,139 @@ bool BatteryWindow::ApplyBluetoothDeviceConnectionChange(const std::string& chan
                 .arg(now.toString(QStringLiteral("HH:mm:ss"))));
     }
     return true;
+}
+
+void BatteryWindow::RefreshBatteryDataForDevice(const std::string& device_id) {
+    const std::uint64_t refresh_id = NextUiRefreshId();
+    UiDebugLog("refresh#" + std::to_string(refresh_id) + " targeted requested target='" + device_id + "'");
+    if (device_id.empty()) {
+        UiDebugLog("refresh#" + std::to_string(refresh_id) + " targeted empty target -> full refresh");
+        RefreshBatteryData(false, true);
+        return;
+    }
+
+    if (drag_in_progress_) {
+        UiDebugLog("refresh#" + std::to_string(refresh_id) + " targeted deferred because drag_in_progress target='" + device_id + "'");
+        refresh_pending_ = true;
+        pending_preserve_disconnected_snapshot_ = true;
+        status_label_->setText(QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435 "
+                                                 u8"\u043E\u0442\u043B\u043E\u0436\u0435\u043D\u043E: "
+                                                 u8"\u0438\u0434\u0451\u0442 \u043F\u0435\u0440\u0435\u0442\u0430\u0441\u043A\u0438\u0432\u0430\u043D\u0438\u0435"));
+        return;
+    }
+
+    if (refresh_in_progress_.load(std::memory_order_acquire)) {
+        UiDebugLog("refresh#" + std::to_string(refresh_id) + " targeted deferred because refresh_in_progress target='" + device_id + "'");
+        refresh_pending_ = true;
+        pending_preserve_disconnected_snapshot_ = true;
+        status_label_->setText(QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435..."));
+        return;
+    }
+
+    if (refresh_worker_.joinable()) {
+        refresh_worker_.join();
+    }
+    refresh_in_progress_.store(true, std::memory_order_release);
+
+    refresh_button_->setEnabled(false);
+    show_all_button_->setEnabled(false);
+    status_label_->setText(QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435..."));
+
+    refresh_worker_ = std::thread([this, device_id, refresh_id]() {
+        RefreshTaskResult result;
+        try {
+            BatteryQueryOptions query_options;
+            query_options.include_disconnected = false;
+            query_options.target_device_id = device_id;
+            UiDebugLog("refresh#" + std::to_string(refresh_id) +
+                       " provider query targeted include_disconnected=false target='" + device_id + "'");
+            result.devices = provider_->GetDevicesBattery(query_options);
+            UiDebugLogDevices("refresh#" + std::to_string(refresh_id) + " provider result targeted", result.devices);
+#ifdef _WIN32
+        } catch (const winrt::hresult_error& error) {
+            result.error_text = QString::fromUtf8(u8"\u041E\u0448\u0438\u0431\u043A\u0430: %1").arg(FormatWinRtError(error));
+            result.is_bluetooth_stack_error = true;
+            UiDebugLog("refresh#" + std::to_string(refresh_id) + " provider targeted WinRT error='" +
+                       result.error_text.toStdString() + "'");
+#endif
+        } catch (const std::exception& ex) {
+            result.error_text = QString::fromUtf8(u8"\u041E\u0448\u0438\u0431\u043A\u0430: %1").arg(ToQString(FormatError(ex)));
+            UiDebugLog("refresh#" + std::to_string(refresh_id) + " provider targeted std error='" +
+                       result.error_text.toStdString() + "'");
+        } catch (...) {
+            result.error_text = QString::fromUtf8(u8"\u041E\u0448\u0438\u0431\u043A\u0430: \u043D\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043D\u043E\u0435 \u0438\u0441\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435");
+            UiDebugLog("refresh#" + std::to_string(refresh_id) + " provider targeted unknown error");
+        }
+
+        QMetaObject::invokeMethod(
+            this,
+            [this, device_id, refresh_id, result = std::move(result)]() mutable {
+                refresh_in_progress_.store(false, std::memory_order_release);
+
+                if (quitting_) {
+                    UiDebugLog("refresh#" + std::to_string(refresh_id) + " targeted ignored because quitting");
+                    return;
+                }
+
+                if (result.error_text.isEmpty()) {
+                    if (result.devices.empty()) {
+                        UiDebugLog("refresh#" + std::to_string(refresh_id) + " targeted empty result -> full refresh");
+                        RefreshBatteryData(false, true);
+                        return;
+                    }
+
+                    UiDebugLogDevices("refresh#" + std::to_string(refresh_id) + " snapshot before targeted merge",
+                                      last_devices_snapshot_);
+                    auto merged_devices = last_devices_snapshot_;
+                    merged_devices.erase(
+                        std::remove_if(
+                            merged_devices.begin(),
+                            merged_devices.end(),
+                            [&](const DeviceBatteryInfo& existing) {
+                                if (DeviceIdsReferToSameBluetoothDevice(existing.device_id, device_id)) {
+                                    return true;
+                                }
+                                return std::any_of(
+                                    result.devices.begin(), result.devices.end(),
+                                    [&](const DeviceBatteryInfo& incoming) {
+                                        return DeviceIdsReferToSameBluetoothDevice(existing.device_id, incoming.device_id);
+                                    });
+                            }),
+                        merged_devices.end());
+                    merged_devices.insert(merged_devices.end(), result.devices.begin(), result.devices.end());
+                    NotifyLowBatteryIfNeeded(result.devices);
+                    RecordBatteryHistory(result.devices);
+                    last_devices_snapshot_ = std::move(merged_devices);
+                    UiDebugLogDevices("refresh#" + std::to_string(refresh_id) + " snapshot after targeted merge",
+                                      last_devices_snapshot_);
+                    PopulateDeviceCards(last_devices_snapshot_);
+                    UpdateTrayTooltip(last_devices_snapshot_);
+
+                    const auto now = QDateTime::currentDateTime();
+                    status_label_->setText(
+                        QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u043E \u0432 %1")
+                            .arg(now.toString(QStringLiteral("HH:mm:ss"))));
+                } else {
+                    UiDebugLog("refresh#" + std::to_string(refresh_id) + " targeted ui error='" +
+                               result.error_text.toStdString() + "'");
+                    status_label_->setText(result.error_text);
+                }
+
+                refresh_button_->setEnabled(true);
+                show_all_button_->setEnabled(!hidden_device_ids_.empty());
+                UpdateToggleActionText();
+
+                if (refresh_pending_) {
+                    const bool next_include_disconnected = pending_include_disconnected_;
+                    const bool next_preserve_disconnected_snapshot = pending_preserve_disconnected_snapshot_;
+                    refresh_pending_ = false;
+                    pending_include_disconnected_ = false;
+                    pending_preserve_disconnected_snapshot_ = true;
+                    RefreshBatteryData(next_include_disconnected, next_preserve_disconnected_snapshot);
+                }
+            },
+            Qt::QueuedConnection);
+    });
 }
 
 void BatteryWindow::ApplyNoiseControlMode(const std::string& device_id, NoiseControlMode mode) {
@@ -3198,7 +3526,12 @@ void BatteryWindow::ShowNoiseSubmodeMenu(QWidget* anchor,
 }
 
 void BatteryWindow::RefreshBatteryData(bool include_disconnected, bool preserve_disconnected_snapshot) {
+    const std::uint64_t refresh_id = NextUiRefreshId();
+    UiDebugLog("refresh#" + std::to_string(refresh_id) +
+               " full requested include_disconnected=" + (include_disconnected ? "true" : "false") +
+               " preserve_disconnected_snapshot=" + (preserve_disconnected_snapshot ? "true" : "false"));
     if (drag_in_progress_) {
+        UiDebugLog("refresh#" + std::to_string(refresh_id) + " full deferred because drag_in_progress");
         refresh_pending_ = true;
         pending_include_disconnected_ = pending_include_disconnected_ || include_disconnected;
         pending_preserve_disconnected_snapshot_ = pending_preserve_disconnected_snapshot_ || preserve_disconnected_snapshot;
@@ -3209,6 +3542,7 @@ void BatteryWindow::RefreshBatteryData(bool include_disconnected, bool preserve_
     }
 
     if (refresh_in_progress_.load(std::memory_order_acquire)) {
+        UiDebugLog("refresh#" + std::to_string(refresh_id) + " full deferred because refresh_in_progress");
         refresh_pending_ = true;
         pending_include_disconnected_ = pending_include_disconnected_ || include_disconnected;
         pending_preserve_disconnected_snapshot_ = pending_preserve_disconnected_snapshot_ || preserve_disconnected_snapshot;
@@ -3225,31 +3559,43 @@ void BatteryWindow::RefreshBatteryData(bool include_disconnected, bool preserve_
     show_all_button_->setEnabled(false);
     status_label_->setText(QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435..."));
 
-    refresh_worker_ = std::thread([this, include_disconnected, preserve_disconnected_snapshot]() {
+    refresh_worker_ = std::thread([this, include_disconnected, preserve_disconnected_snapshot, refresh_id]() {
         RefreshTaskResult result;
         try {
             BatteryQueryOptions query_options;
             query_options.include_disconnected = include_disconnected;
+            UiDebugLog("refresh#" + std::to_string(refresh_id) +
+                       " provider query full include_disconnected=" +
+                       (include_disconnected ? "true" : "false") + " target='' preserve_disconnected_snapshot=" +
+                       (preserve_disconnected_snapshot ? "true" : "false"));
             result.devices = provider_->GetDevicesBattery(query_options);
+            UiDebugLogDevices("refresh#" + std::to_string(refresh_id) + " provider result full", result.devices);
 #ifdef _WIN32
         } catch (const winrt::hresult_error& error) {
             result.error_text = QString::fromUtf8(u8"\u041E\u0448\u0438\u0431\u043A\u0430: %1").arg(FormatWinRtError(error));
             result.is_bluetooth_stack_error = true;
+            UiDebugLog("refresh#" + std::to_string(refresh_id) + " provider full WinRT error='" +
+                       result.error_text.toStdString() + "'");
 #endif
         } catch (const std::exception& ex) {
             result.error_text = QString::fromUtf8(u8"\u041E\u0448\u0438\u0431\u043A\u0430: %1").arg(ToQString(FormatError(ex)));
+            UiDebugLog("refresh#" + std::to_string(refresh_id) + " provider full std error='" +
+                       result.error_text.toStdString() + "'");
         } catch (...) {
             result.error_text = QString::fromUtf8(u8"\u041E\u0448\u0438\u0431\u043A\u0430: \u043D\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043D\u043E\u0435 \u0438\u0441\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435");
+            UiDebugLog("refresh#" + std::to_string(refresh_id) + " provider full unknown error");
         }
 
         QMetaObject::invokeMethod(
             this,
             [this,
+             refresh_id,
              result = std::move(result),
              preserve_disconnected_snapshot]() mutable {
                 refresh_in_progress_.store(false, std::memory_order_release);
 
                 if (quitting_) {
+                    UiDebugLog("refresh#" + std::to_string(refresh_id) + " full ignored because quitting");
                     return;
                 }
 
@@ -3267,6 +3613,8 @@ void BatteryWindow::RefreshBatteryData(bool include_disconnected, bool preserve_
 
                 if (result.error_text.isEmpty()) {
                     if (preserve_disconnected_snapshot) {
+                        UiDebugLogDevices("refresh#" + std::to_string(refresh_id) + " snapshot before preserve merge",
+                                          last_devices_snapshot_);
                         std::vector<DeviceBatteryInfo> merged_devices = result.devices;
                         for (const auto& previous : last_devices_snapshot_) {
                             if (previous.is_connected) {
@@ -3282,10 +3630,14 @@ void BatteryWindow::RefreshBatteryData(bool include_disconnected, bool preserve_
                             }
                         }
                         result.devices = std::move(merged_devices);
+                        UiDebugLogDevices("refresh#" + std::to_string(refresh_id) + " snapshot after preserve merge",
+                                          result.devices);
                     }
                     NotifyLowBatteryIfNeeded(result.devices);
                     RecordBatteryHistory(result.devices);
                     last_devices_snapshot_ = result.devices;
+                    UiDebugLogDevices("refresh#" + std::to_string(refresh_id) + " snapshot assigned full",
+                                      last_devices_snapshot_);
                     PopulateDeviceCards(result.devices);
                     UpdateTrayTooltip(result.devices);
 
@@ -3294,6 +3646,8 @@ void BatteryWindow::RefreshBatteryData(bool include_disconnected, bool preserve_
                         QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u043E \u0432 %1")
                             .arg(now.toString(QStringLiteral("HH:mm:ss"))));
                 } else {
+                    UiDebugLog("refresh#" + std::to_string(refresh_id) + " full ui error='" +
+                               result.error_text.toStdString() + "'");
                     ClearDeviceCards();
                     summary_label_->setText(QString::fromUtf8(u8"\u041D\u0435\u0442 \u0434\u0430\u043D\u043D\u044B\u0445"));
 
@@ -3332,13 +3686,25 @@ void BatteryWindow::RefreshBatteryData(bool include_disconnected, bool preserve_
     });
 }
 
+void BatteryWindow::RefreshBatteryDataFromUser() {
+    UiDebugLog("manual refresh requested: stop debounce and force startup-equivalent full refresh");
+    if (bluetooth_refresh_debounce_timer_ != nullptr) {
+        bluetooth_refresh_debounce_timer_->stop();
+    }
+    pending_bluetooth_refresh_device_id_.clear();
+    RefreshBatteryData(true, false);
+}
+
 void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& devices) {
+    UiDebugLogDevices("render input", devices);
     ClearDeviceCards();
 
     const auto grouped = GroupDevices(devices, hidden_device_ids_);
+    UiDebugLogGroupedDevices("render grouped", grouped);
     SyncOrderQueue(grouped, true, &connected_device_order_);
     SyncOrderQueue(grouped, false, &disconnected_device_order_);
     const auto ordered = ApplyCustomOrder(grouped, connected_device_order_, disconnected_device_order_);
+    UiDebugLogGroupedDevices("render ordered", ordered);
     const bool has_noise_control_devices = std::any_of(
         ordered.begin(), ordered.end(),
         [this](const DeviceEntry& device) {
@@ -3669,6 +4035,8 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
 
         auto* actions_menu = new QMenu(actions_button);
         auto* refresh_row_action = actions_menu->addAction(QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u0438\u0442\u044C"));
+        auto* diagnostics_row_action =
+            actions_menu->addAction(QString::fromUtf8(u8"\u0414\u0438\u0430\u0433\u043D\u043E\u0441\u0442\u0438\u043A\u0430"));
         auto* stats_row_action =
             actions_menu->addAction(QString::fromUtf8(u8"\u0421\u0442\u0430\u0442\u0438\u0441\u0442\u0438\u043A\u0430"));
         auto* history_row_action =
@@ -3679,7 +4047,15 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
                                                       u8"\u0443\u0441\u0442\u0440\u043E\u0439\u0441\u0442\u0432\u043E"));
         actions_button->setMenu(actions_menu);
 
-        connect(refresh_row_action, &QAction::triggered, this, [this]() { RefreshBatteryData(); });
+        connect(refresh_row_action, &QAction::triggered, this, [this]() {
+            if (bluetooth_refresh_debounce_timer_ != nullptr) {
+                bluetooth_refresh_debounce_timer_->stop();
+            }
+            pending_bluetooth_refresh_device_id_.clear();
+            RefreshBatteryData(false, false);
+        });
+        connect(diagnostics_row_action, &QAction::triggered, this,
+                [this, device_id = device.device_id]() { ShowDeviceDiagnostics(device_id); });
         connect(stats_row_action, &QAction::triggered, this,
                 [this, device_id = device.device_id, device_name = device.device_name]() {
                     ShowBatteryStats(device_id, device_name);

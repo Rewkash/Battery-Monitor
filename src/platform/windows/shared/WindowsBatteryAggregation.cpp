@@ -351,7 +351,24 @@ std::vector<DeviceBatteryInfo> FinalizeCollectedEntries(std::vector<DeviceBatter
         const auto dedup_it = final_dedup.find(key);
         if (dedup_it != final_dedup.end()) {
             auto& existing = filtered_entries[dedup_it->second];
-            existing.is_connected = existing.is_connected || entry.is_connected;
+            entry.is_connected = existing.is_connected || entry.is_connected;
+            if (!entry.device_mode.has_value()) {
+                entry.device_mode = existing.device_mode;
+            }
+            if (!entry.device_submode.has_value()) {
+                entry.device_submode = existing.device_submode;
+            }
+            if (!entry.bluetooth_le_appearance.has_value()) {
+                entry.bluetooth_le_appearance = existing.bluetooth_le_appearance;
+            }
+            if (!entry.bluetooth_cod_major.has_value()) {
+                entry.bluetooth_cod_major = existing.bluetooth_cod_major;
+            }
+            if (!entry.bluetooth_cod_minor.has_value()) {
+                entry.bluetooth_cod_minor = existing.bluetooth_cod_minor;
+            }
+            AppendUniqueStrings(&entry.device_categories, existing.device_categories);
+            existing = std::move(entry);
             continue;
         }
 
