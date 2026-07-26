@@ -152,12 +152,11 @@ void CollectBleCandidateBatteryEntries(const WindowsBleCandidateBatteryCollector
                 continue;
             }
             const auto ble_device = *maybe_ble_device;
-            const auto opened_ble_address = TryGetBluetoothAddress(ble_device);
-            if (opened_ble_address.has_value() &&
-                accumulator->AddressesWithRealBattery().contains(*opened_ble_address)) {
+            const bool ble_is_connected = ble_device.ConnectionStatus() == BluetoothConnectionStatus::Connected;
+            if (!ble_is_connected) {
                 if (context.debug_enabled) {
                     LogDebug(context.debug_log,
-                             "BLE candidate skipped because fast battery already exists id='" + candidate_id + "'");
+                             "BLE candidate skipped because device is disconnected id='" + candidate_id + "'");
                 }
                 continue;
             }
@@ -293,20 +292,6 @@ void CollectBleCandidateBatteryEntries(const WindowsBleCandidateBatteryCollector
                 }
             }
 
-            if (likely_xiaomi_tws &&
-                !HasUsefulXiaomiTwsReadings(resolved_readings) &&
-                resolved_address_for_fallback.has_value()) {
-                const auto persisted_result = xiaomi_classic_cache->ReadPersistent(*resolved_address_for_fallback, 2U);
-                if (!persisted_result.readings.empty() &&
-                    XiaomiReadingsRichnessScore(persisted_result.readings) > XiaomiReadingsRichnessScore(resolved_readings)) {
-                    resolved_readings = persisted_result.readings;
-                    resolved_from_persistent_cache = persisted_result.from_persistent_cache;
-                    LogDebug(context.debug_log,
-                             "BLE Xiaomi fallback: last successful live snapshot accepted for '" + device_name + "'");
-                }
-            }
-
-            const bool ble_is_connected = ble_device.ConnectionStatus() == BluetoothConnectionStatus::Connected;
             if (!likely_tws && resolved_readings.empty()) {
                 const auto endpoint_battery = ReadBatteryPercentFromEndpointProperties(device_info);
                 if (endpoint_battery.has_value()) {
@@ -352,6 +337,16 @@ void CollectBleCandidateBatteryEntries(const WindowsBleCandidateBatteryCollector
                 !resolved_from_persistent_cache &&
                 HasUsefulXiaomiTwsReadings(resolved_readings, 2U)) {
                 xiaomi_classic_cache->Persist(*resolved_address_for_fallback, resolved_readings);
+            }
+
+            const bool has_tws_components = std::any_of(
+                resolved_readings.begin(), resolved_readings.end(), [](const BatteryReading& reading) {
+                    const std::string component = ToLowerAscii(reading.component);
+                    return component == "left" || component == "right" || component == "case";
+                });
+            if (likely_tws && !resolved_from_persistent_cache && has_tws_components &&
+                resolved_address_for_fallback.has_value()) {
+                accumulator->RemoveTwsBatteryEntriesForAddress(*resolved_address_for_fallback);
             }
 
             for (const auto& battery_reading : resolved_readings) {

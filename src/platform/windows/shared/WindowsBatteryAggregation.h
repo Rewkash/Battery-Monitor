@@ -26,6 +26,7 @@ struct DisconnectedPairedCollection {
 class DeviceBatteryAccumulator {
    public:
     void AddEntry(DeviceBatteryInfo entry);
+    void RemoveTwsBatteryEntriesForAddress(std::uint64_t address);
     void MarkAddressWithRealBattery(std::uint64_t address);
     bool Empty() const;
     const std::vector<DeviceBatteryInfo>& Entries() const;

@@ -131,6 +131,31 @@ void DeviceBatteryAccumulator::AddEntry(DeviceBatteryInfo entry) {
     entries_.push_back(std::move(entry));
 }
 
+void DeviceBatteryAccumulator::RemoveTwsBatteryEntriesForAddress(std::uint64_t address) {
+    entries_.erase(
+        std::remove_if(entries_.begin(), entries_.end(),
+                       [address](const DeviceBatteryInfo& entry) {
+                           const auto parsed_address = ParseBluetoothAddressFromDeviceId(entry.device_id);
+                           if (!parsed_address.has_value() || *parsed_address != address) {
+                               return false;
+                           }
+                           const std::string component = ToLowerAscii(entry.battery_component);
+                           return component == "left" || component == "right" || component == "case";
+                       }),
+        entries_.end());
+
+    known_entries_.clear();
+    addresses_with_real_battery_.erase(address);
+    for (std::size_t i = 0; i < entries_.size(); ++i) {
+        const auto& entry = entries_[i];
+        known_entries_.emplace(MakeEntryKey(entry), i);
+        const auto parsed_address = ParseBluetoothAddressFromDeviceId(entry.device_id);
+        if (entry.battery_level_percent.has_value() && !entry.is_cached && parsed_address.has_value()) {
+            addresses_with_real_battery_.insert(*parsed_address);
+        }
+    }
+}
+
 void DeviceBatteryAccumulator::MarkAddressWithRealBattery(std::uint64_t address) {
     if (address > 0xFFFFULL) {
         addresses_with_real_battery_.insert(address);

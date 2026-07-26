@@ -95,7 +95,16 @@ void AddCandidateReadings(DeviceBatteryAccumulator* accumulator,
     const std::string device_id = ResolveCandidateDeviceId(candidate);
     const std::string device_name =
         device_name_override != nullptr && !device_name_override->empty() ? *device_name_override
-                                                                          : ResolveCandidateDeviceName(candidate);
+                                                                           : ResolveCandidateDeviceName(candidate);
+
+    const bool has_tws_components = std::any_of(
+        readings.begin(), readings.end(), [](const BatteryReading& reading) {
+            const std::string component = ToLowerAscii(reading.component);
+            return component == "left" || component == "right" || component == "case";
+        });
+    if (!is_cached && has_tws_components) {
+        accumulator->RemoveTwsBatteryEntriesForAddress(candidate.bluetooth_address);
+    }
 
     for (const auto& battery_reading : readings) {
         DeviceBatteryInfo entry;
@@ -152,9 +161,26 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
         }
         accumulator->AddEntry(fast_entry);
     }
+    const std::size_t connected_tws_candidates = static_cast<std::size_t>(std::count_if(
+        tws_candidates.begin(), tws_candidates.end(),
+        [](const EndpointCandidate& candidate) { return candidate.is_connected; }));
+    const bool has_fast_connected_battery = std::any_of(
+        fast_connected_entries.begin(), fast_connected_entries.end(),
+        [&tws_candidates](const DeviceBatteryInfo& entry) {
+            if (!entry.is_connected || !entry.battery_level_percent.has_value()) {
+                return false;
+            }
+            const auto entry_address = ParseBluetoothAddressFromDeviceId(entry.device_id);
+            return entry_address.has_value() && std::any_of(
+                tws_candidates.begin(), tws_candidates.end(),
+                [&entry_address](const EndpointCandidate& candidate) {
+                    return candidate.is_connected && candidate.bluetooth_address == *entry_address;
+                });
+        });
     const bool should_scan_aep = context.force_aep_scan ||
-                                 (targeted && tws_candidates.empty()) ||
-                                 (!targeted && tws_candidates.size() < 2U);
+                                 (targeted && connected_tws_candidates == 0U) ||
+                                 (!targeted && connected_tws_candidates == 0U) ||
+                                 !has_fast_connected_battery;
     if (should_scan_aep) {
         std::vector<EndpointCandidate> aep_tws_candidates;
         const auto endpoint_entries = ReadAssociationEndpointBattery(
@@ -172,12 +198,10 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
     }
 
     for (const auto& candidate : tws_candidates) {
-        if (accumulator->AddressesWithRealBattery().contains(candidate.bluetooth_address)) {
-            continue;
-        }
-
-        if (context.include_disconnected && !candidate.is_connected) {
-            AddOfflineCandidateEntry(accumulator, candidate);
+        if (!candidate.is_connected) {
+            if (context.include_disconnected) {
+                AddOfflineCandidateEntry(accumulator, candidate);
+            }
             continue;
         }
 
@@ -188,14 +212,6 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
             context.is_likely_xiaomi_earbuds != nullptr &&
             context.is_likely_xiaomi_earbuds(candidate.endpoint_name, candidate.endpoint_name, candidate.endpoint_id);
         const bool should_try_classic_for_candidate = likely_xiaomi_tws || candidate_is_likely_zmi;
-        const auto& addresses_with_real_battery = accumulator->AddressesWithRealBattery();
-        if (!targeted && likely_xiaomi_tws && !addresses_with_real_battery.empty() &&
-            !addresses_with_real_battery.contains(candidate.bluetooth_address)) {
-            LogDebug(context.debug_log,
-                     "Xiaomi TWS candidate skipped because another connected TWS battery is available for '" +
-                         candidate.endpoint_name + "'");
-            continue;
-        }
         const bool aggressive_xiaomi_retry =
             candidate.from_connected_scan &&
             !context.include_disconnected &&
@@ -211,7 +227,8 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
                                            aggressive_xiaomi_retry,
                                            2U);
             if (!classic_result.readings.empty()) {
-                if (candidate_is_likely_zmi && XiaomiResolvedTwsComponentCount(classic_result.readings) >= 1U) {
+                if (candidate_is_likely_zmi && !classic_result.from_persistent_cache &&
+                    XiaomiResolvedTwsComponentCount(classic_result.readings) >= 1U) {
                     AddCandidateReadings(
                         accumulator,
                         candidate,
@@ -257,23 +274,6 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
                     partial_classic_from_cache,
                     candidate.is_connected);
                 continue;
-            }
-
-            if (likely_xiaomi_tws) {
-                const auto persisted_result = xiaomi_classic_cache->ReadPersistent(candidate.bluetooth_address, 2U);
-                if (!persisted_result.readings.empty() &&
-                    HasUsefulXiaomiTwsReadings(persisted_result.readings, 2U)) {
-                    AddCandidateReadings(
-                        accumulator,
-                        candidate,
-                        persisted_result.readings,
-                        persisted_result.from_persistent_cache,
-                        candidate.is_connected);
-                    LogDebug(context.debug_log,
-                             "AEP fallback: last successful live snapshot used for '" +
-                                 ResolveCandidateDeviceName(candidate) + "'");
-                    continue;
-                }
             }
 
             AddUnknownCandidateEntry(accumulator, candidate, candidate.is_connected);
@@ -344,18 +344,6 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
                                  std::to_string(resolved_readings.size()) +
                                  " entries for '" + candidate.endpoint_name + "'");
                 }
-            }
-        }
-
-        if (should_try_classic_for_candidate && !HasUsefulXiaomiTwsReadings(resolved_readings)) {
-            const auto persisted_result = xiaomi_classic_cache->ReadPersistent(candidate.bluetooth_address, 2U);
-            if (!persisted_result.readings.empty() &&
-                XiaomiReadingsRichnessScore(persisted_result.readings) > XiaomiReadingsRichnessScore(resolved_readings)) {
-                resolved_readings = persisted_result.readings;
-                resolved_from_persistent_cache = persisted_result.from_persistent_cache;
-                LogDebug(context.debug_log,
-                         "AEP Xiaomi fallback: last successful live snapshot accepted for '" +
-                             candidate.endpoint_name + "'");
             }
         }
 

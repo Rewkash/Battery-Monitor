@@ -28,10 +28,9 @@ class XiaomiClassicBatteryCache {
                               bool debug_enabled = false,
                               XiaomiDebugLogFn debug_log = nullptr);
 
-    const XiaomiReadResult& Read(std::uint64_t address,
-                                 bool aggressive_retry,
-                                 std::size_t min_tws_components = 1U);
-    XiaomiReadResult ReadPersistent(std::uint64_t address, std::size_t min_tws_components = 1U) const;
+    XiaomiReadResult Read(std::uint64_t address,
+                          bool aggressive_retry,
+                          std::size_t min_tws_components = 1U);
     void Persist(std::uint64_t address, const std::vector<BatteryReading>& readings) const;
 
    private:
@@ -41,8 +40,9 @@ class XiaomiClassicBatteryCache {
     int ttl_minutes_ = 180;
     bool debug_enabled_ = false;
     XiaomiDebugLogFn debug_log_ = nullptr;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::unordered_map<std::uint64_t, XiaomiReadResult> cache_;
+    std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> last_successful_live_read_;
     std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> last_failed_live_read_;
     std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> live_read_in_progress_;
 };

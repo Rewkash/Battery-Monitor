@@ -205,6 +205,16 @@ std::vector<DeviceBatteryInfo> ReadConnectedBluetoothDeviceBatteryFast(
         auto battery_percent = ReadBatteryPercentFromEndpointProperties(device_info);
         if (!battery_percent.has_value() &&
             address.has_value() &&
+            likely_tws) {
+            battery_percent = read_phone_hfp_battery_cached(*address);
+            if (battery_percent.has_value()) {
+                LogDebug(context,
+                         "Fast connected TWS HFP battery accepted for '" + device_name +
+                             "': " + std::to_string(*battery_percent));
+            }
+        }
+        if (!battery_percent.has_value() &&
+            address.has_value() &&
             context.is_likely_phone_device != nullptr &&
             context.is_likely_phone_device(device_name, device_name, device_id)) {
             battery_percent = read_phone_hfp_battery_cached(*address);
