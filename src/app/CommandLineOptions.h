@@ -16,6 +16,8 @@ struct PlatformCommandOptions {
 };
 
 struct CommandLineOptions {
+    bool show_version = false;
+    bool check_updates = false;
     bool json_output = false;
     bool cli_output = false;
     bool gui_forced = false;

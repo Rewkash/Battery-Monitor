@@ -6,6 +6,8 @@
 /out/
 /bin/
 /obj/
+/release-staging/
+/signing-output/
 
 # CMake generated files (in-source fallback)
 /CMakeCache.txt
@@ -37,6 +39,13 @@ CMakeUserPresets.json
 *.iobj
 *.exp
 *.map
+*.pfx
+*.p12
+*.pem
+*.key
+*.cer
+__pycache__/
+*.py[cod]
 
 # Visual Studio
 /.vs/

@@ -1,5 +1,14 @@
 # Battery Monitor
 
+Current application version is defined once in the root `CMakeLists.txt`. Windows builds include an optional signed GitHub Releases updater; see [auto-update design](docs/auto-update-design.md) and [release process](docs/release-process.md).
+
+Version and update check:
+
+```powershell
+.\build\Debug\battery-monitor-cli.exe --version
+.\build\Debug\battery-monitor-cli.exe --check-updates --json
+```
+
 Native C++20 application for viewing Bluetooth device battery state.
 
 The project provides a shared core, a CLI, and an optional Qt 6 desktop UI. Windows uses WinRT Bluetooth APIs with extra device-specific readers for several common device classes. Linux reads battery data from BlueZ over D-Bus.

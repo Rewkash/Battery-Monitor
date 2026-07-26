@@ -4,6 +4,12 @@
 #include "ui/NoiseControlUi.h"
 #include "ui/BatteryStatsDialog.h"
 #include "ui/BatteryWindowSettings.h"
+#include <QRandomGenerator>
+#ifdef BATTERY_MONITOR_WITH_UPDATER
+#include "ui/UpdateDialog.h"
+#include "update/UpdateService.h"
+#include "BatteryMonitorVersion.h"
+#endif
 #include "ui/DeviceDiagnosticsDialog.h"
 #include "ui/DraggableDeviceRow.h"
 
@@ -2403,6 +2409,36 @@ QWidget#listContainer {
 
     AdjustWindowHeightForRows(kMaxVisibleRows);
     InitializeTray();
+#ifdef BATTERY_MONITOR_WITH_UPDATER
+    update_service_ = new UpdateService(this);
+    connect(update_service_, &UpdateService::CheckFinished, this,
+            [this](bool available, const UpdateManifest& manifest, const QString& error) {
+        if (!error.isEmpty()) {
+            if (status_label_ != nullptr) {
+                status_label_->setText(QString::fromUtf8(u8"Ошибка проверки обновлений: %1").arg(error));
+            }
+            return;
+        }
+        if (available) {
+            ShowApplicationUpdate(manifest);
+        } else if (status_label_ != nullptr) {
+            status_label_->setText(QString::fromUtf8(u8"Установлена последняя версия"));
+        }
+    });
+    connect(update_service_, &UpdateService::DownloadProgress, this,
+            [this](qint64 received, qint64 total) {
+        if (update_dialog_ != nullptr) update_dialog_->SetDownloadProgress(received, total);
+    });
+    connect(update_service_, &UpdateService::InstallFailed, this, [this](const QString& error) {
+        if (update_dialog_ != nullptr) update_dialog_->SetError(error);
+    });
+    connect(update_service_, &UpdateService::InstallReady, this, [this]() {
+        if (update_dialog_ != nullptr) update_dialog_->SetInstalling();
+        PrepareForUpdateExit();
+    });
+    QTimer::singleShot(5000 + QRandomGenerator::global()->bounded(25000), this,
+                       [this]() { CheckForApplicationUpdates(false); });
+#endif
     StartBluetoothDeviceWatcher();
     RefreshBatteryData(true, false);
 }
@@ -2501,6 +2537,11 @@ void BatteryWindow::InitializeTray() {
         u8"\u041F\u043E\u043A\u0430\u0437\u0430\u0442\u044C \u0441\u043A\u0440\u044B\u0442\u044B\u0435 "
         u8"\u0443\u0441\u0442\u0440\u043E\u0439\u0441\u0442\u0432\u0430"));
     tray_menu_->addSeparator();
+#ifdef BATTERY_MONITOR_WITH_UPDATER
+    check_updates_action_ = tray_menu_->addAction(
+        QString::fromUtf8(u8"Проверить обновления (%1)").arg(QStringLiteral(BATTERY_MONITOR_VERSION)));
+    tray_menu_->addSeparator();
+#endif
     quit_action_ = tray_menu_->addAction(QString::fromUtf8(u8"\u0412\u044B\u0445\u043E\u0434"));
 
     connect(toggle_window_action_, &QAction::triggered, this, [this]() {
@@ -2512,6 +2553,10 @@ void BatteryWindow::InitializeTray() {
     });
     connect(refresh_action_, &QAction::triggered, this, [this]() { RefreshBatteryDataFromUser(); });
     connect(reset_hidden_action_, &QAction::triggered, this, [this]() { ResetHiddenDevices(); });
+#ifdef BATTERY_MONITOR_WITH_UPDATER
+    connect(check_updates_action_, &QAction::triggered, this,
+            [this]() { CheckForApplicationUpdates(true); });
+#endif
     connect(quit_action_, &QAction::triggered, this, [this]() { QuitFromTray(); });
 
     connect(tray_icon_, &QSystemTrayIcon::activated, this,
@@ -2530,6 +2575,53 @@ void BatteryWindow::InitializeTray() {
     tray_icon_->show();
 
     UpdateToggleActionText();
+}
+
+void BatteryWindow::CheckForApplicationUpdates(bool user_initiated) {
+#ifdef BATTERY_MONITOR_WITH_UPDATER
+    if (update_service_ == nullptr) {
+        return;
+    }
+    if (user_initiated && status_label_ != nullptr) {
+        status_label_->setText(QString::fromUtf8(u8"Проверка обновлений…"));
+    }
+    update_service_->CheckForUpdates(user_initiated);
+#else
+    (void)user_initiated;
+#endif
+}
+
+void BatteryWindow::ShowApplicationUpdate(const UpdateManifest& manifest) {
+#ifdef BATTERY_MONITOR_WITH_UPDATER
+    if (update_dialog_ != nullptr) {
+        update_dialog_->show();
+        update_dialog_->raise();
+        update_dialog_->activateWindow();
+        return;
+    }
+    auto* dialog = new UpdateDialog(manifest, this);
+    update_dialog_ = dialog;
+    connect(dialog, &UpdateDialog::InstallRequested, this, [this, manifest]() {
+        if (update_service_ != nullptr) update_service_->DownloadAndInstall(manifest);
+    });
+    connect(dialog, &QObject::destroyed, this, [this]() { update_dialog_ = nullptr; });
+    dialog->show();
+    dialog->raise();
+    dialog->activateWindow();
+#else
+    (void)manifest;
+#endif
+}
+
+void BatteryWindow::PrepareForUpdateExit() {
+    quitting_ = true;
+    if (refresh_timer_ != nullptr) refresh_timer_->stop();
+    if (runtime_timer_ != nullptr) runtime_timer_->stop();
+    if (bluetooth_refresh_debounce_timer_ != nullptr) bluetooth_refresh_debounce_timer_->stop();
+    StopBluetoothDeviceWatcher();
+    if (tray_icon_ != nullptr) tray_icon_->hide();
+    close();
+    if (qApp != nullptr) qApp->quit();
 }
 
 void BatteryWindow::ShowWindowFromTray() {

@@ -1,0 +1,23 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730 # v4.3.1
+        with:
+          version: '6.8.3'
+          arch: win64_msvc2022_64
+          modules: 'qtsvg'
+          cache: true
+      - run: cmake --fresh -S . -B build -G "Visual Studio 17 2022" -A x64
+      - run: cmake --build build --config Release
+      - run: build\Release\battery-monitor-cli.exe --version

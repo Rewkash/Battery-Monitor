@@ -34,6 +34,15 @@ CommandLineOptions ParseCommandLine(int argc, char** argv) {
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
+        if (arg == "--version") {
+            options.show_version = true;
+            continue;
+        }
+        if (arg == "--check-updates") {
+            options.check_updates = true;
+            options.cli_output = true;
+            continue;
+        }
         if (arg == "--json") {
             options.json_output = true;
             continue;
@@ -69,7 +78,8 @@ CommandLineOptions ParseCommandLine(int argc, char** argv) {
 }
 
 bool ShouldLaunchGui(const CommandLineOptions& options, bool prefer_gui) noexcept {
-    return !options.json_output && !options.cli_output && (prefer_gui || options.gui_forced);
+    return !options.show_version && !options.check_updates && !options.json_output && !options.cli_output &&
+           (prefer_gui || options.gui_forced);
 }
 
 }  // namespace battery_monitor

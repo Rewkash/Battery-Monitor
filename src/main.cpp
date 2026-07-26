@@ -4,8 +4,15 @@
 
 #ifdef BATTERY_MONITOR_WITH_QT
 #include <QApplication>
+#include <QCoreApplication>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QTimer>
 
 #include "ui/BatteryWindow.h"
+#ifdef BATTERY_MONITOR_WITH_UPDATER
+#include "update/UpdateService.h"
+#endif
 #endif
 
 #include "AppMain.h"
@@ -13,13 +20,20 @@
 #include "app/CommandLineOptions.h"
 #include "app/PlatformCommandDispatcher.h"
 #include "core/ProviderFactory.h"
+#include "BatteryMonitorVersion.h"
+#ifdef BATTERY_MONITOR_WITH_UPDATER
+#include "update/StartupHealth.h"
+#endif
 
 namespace battery_monitor {
 
 namespace {
 
-int RunCliApplication(const CommandLineOptions& options) {
+int RunCliApplication(int argc, char** argv, const CommandLineOptions& options) {
     auto provider = CreateBatteryProvider();
+#ifdef BATTERY_MONITOR_WITH_UPDATER
+    SignalUpdateStartupHealth(argc, argv);
+#endif
     BatteryQueryOptions query_options;
     query_options.include_disconnected = options.include_offline;
     const auto devices = provider->GetDevicesBattery(query_options);
@@ -31,9 +45,15 @@ int RunCliApplication(const CommandLineOptions& options) {
 int RunGuiApplication(int argc, char** argv) {
 #ifdef BATTERY_MONITOR_WITH_QT
     QApplication app(argc, argv);
+    QCoreApplication::setOrganizationName(QStringLiteral(BATTERY_MONITOR_PUBLISHER));
+    QCoreApplication::setApplicationName(QStringLiteral("Battery Monitor"));
+    QCoreApplication::setApplicationVersion(QStringLiteral(BATTERY_MONITOR_VERSION));
     auto provider = CreateBatteryProvider();
     BatteryWindow window(std::move(provider));
     window.Launch();
+#ifdef BATTERY_MONITOR_WITH_UPDATER
+    QTimer::singleShot(0, &app, [argc, argv]() { SignalUpdateStartupHealth(argc, argv); });
+#endif
     return app.exec();
 #else
     (void)argc;
@@ -41,6 +61,55 @@ int RunGuiApplication(int argc, char** argv) {
     return 0;
 #endif
 }
+
+#ifdef BATTERY_MONITOR_WITH_QT
+int RunUpdateCheck(int argc, char** argv, bool json_output) {
+#ifdef BATTERY_MONITOR_WITH_UPDATER
+    QCoreApplication app(argc, argv);
+    QCoreApplication::setOrganizationName(QStringLiteral(BATTERY_MONITOR_PUBLISHER));
+    QCoreApplication::setApplicationName(QStringLiteral("Battery Monitor"));
+    QCoreApplication::setApplicationVersion(QStringLiteral(BATTERY_MONITOR_VERSION));
+    UpdateService service;
+    int result = 20;
+    QObject::connect(&service, &UpdateService::CheckFinished, &app,
+                     [&](bool available, const UpdateManifest& manifest, const QString& error) {
+        if (!error.isEmpty()) {
+            if (json_output) {
+                const QJsonObject output{{QStringLiteral("schemaVersion"), 1},
+                                         {QStringLiteral("error"), error}};
+                std::cout << QJsonDocument(output).toJson(QJsonDocument::Compact).constData() << '\n';
+            } else {
+                std::cerr << "Update check failed: " << error.toStdString() << '\n';
+            }
+            result = 20;
+        } else if (available) {
+            if (json_output) {
+                std::cout << "{\"schemaVersion\":1,\"updateAvailable\":true,\"version\":\""
+                          << manifest.version.toStdString() << "\",\"mandatory\":"
+                          << (manifest.mandatory ? "true" : "false") << "}\n";
+            } else {
+                std::cout << "Update available: " << manifest.version.toStdString() << '\n';
+            }
+            result = manifest.mandatory ? 11 : 10;
+        } else {
+            std::cout << (json_output ? "{\"schemaVersion\":1,\"updateAvailable\":false}\n"
+                                      : "No update available.\n");
+            result = 0;
+        }
+        app.quit();
+    });
+    QTimer::singleShot(0, &service, [&service]() { service.CheckForUpdates(true); });
+    app.exec();
+    return result;
+#else
+    (void)argc;
+    (void)argv;
+    (void)json_output;
+    std::cerr << "Updater is not available in this build.\n";
+    return 20;
+#endif
+}
+#endif
 
 }  // namespace
 
@@ -50,6 +119,15 @@ int battery_monitor::BatteryMonitorMain(int argc, char** argv, bool prefer_gui) 
     const CommandLineOptions options = ParseCommandLine(argc, argv);
 
     try {
+        if (options.show_version) {
+            std::cout << BATTERY_MONITOR_VERSION << '\n';
+            return 0;
+        }
+#ifdef BATTERY_MONITOR_WITH_QT
+        if (options.check_updates) {
+            return RunUpdateCheck(argc, argv, options.json_output);
+        }
+#endif
         if (const auto exit_code = TryRunPlatformCommand(options.platform_commands); exit_code.has_value()) {
             return *exit_code;
         }
@@ -58,7 +136,7 @@ int battery_monitor::BatteryMonitorMain(int argc, char** argv, bool prefer_gui) 
             return RunGuiApplication(argc, argv);
         }
 #endif
-        return RunCliApplication(options);
+        return RunCliApplication(argc, argv, options);
     } catch (const std::exception& ex) {
         if (!PrintPlatformException(ex, std::cerr)) {
             std::cerr << "Error: " << ex.what() << '\n';

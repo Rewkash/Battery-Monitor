@@ -46,6 +46,9 @@ namespace battery_monitor {
 class BatteryHistoryDialog;
 class BatteryStatsDialog;
 class DeviceDiagnosticsDialog;
+class UpdateDialog;
+class UpdateService;
+struct UpdateManifest;
 
 class BatteryWindow : public QWidget {
    public:
@@ -64,7 +67,10 @@ class BatteryWindow : public QWidget {
      void RefreshBatteryDataForDevice(const std::string& device_id);
     void PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& devices);
     void ClearDeviceCards();
-    void InitializeTray();
+     void InitializeTray();
+     void CheckForApplicationUpdates(bool user_initiated);
+     void ShowApplicationUpdate(const UpdateManifest& manifest);
+     void PrepareForUpdateExit();
     void ShowWindowFromTray();
     void HideWindowToTray();
     void QuitFromTray();
@@ -116,6 +122,7 @@ class BatteryWindow : public QWidget {
     QAction* toggle_window_action_ = nullptr;
     QAction* refresh_action_ = nullptr;
     QAction* reset_hidden_action_ = nullptr;
+    QAction* check_updates_action_ = nullptr;
     QAction* quit_action_ = nullptr;
     QTimer* refresh_timer_ = nullptr;
     QTimer* runtime_timer_ = nullptr;
@@ -157,6 +164,8 @@ class BatteryWindow : public QWidget {
     int low_battery_threshold_percent_ = kBatteryWindowDefaultLowBatteryThresholdPercent;
     int low_battery_repeat_minutes_ = kBatteryWindowDefaultLowBatteryRepeatMinutes;
     bool quitting_ = false;
+    UpdateService* update_service_ = nullptr;
+    QPointer<UpdateDialog> update_dialog_;
     BatteryHistoryStore history_store_;
 };
 

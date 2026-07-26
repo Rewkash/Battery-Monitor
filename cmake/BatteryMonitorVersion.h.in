@@ -1,0 +1,11 @@
+#pragma once
+
+#define BATTERY_MONITOR_VERSION "@PROJECT_VERSION@"
+#define BATTERY_MONITOR_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define BATTERY_MONITOR_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define BATTERY_MONITOR_VERSION_PATCH @PROJECT_VERSION_PATCH@
+#define BATTERY_MONITOR_PUBLISHER "Orion Group"
+#define BATTERY_MONITOR_UPDATE_MANIFEST_URL \
+    "https://github.com/Rewkash/Battery-Monitor/releases/latest/download/update-manifest.json"
+#define BATTERY_MONITOR_UPDATE_SIGNATURE_URL \
+    "https://github.com/Rewkash/Battery-Monitor/releases/latest/download/update-manifest.json.sig"

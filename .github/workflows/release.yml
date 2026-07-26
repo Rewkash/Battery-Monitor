@@ -1,0 +1,68 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730 # v4.3.1
+        with:
+          version: '6.8.3'
+          arch: win64_msvc2022_64
+          modules: 'qtsvg'
+          cache: true
+      - name: Validate version
+        shell: pwsh
+        run: |
+          $tagVersion = "${{ github.ref_name }}".TrimStart('v')
+          $cmakeVersion = (Select-String -Path CMakeLists.txt -Pattern 'project\(BatteryMonitor VERSION ([0-9.]+)').Matches.Groups[1].Value
+          if ($tagVersion -ne $cmakeVersion) { throw "Tag $tagVersion does not match CMake $cmakeVersion" }
+      - run: cmake --fresh -S . -B build -G "Visual Studio 17 2022" -A x64
+      - run: cmake --build build --config Release
+      - name: Stage package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory release-staging\app | Out-Null
+          Copy-Item build\Release\*.exe release-staging\app
+          Copy-Item build\Release\*.dll release-staging\app
+          Get-ChildItem build\Release -Directory | ForEach-Object { Copy-Item $_.FullName release-staging\app -Recurse }
+          Copy-Item profiles release-staging\app -Recurse
+      - name: Authenticode production placeholder
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+        run: |
+          if (-not $env:WINDOWS_SIGNING_PFX_BASE64) {
+            throw "Trusted Authenticode certificate is required for production releases."
+          } else {
+            $pfx = Join-Path $env:RUNNER_TEMP signing.pfx
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX_BASE64))
+            .\scripts\signing\Sign-DevelopmentBuild.ps1 -BuildDirectory release-staging\app -PfxPath $pfx -Password $env:WINDOWS_SIGNING_PFX_PASSWORD
+            Remove-Item $pfx -Force
+          }
+      - name: Build and sign update
+        shell: pwsh
+        env:
+          BATTERY_MONITOR_ED25519_PRIVATE_KEY_B64: ${{ secrets.BATTERY_MONITOR_ED25519_PRIVATE_KEY_B64 }}
+        run: |
+          py -3.11 -m pip install --disable-pip-version-check --no-deps --only-binary=:all: --require-hashes -r scripts\release\requirements.txt
+          py -3.11 scripts\release\build_bundle.py --input release-staging\app --output release-staging\battery-monitor-${{ github.ref_name }}-win-x64.bmup
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          py -3.11 scripts\release\sign_manifest.py --version $version --sequence ${{ github.run_number }} --bundle release-staging\battery-monitor-${{ github.ref_name }}-win-x64.bmup --artifact-url "https://github.com/Rewkash/Battery-Monitor/releases/download/${{ github.ref_name }}/battery-monitor-${{ github.ref_name }}-win-x64.bmup" --release-notes-url "https://github.com/Rewkash/Battery-Monitor/releases/tag/${{ github.ref_name }}" --output-dir release-staging
+          py -3.11 scripts\release\verify_release.py --manifest release-staging\update-manifest.json --signature release-staging\update-manifest.json.sig --bundle release-staging\battery-monitor-${{ github.ref_name }}-win-x64.bmup
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-staging/*.bmup
+            release-staging/update-manifest.json
+            release-staging/update-manifest.json.sig
