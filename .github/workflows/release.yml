@@ -79,6 +79,8 @@ jobs:
           BATTERY_MONITOR_ED25519_PRIVATE_KEY_B64: ${{ secrets.BATTERY_MONITOR_ED25519_PRIVATE_KEY_B64 }}
         run: |
           py -3.11 -m pip install --disable-pip-version-check --no-deps --only-binary=:all: --require-hashes -r scripts\release\requirements.txt
+          py -3.11 -m pip check
+          py -3.11 -c "import _cffi_backend; from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey; assert len(Ed25519PrivateKey.generate().sign(b'release-check')) == 64"
           py -3.11 scripts\release\build_bundle.py --input release-staging\app --output release-staging\battery-monitor-${{ github.ref_name }}-win-x64.bmup
           $version = "${{ steps.release_meta.outputs.version }}"
           py -3.11 scripts\release\sign_manifest.py --version $version --sequence ${{ github.run_number }} --bundle release-staging\battery-monitor-${{ github.ref_name }}-win-x64.bmup --artifact-url "https://github.com/Rewkash/Battery-Monitor/releases/download/${{ github.ref_name }}/battery-monitor-${{ github.ref_name }}-win-x64.bmup" --release-notes-url "https://github.com/Rewkash/Battery-Monitor/releases/tag/${{ github.ref_name }}" --output-dir release-staging
