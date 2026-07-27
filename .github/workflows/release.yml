@@ -59,6 +59,7 @@ jobs:
           }
       - name: Authenticode test signing
         if: steps.release_meta.outputs.test == 'true'
+        timeout-minutes: 10
         shell: pwsh
         env:
           WINDOWS_TEST_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_TEST_SIGNING_PFX_BASE64 }}
@@ -73,7 +74,7 @@ jobs:
             $certificate = Get-PfxCertificate -FilePath $pfx -Password $securePassword
             Export-Certificate -Cert $certificate -FilePath $cer | Out-Null
             Import-Certificate -FilePath $cer -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
-            .\scripts\signing\Sign-DevelopmentBuild.ps1 -BuildDirectory release-staging\app -PfxPath $pfx -Password $env:WINDOWS_TEST_SIGNING_PFX_PASSWORD
+            .\scripts\signing\Sign-DevelopmentBuild.ps1 -BuildDirectory release-staging\app -PfxPath $pfx -Password $env:WINDOWS_TEST_SIGNING_PFX_PASSWORD -SkipTimestamp
             Get-ChildItem release-staging\app -Recurse -Include *.exe,*.dll | ForEach-Object {
               $signature = Get-AuthenticodeSignature $_.FullName
               if ($signature.SignerCertificate.Thumbprint -ne $certificate.Thumbprint) {

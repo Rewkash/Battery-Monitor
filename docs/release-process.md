@@ -52,6 +52,7 @@ Self-signed signatures are only for development and do not establish public trus
 
 For an explicitly self-signed test prerelease, configure `WINDOWS_TEST_SIGNING_PFX_BASE64` and
 `WINDOWS_TEST_SIGNING_PFX_PASSWORD`, then tag `vX.Y.Z-test.N`. Test tags never fall back to the
-production Authenticode credentials and are published as GitHub prereleases.
+production Authenticode credentials and are published as GitHub prereleases. Test signatures omit
+network timestamping; production signatures continue to require RFC 3161 timestamps.
 
 The manifest expires after 14 days. Ship a newer release before expiration. Lower sequence values than the last successfully started installation are rejected by clients. A protected metadata-refresh workflow is not implemented yet, so do not replace release metadata manually.
