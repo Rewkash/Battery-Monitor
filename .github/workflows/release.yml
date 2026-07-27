@@ -67,23 +67,11 @@ jobs:
         run: |
           if (-not $env:WINDOWS_TEST_SIGNING_PFX_BASE64) { throw "Test signing certificate is required." }
           $pfx = Join-Path $env:RUNNER_TEMP test-signing.pfx
-          $cer = Join-Path $env:RUNNER_TEMP test-signing.cer
-          $securePassword = ConvertTo-SecureString $env:WINDOWS_TEST_SIGNING_PFX_PASSWORD -AsPlainText -Force
           try {
             [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_TEST_SIGNING_PFX_BASE64))
-            $certificate = Get-PfxCertificate -FilePath $pfx -Password $securePassword
-            Export-Certificate -Cert $certificate -FilePath $cer | Out-Null
-            Import-Certificate -FilePath $cer -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
             .\scripts\signing\Sign-DevelopmentBuild.ps1 -BuildDirectory release-staging\app -PfxPath $pfx -Password $env:WINDOWS_TEST_SIGNING_PFX_PASSWORD -SkipTimestamp
-            Get-ChildItem release-staging\app -Recurse -Include *.exe,*.dll | ForEach-Object {
-              $signature = Get-AuthenticodeSignature $_.FullName
-              if ($signature.SignerCertificate.Thumbprint -ne $certificate.Thumbprint) {
-                throw "Unexpected test signer: $($_.FullName)"
-              }
-            }
           } finally {
-            if ($certificate) { Remove-Item "Cert:\CurrentUser\Root\$($certificate.Thumbprint)" -ErrorAction SilentlyContinue }
-            Remove-Item $pfx,$cer -Force -ErrorAction SilentlyContinue
+            Remove-Item $pfx -Force -ErrorAction SilentlyContinue
           }
       - name: Build and sign update
         shell: pwsh

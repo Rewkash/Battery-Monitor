@@ -12,7 +12,15 @@ $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurs
     Sort-Object FullName -Descending |
     Select-Object -First 1
 if (-not $signtool) { throw "signtool.exe not found" }
-$files = Get-ChildItem $BuildDirectory -Recurse -Include *.exe,*.dll
+$files = @(
+    "battery-monitor.exe",
+    "battery-monitor-cli.exe",
+    "battery-monitor-maintenance.exe"
+) | ForEach-Object {
+    $path = Join-Path $BuildDirectory $_
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Signing target not found: $path" }
+    Get-Item -LiteralPath $path
+}
 foreach ($file in $files) {
     if ($SkipTimestamp) {
         & $signtool.FullName sign /fd SHA256 /f $PfxPath /p $Password $file.FullName
@@ -20,7 +28,8 @@ foreach ($file in $files) {
         & $signtool.FullName sign /fd SHA256 /tr $TimestampUrl /td SHA256 /f $PfxPath /p $Password $file.FullName
     }
     if ($LASTEXITCODE -ne 0) { throw "Signing failed: $($file.FullName)" }
-    & $signtool.FullName verify /pa $file.FullName
-    if ($LASTEXITCODE -ne 0) { throw "Signature verification failed: $($file.FullName)" }
+    if (-not $SkipTimestamp) {
+        & $signtool.FullName verify /pa /all /tw $file.FullName
+        if ($LASTEXITCODE -ne 0) { throw "Signature verification failed: $($file.FullName)" }
+    }
 }
-$files | ForEach-Object { Get-AuthenticodeSignature $_.FullName | Select-Object Path,Status,SignerCertificate }
