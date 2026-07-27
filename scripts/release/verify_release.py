@@ -13,7 +13,7 @@ import struct
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 
-PUBLIC_KEY = base64.b64decode("DPivxj7wPutUTEtyUOwg411VVXHH0FCIle7Y6IVB9Xg=")
+PUBLIC_KEY = base64.b64decode("bfwjZfSItKzGrGJ8TXHWilvU8QvJgJZtj+yM/DIatRc=")
 MAX_FILES = 4096
 MAX_FILE_SIZE = 512 * 1024 * 1024
 RESERVED_NAMES = {"con", "prn", "aux", "nul", "clock$"} | {

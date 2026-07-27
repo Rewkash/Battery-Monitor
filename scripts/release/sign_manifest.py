@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 
-EXPECTED_PUBLIC_KEY_B64 = "DPivxj7wPutUTEtyUOwg411VVXHH0FCIle7Y6IVB9Xg="
+EXPECTED_PUBLIC_KEY_B64 = "bfwjZfSItKzGrGJ8TXHWilvU8QvJgJZtj+yM/DIatRc="
 
 
 def main() -> int:

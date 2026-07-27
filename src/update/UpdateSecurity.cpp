@@ -17,7 +17,7 @@
 namespace battery_monitor {
 namespace {
 
-const QByteArray kPublicKey = QByteArray::fromBase64("DPivxj7wPutUTEtyUOwg411VVXHH0FCIle7Y6IVB9Xg=");
+const QByteArray kPublicKey = QByteArray::fromBase64("bfwjZfSItKzGrGJ8TXHWilvU8QvJgJZtj+yM/DIatRc=");
 
 bool Fail(QString* error, const QString& message) {
     if (error != nullptr) {

@@ -13,6 +13,10 @@
 
 Never commit PFX, PEM, private-key or password files. The private Ed25519 seed is consumed only from the environment. Pull-request workflows do not receive it.
 
+Key rotation is an atomic release change: run `generate_release_secrets.py`, replace the public key in
+`UpdateSecurity.cpp`, `sign_manifest.py`, and `verify_release.py`, verify all three values match
+`ed25519-public.b64`, and only then store `ed25519-seed.b64` as the GitHub secret.
+
 ## Development signing
 
 Self-signed signatures are only for development and do not establish public trust:
@@ -45,5 +49,9 @@ Self-signed signatures are only for development and do not establish public trus
 5. Approve the `release` GitHub environment.
 6. The workflow validates tag/CMake equality, builds GUI and CLI together, applies Authenticode when configured, creates one `bmup-1` bundle, hashes it, generates and signs the manifest, independently verifies all artifacts, then publishes them.
 7. Re-download the three GitHub Release assets and run `verify_release.py` before announcing the release.
+
+For an explicitly self-signed test prerelease, configure `WINDOWS_TEST_SIGNING_PFX_BASE64` and
+`WINDOWS_TEST_SIGNING_PFX_PASSWORD`, then tag `vX.Y.Z-test.N`. Test tags never fall back to the
+production Authenticode credentials and are published as GitHub prereleases.
 
 The manifest expires after 14 days. Ship a newer release before expiration. Lower sequence values than the last successfully started installation are rejected by clients. A protected metadata-refresh workflow is not implemented yet, so do not replace release metadata manually.
