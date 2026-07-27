@@ -85,11 +85,13 @@ jobs:
           $version = "${{ steps.release_meta.outputs.version }}"
           py -3.11 scripts\release\sign_manifest.py --version $version --sequence ${{ github.run_number }} --bundle release-staging\battery-monitor-${{ github.ref_name }}-win-x64.bmup --artifact-url "https://github.com/Rewkash/Battery-Monitor/releases/download/${{ github.ref_name }}/battery-monitor-${{ github.ref_name }}-win-x64.bmup" --release-notes-url "https://github.com/Rewkash/Battery-Monitor/releases/tag/${{ github.ref_name }}" --output-dir release-staging
           py -3.11 scripts\release\verify_release.py --manifest release-staging\update-manifest.json --signature release-staging\update-manifest.json.sig --bundle release-staging\battery-monitor-${{ github.ref_name }}-win-x64.bmup
+          Compress-Archive -Path release-staging\app\* -DestinationPath release-staging\battery-monitor-${{ github.ref_name }}-win-x64.zip -CompressionLevel Optimal
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           generate_release_notes: true
           prerelease: ${{ steps.release_meta.outputs.test == 'true' }}
           files: |
             release-staging/*.bmup
+            release-staging/*.zip
             release-staging/update-manifest.json
             release-staging/update-manifest.json.sig
