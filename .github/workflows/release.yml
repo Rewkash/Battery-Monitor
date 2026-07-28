@@ -48,14 +48,24 @@ jobs:
         env:
           WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
           WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+          WINDOWS_TEST_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_TEST_SIGNING_PFX_BASE64 }}
+          WINDOWS_TEST_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_TEST_SIGNING_PFX_PASSWORD }}
         run: |
-          if (-not $env:WINDOWS_SIGNING_PFX_BASE64) {
-            throw "Trusted Authenticode certificate is required for production releases."
-          } else {
+          if ($env:WINDOWS_SIGNING_PFX_BASE64) {
             $pfx = Join-Path $env:RUNNER_TEMP signing.pfx
             [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX_BASE64))
             .\scripts\signing\Sign-DevelopmentBuild.ps1 -BuildDirectory release-staging\app -PfxPath $pfx -Password $env:WINDOWS_SIGNING_PFX_PASSWORD
             Remove-Item $pfx -Force
+          } elseif ($env:WINDOWS_TEST_SIGNING_PFX_BASE64) {
+            $pfx = Join-Path $env:RUNNER_TEMP test-signing.pfx
+            try {
+              [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_TEST_SIGNING_PFX_BASE64))
+              .\scripts\signing\Sign-DevelopmentBuild.ps1 -BuildDirectory release-staging\app -PfxPath $pfx -Password $env:WINDOWS_TEST_SIGNING_PFX_PASSWORD -SkipTimestamp
+            } finally {
+              Remove-Item $pfx -Force -ErrorAction SilentlyContinue
+            }
+          } else {
+            throw "Production or test signing certificate is required."
           }
       - name: Authenticode test signing
         if: steps.release_meta.outputs.test == 'true'
