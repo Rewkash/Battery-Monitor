@@ -20,6 +20,10 @@ struct XiaomiClassicBatterySessionResult {
     bool auth_start_sent = false;
 };
 
+bool RunZmiRawAuthHandshake(SOCKET socket_handle,
+                            bool debug_enabled = false,
+                            XiaomiDebugLogFn debug_log = nullptr);
+
 XiaomiClassicBatterySessionResult RunXiaomiClassicBatterySession(
     SOCKET socket_handle,
     std::uint64_t bluetooth_address,

@@ -15,7 +15,7 @@ namespace battery_monitor {
 UpdateDialog::UpdateDialog(const UpdateManifest& manifest, QWidget* parent)
     : QDialog(parent), manifest_(manifest) {
     setAttribute(Qt::WA_DeleteOnClose);
-    setWindowTitle(QString::fromUtf8(u8"Обновление Battery Monitor"));
+    setWindowTitle(QString::fromUtf8(u8"Обновление ChargeViewer"));
     setMinimumWidth(470);
 
     auto* layout = new QVBoxLayout(this);

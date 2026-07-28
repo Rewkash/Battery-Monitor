@@ -1,5 +1,6 @@
 ﻿#include "platform/windows/devices/xiaomi/XiaomiControlConnection.h"
 
+#include "platform/windows/devices/xiaomi/XiaomiClassicBatterySession.h"
 #include "platform/windows/devices/xiaomi/XiaomiControlSocket.h"
 #include "platform/windows/devices/xiaomi/XiaomiHandshake.h"
 
@@ -27,6 +28,11 @@ XiaomiControlSocketStatus XiaomiControlConnection::OpenSocket(std::uint64_t blue
 bool XiaomiControlConnection::Authenticate(bool debug_enabled, XiaomiDebugLogFn debug_log) {
     if (socket_handle_ == INVALID_SOCKET) {
         return false;
+    }
+    if (connected_path_.starts_with("ZMI-1101")) {
+        const bool authenticated = RunZmiRawAuthHandshake(socket_handle_, debug_enabled, debug_log);
+        sequence_ = 0;
+        return authenticated;
     }
     return RunXiaomiAuthHandshake(socket_handle_, &sequence_, debug_enabled, debug_log);
 }

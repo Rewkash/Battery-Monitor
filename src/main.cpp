@@ -2,6 +2,11 @@
 #include <iostream>
 #include <memory>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <tlhelp32.h>
+#endif
+
 #ifdef BATTERY_MONITOR_WITH_QT
 #include <QApplication>
 #include <QCoreApplication>
@@ -29,6 +34,44 @@ namespace battery_monitor {
 
 namespace {
 
+#ifdef _WIN32
+bool ClaimGuiInstanceAndCloseLegacyCopies() {
+    static HANDLE instance_mutex = CreateMutexW(nullptr, TRUE, L"Local\\ChargeViewerGuiInstance");
+    if (instance_mutex == nullptr) {
+        return true;
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(instance_mutex);
+        instance_mutex = nullptr;
+        return false;
+    }
+
+    const DWORD current_pid = GetCurrentProcessId();
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return true;
+    }
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            if (entry.th32ProcessID == current_pid ||
+                _wcsicmp(entry.szExeFile, L"battery-monitor.exe") != 0) {
+                continue;
+            }
+            HANDLE process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, entry.th32ProcessID);
+            if (process != nullptr) {
+                TerminateProcess(process, 0);
+                WaitForSingleObject(process, 5000);
+                CloseHandle(process);
+            }
+        } while (Process32NextW(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    return true;
+}
+#endif
+
 int RunCliApplication(int argc, char** argv, const CommandLineOptions& options) {
     auto provider = CreateBatteryProvider();
 #ifdef BATTERY_MONITOR_WITH_UPDATER
@@ -45,6 +88,11 @@ int RunCliApplication(int argc, char** argv, const CommandLineOptions& options) 
 int RunGuiApplication(int argc, char** argv) {
 #ifdef BATTERY_MONITOR_WITH_QT
     QApplication app(argc, argv);
+#ifdef _WIN32
+    if (!ClaimGuiInstanceAndCloseLegacyCopies()) {
+        return 0;
+    }
+#endif
     QCoreApplication::setOrganizationName(QStringLiteral(BATTERY_MONITOR_PUBLISHER));
     QCoreApplication::setApplicationName(QStringLiteral("Battery Monitor"));
     QCoreApplication::setApplicationVersion(QStringLiteral(BATTERY_MONITOR_VERSION));

@@ -105,6 +105,8 @@ bool ReceiveExact(SOCKET socket_handle, std::uint8_t* output, std::size_t size) 
     return true;
 }
 
+}  // namespace
+
 bool RunZmiRawAuthHandshake(SOCKET socket_handle,
                             bool debug_enabled,
                             XiaomiDebugLogFn debug_log) {
@@ -161,8 +163,6 @@ bool RunZmiRawAuthHandshake(SOCKET socket_handle,
     MaybeDebugLog(debug_enabled, debug_log, "ZMI raw auth: handshake completed");
     return true;
 }
-
-}  // namespace
 
 XiaomiClassicBatterySessionResult RunXiaomiClassicBatterySession(
     SOCKET socket_handle,

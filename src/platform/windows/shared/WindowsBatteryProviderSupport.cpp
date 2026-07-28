@@ -255,13 +255,11 @@ bool IsLikelyXiaomiEarbuds(const std::string& primary_name,
                             const std::string& device_id) {
     const std::string probe = ToLowerAscii(primary_name + " " + secondary_name + " " + device_id);
 
-    // ZMI PurPods and other ZMI-branded earbuds do not speak the Xiaomi RFCOMM FD2D
-    // protocol. They use the standard BLE battery service instead. Exclude them from
-    // the Xiaomi TWS classification so the BLE standard path is used.
+    // ZMI PurPods use the Xiaomi-framed protocol over their vendor SPP service.
     const bool is_zmi_family = probe.find("zmi") != std::string::npos ||
                                probe.find("purpods") != std::string::npos;
     if (is_zmi_family) {
-        return HasDeviceProfileFamily(primary_name, secondary_name, device_id, "xiaomi_earbuds");
+        return true;
     }
 
     const bool has_brand_hint = probe.find("redmi") != std::string::npos ||

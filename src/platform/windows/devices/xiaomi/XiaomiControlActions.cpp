@@ -249,62 +249,19 @@ bool SetXiaomiNoiseSubmodeForTarget(const ResolvedBluetoothTarget& target,
 bool SetNoiseControlModeForAddress(std::uint64_t address,
                                    NoiseControlMode mode,
                                    const XiaomiControlActionContext& context) {
-    XiaomiControlConnection connection;
-    if (!OpenControlConnection(address, &connection, context, "", true, false)) {
-        return false;
-    }
-
-    std::uint8_t mode_value = 0;
+    const char* mode_name = nullptr;
     switch (mode) {
         case NoiseControlMode::Off:
-            mode_value = 0x00;
+            mode_name = "off";
             break;
         case NoiseControlMode::Anc:
-            mode_value = 0x01;
+            mode_name = "anc";
             break;
         case NoiseControlMode::Transparency:
-            mode_value = 0x02;
+            mode_name = "transparency";
             break;
     }
-
-    XiaomiMessage message;
-    message.type = static_cast<XiaomiMessageType>(0xC1U);
-    message.opcode = static_cast<XiaomiOpcode>(0x08U);
-    message.sequence = connection.sequence()++;
-    message.payload = {0x02, 0x04, mode_value};
-    if (!SendAll(connection.socket_handle(), EncodeXiaomiMessage(message))) {
-        return false;
-    }
-
-    bool observed_confirmation = false;
-    std::vector<std::uint8_t> rx_buffer;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1800);
-    while (std::chrono::steady_clock::now() < deadline) {
-        const auto chunk = ReceiveChunk(connection.socket_handle());
-        if (!chunk.has_value()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(40));
-            continue;
-        }
-        const auto messages = AppendAndDecodeXiaomiMessages(&rx_buffer, *chunk);
-        for (const auto& response : messages) {
-            const auto parsed_mode =
-                ParseXiaomiNoiseModeCode(static_cast<std::uint8_t>(response.opcode), response.payload);
-            if (!parsed_mode.has_value()) {
-                continue;
-            }
-
-            const auto parsed_submode =
-                static_cast<std::uint8_t>(response.opcode) == 0xF4U
-                    ? ParseXiaomiNoiseSubmodeCodeFromF4Payload(response.payload)
-                    : std::optional<std::uint8_t>{};
-            PutXiaomiModeCacheEntry(address, *parsed_mode, parsed_submode);
-            if (*parsed_mode == mode_value) {
-                observed_confirmation = true;
-            }
-        }
-    }
-
-    return observed_confirmation;
+    return SetXiaomiNoiseModeForTarget({std::string(), address}, mode_name, context);
 }
 
 }  // namespace battery_monitor
