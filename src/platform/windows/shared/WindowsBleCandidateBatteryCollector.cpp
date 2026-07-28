@@ -247,7 +247,10 @@ void CollectBleCandidateBatteryEntries(const WindowsBleCandidateBatteryCollector
                 if (resolved_address_for_fallback.has_value()) {
                     const auto& classic_result =
                         xiaomi_classic_cache->Read(*resolved_address_for_fallback,
-                                                   aggressive_xiaomi_retry,
+                                                   likely_zmi ? ClassicBatteryService::kZmiPurPodsSerial
+                                                              : ClassicBatteryService::kXiaomiDeviceControl,
+                                                   likely_zmi ? context.force_live_refresh
+                                                              : aggressive_xiaomi_retry,
                                                    2U);
                     if (!classic_result.readings.empty()) {
                         resolved_readings = classic_result.readings;

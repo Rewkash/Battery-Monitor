@@ -9,7 +9,15 @@
 
 namespace battery_monitor {
 
+enum class ClassicBatteryService {
+    kXiaomiDeviceControl,
+    kBluetoothSerialPort,
+    kZmiPurPodsSerial,
+};
+
 std::vector<BatteryReading> TryReadXiaomiClassicBattery(std::uint64_t bluetooth_address,
+                                                        ClassicBatteryService service,
+                                                        bool* connected,
                                                         XiaomiModeCacheUpdateFn mode_cache_update = nullptr,
                                                         bool debug_enabled = false,
                                                         XiaomiDebugLogFn debug_log = nullptr);

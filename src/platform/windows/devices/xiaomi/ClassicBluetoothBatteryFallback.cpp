@@ -1,5 +1,6 @@
 ﻿#include "platform/windows/devices/xiaomi/ClassicBluetoothBatteryFallback.h"
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -8,6 +9,7 @@
 #include <ws2bth.h>
 
 #include "platform/windows/bluetooth/BluetoothSocketUtils.h"
+#include "platform/windows/shared/WindowsBatteryProviderSupport.h"
 #include "platform/windows/shared/WindowsBluetoothConstants.h"
 
 namespace battery_monitor {
@@ -15,7 +17,8 @@ namespace battery_monitor {
 namespace {
 
 void LogDebug(bool debug_enabled, XiaomiDebugLogFn debug_log, const std::string& message) {
-    if (debug_enabled && debug_log != nullptr) {
+    WindowsBatteryProviderEventLog(message);
+    if (debug_enabled && debug_log != nullptr && debug_log != &WindowsBatteryProviderDebugLog) {
         debug_log(message);
     }
 }
@@ -77,6 +80,8 @@ bool TryConnectServiceSocket(const SOCKADDR_BTH& base_address,
 }  // namespace
 
 std::vector<BatteryReading> TryReadXiaomiClassicBattery(std::uint64_t bluetooth_address,
+                                                        ClassicBatteryService service,
+                                                        bool* service_connected,
                                                         XiaomiModeCacheUpdateFn mode_cache_update,
                                                         bool debug_enabled,
                                                         XiaomiDebugLogFn debug_log) {
@@ -96,16 +101,27 @@ std::vector<BatteryReading> TryReadXiaomiClassicBattery(std::uint64_t bluetooth_
     address.port = BT_PORT_ANY;
     std::string connected_path;
 
-    const bool connected =
-        TryConnectServiceSocket(address, kXiaomiDeviceCtrlServiceUuid, "FD2D", 280,
-                                debug_enabled, debug_log, &socket_handle, &connected_path) ||
-        TryConnectServiceSocket(address, kBluetoothSerialPortServiceUuid, "SPP-1101", 280,
-                                debug_enabled, debug_log, &socket_handle, &connected_path) ||
-        TryConnectServiceSocket(address, kZmiPurPodsSerialServiceUuid, "ZMI-1101", 280,
-                                debug_enabled, debug_log, &socket_handle, &connected_path);
+    if (service_connected != nullptr) {
+        *service_connected = false;
+    }
+    const bool connected = service == ClassicBatteryService::kZmiPurPodsSerial
+                               ? TryConnectServiceSocket(address, kZmiPurPodsSerialServiceUuid, "ZMI-1101", 280,
+                                                         debug_enabled, debug_log, &socket_handle, &connected_path)
+                           : service == ClassicBatteryService::kBluetoothSerialPort
+                               ? TryConnectServiceSocket(address, kBluetoothSerialPortServiceUuid, "SPP-1101", 280,
+                                                         debug_enabled, debug_log, &socket_handle, &connected_path)
+                               : TryConnectServiceSocket(address, kXiaomiDeviceCtrlServiceUuid, "FD2D", 280,
+                                                         debug_enabled, debug_log, &socket_handle, &connected_path);
     if (!connected) {
         return {};
     }
+    if (service_connected != nullptr) {
+        *service_connected = true;
+    }
+
+    const auto session_started_at = std::chrono::steady_clock::now();
+    LogDebug(debug_enabled, debug_log,
+             "Classic RFCOMM: battery session started path=" + connected_path);
 
     const int io_timeout_ms = 260;
     setsockopt(socket_handle, SOL_SOCKET, SO_RCVTIMEO,
@@ -114,9 +130,23 @@ std::vector<BatteryReading> TryReadXiaomiClassicBattery(std::uint64_t bluetooth_
                reinterpret_cast<const char*>(&io_timeout_ms), sizeof(io_timeout_ms));
 
     const auto classic_session =
-        RunXiaomiClassicBatterySession(socket_handle, bluetooth_address, mode_cache_update, debug_enabled, debug_log);
+        RunXiaomiClassicBatterySession(socket_handle,
+                                       bluetooth_address,
+                                       service == ClassicBatteryService::kZmiPurPodsSerial,
+                                       mode_cache_update,
+                                       debug_enabled,
+                                       debug_log);
 
+    const auto session_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() - session_started_at)
+                                         .count();
+    LogDebug(debug_enabled, debug_log,
+             "Classic RFCOMM: battery session finished path=" + connected_path +
+                 " duration_ms=" + std::to_string(session_duration_ms) +
+                 " readings=" + std::to_string(classic_session.readings.size()) +
+                 " last_socket_error=" + std::to_string(WSAGetLastError()));
     closesocket(socket_handle);
+    LogDebug(debug_enabled, debug_log, "Classic RFCOMM: socket closed path=" + connected_path);
     return classic_session.readings;
 }
 

@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "platform/windows/devices/xiaomi/XiaomiBatteryCodec.h"
+#include "platform/windows/devices/xiaomi/ClassicBluetoothBatteryFallback.h"
 #include "platform/windows/devices/xiaomi/XiaomiHandshake.h"
 
 namespace battery_monitor {
@@ -29,6 +30,7 @@ class XiaomiClassicBatteryCache {
                               XiaomiDebugLogFn debug_log = nullptr);
 
     XiaomiReadResult Read(std::uint64_t address,
+                          ClassicBatteryService preferred_service,
                           bool aggressive_retry,
                           std::size_t min_tws_components = 1U);
     void Persist(std::uint64_t address, const std::vector<BatteryReading>& readings) const;
@@ -45,6 +47,8 @@ class XiaomiClassicBatteryCache {
     std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> last_successful_live_read_;
     std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> last_failed_live_read_;
     std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> live_read_in_progress_;
+    std::unordered_map<std::uint64_t, ClassicBatteryService> successful_service_;
+    std::unordered_map<std::uint64_t, bool> services_exhausted_;
 };
 
 }  // namespace battery_monitor

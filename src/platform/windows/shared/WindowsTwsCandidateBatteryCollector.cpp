@@ -212,6 +212,9 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
             context.is_likely_xiaomi_earbuds != nullptr &&
             context.is_likely_xiaomi_earbuds(candidate.endpoint_name, candidate.endpoint_name, candidate.endpoint_id);
         const bool should_try_classic_for_candidate = likely_xiaomi_tws || candidate_is_likely_zmi;
+        const auto classic_service = candidate_is_likely_zmi
+                                         ? ClassicBatteryService::kZmiPurPodsSerial
+                                         : ClassicBatteryService::kXiaomiDeviceControl;
         const bool aggressive_xiaomi_retry =
             candidate.from_connected_scan &&
             !context.include_disconnected &&
@@ -224,7 +227,9 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
         if (should_try_classic_for_candidate) {
             const auto& classic_result =
                 xiaomi_classic_cache->Read(candidate.bluetooth_address,
-                                           aggressive_xiaomi_retry,
+                                           classic_service,
+                                           candidate_is_likely_zmi ? context.force_live_refresh
+                                                                   : aggressive_xiaomi_retry,
                                            2U);
             if (!classic_result.readings.empty()) {
                 if (candidate_is_likely_zmi && !classic_result.from_persistent_cache &&
@@ -294,7 +299,9 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
         if (should_try_classic_for_candidate && !HasUsefulXiaomiTwsReadings(resolved_readings)) {
             const auto& classic_result =
                 xiaomi_classic_cache->Read(candidate.bluetooth_address,
-                                           aggressive_xiaomi_retry,
+                                           classic_service,
+                                           candidate_is_likely_zmi ? context.force_live_refresh
+                                                                   : aggressive_xiaomi_retry,
                                            2U);
             if (!classic_result.readings.empty()) {
                 resolved_readings = classic_result.readings;

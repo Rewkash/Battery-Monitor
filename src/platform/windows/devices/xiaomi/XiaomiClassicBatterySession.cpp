@@ -31,11 +31,23 @@ std::optional<XiaomiBatterySnapshot> ResolveSessionSnapshot(
         return std::nullopt;
     }
 
-    if (status_snapshot.has_value()) {
-        return *status_snapshot;
+    if (!status_snapshot.has_value()) {
+        return *device_info_snapshot;
     }
 
-    return *device_info_snapshot;
+    XiaomiBatterySnapshot merged = *status_snapshot;
+    if (device_info_snapshot.has_value()) {
+        if (!merged.left.has_value()) {
+            merged.left = device_info_snapshot->left;
+        }
+        if (!merged.right.has_value()) {
+            merged.right = device_info_snapshot->right;
+        }
+        if (!merged.case_level.has_value()) {
+            merged.case_level = device_info_snapshot->case_level;
+        }
+    }
+    return merged;
 }
 
 void LogMergedSnapshot(bool debug_enabled,
@@ -78,11 +90,84 @@ void LogSessionMessage(bool debug_enabled, XiaomiDebugLogFn debug_log, const Xia
     MaybeDebugLog(debug_enabled, debug_log, FormatXiaomiMessageLine(message, true, "Xiaomi message "));
 }
 
+bool ReceiveExact(SOCKET socket_handle, std::uint8_t* output, std::size_t size) {
+    std::size_t received = 0;
+    while (received < size) {
+        const int chunk = recv(socket_handle,
+                               reinterpret_cast<char*>(output + received),
+                               static_cast<int>(size - received),
+                               0);
+        if (chunk <= 0) {
+            return false;
+        }
+        received += static_cast<std::size_t>(chunk);
+    }
+    return true;
+}
+
+bool RunZmiRawAuthHandshake(SOCKET socket_handle,
+                            bool debug_enabled,
+                            XiaomiDebugLogFn debug_log) {
+    const auto local_challenge = GenerateRandomChallenge();
+    std::vector<std::uint8_t> challenge_request{0x00U};
+    challenge_request.insert(challenge_request.end(), local_challenge.begin(), local_challenge.end());
+    if (!SendAll(socket_handle, challenge_request)) {
+        MaybeDebugLog(debug_enabled, debug_log, "ZMI raw auth: failed to send local challenge");
+        return false;
+    }
+
+    std::array<std::uint8_t, 17> challenge_response{};
+    if (!ReceiveExact(socket_handle, challenge_response.data(), challenge_response.size()) ||
+        challenge_response[0] != 0x01U) {
+        MaybeDebugLog(debug_enabled, debug_log, "ZMI raw auth: invalid local challenge response");
+        return false;
+    }
+    const auto expected_response = ComputeXiaomiChallengeResponse(local_challenge);
+    if (!std::equal(expected_response.begin(), expected_response.end(), challenge_response.begin() + 1)) {
+        MaybeDebugLog(debug_enabled, debug_log, "ZMI raw auth: local challenge verification failed");
+        return false;
+    }
+
+    const std::vector<std::uint8_t> pass_message = {0x02U, 0x70U, 0x61U, 0x73U, 0x73U};
+    if (!SendAll(socket_handle, pass_message)) {
+        MaybeDebugLog(debug_enabled, debug_log, "ZMI raw auth: failed to send local confirmation");
+        return false;
+    }
+
+    std::array<std::uint8_t, 17> remote_challenge{};
+    if (!ReceiveExact(socket_handle, remote_challenge.data(), remote_challenge.size()) ||
+        remote_challenge[0] != 0x00U) {
+        MaybeDebugLog(debug_enabled, debug_log, "ZMI raw auth: invalid remote challenge");
+        return false;
+    }
+
+    std::array<std::uint8_t, 16> remote_challenge_bytes{};
+    std::copy_n(remote_challenge.begin() + 1, remote_challenge_bytes.size(), remote_challenge_bytes.begin());
+    const auto remote_response = ComputeXiaomiChallengeResponse(remote_challenge_bytes);
+    std::vector<std::uint8_t> response_message{0x01U};
+    response_message.insert(response_message.end(), remote_response.begin(), remote_response.end());
+    if (!SendAll(socket_handle, response_message)) {
+        MaybeDebugLog(debug_enabled, debug_log, "ZMI raw auth: failed to send remote challenge response");
+        return false;
+    }
+
+    std::array<std::uint8_t, 5> remote_confirmation{};
+    if (!ReceiveExact(socket_handle, remote_confirmation.data(), remote_confirmation.size()) ||
+        !std::equal(pass_message.begin(), pass_message.end(), remote_confirmation.begin())) {
+        MaybeDebugLog(debug_enabled, debug_log, "ZMI raw auth: invalid remote confirmation");
+        return false;
+    }
+
+    MaybeDebugLog(debug_enabled, debug_log, "ZMI raw auth: handshake completed");
+    return true;
+}
+
 }  // namespace
 
 XiaomiClassicBatterySessionResult RunXiaomiClassicBatterySession(
     SOCKET socket_handle,
     std::uint64_t bluetooth_address,
+    bool use_zmi_raw_handshake,
     XiaomiModeCacheUpdateFn mode_cache_update,
     bool debug_enabled,
     XiaomiDebugLogFn debug_log) {
@@ -92,20 +177,29 @@ XiaomiClassicBatterySessionResult RunXiaomiClassicBatterySession(
     }
 
     std::uint8_t sequence = 0;
-    const auto challenge = GenerateRandomChallenge();
-    XiaomiMessage auth_start;
-    auth_start.type = XiaomiMessageType::kPhoneRequest;
-    auth_start.opcode = XiaomiOpcode::kAuthChallenge;
-    auth_start.sequence = sequence++;
-    auth_start.payload.push_back(0x01);
-    auth_start.payload.insert(auth_start.payload.end(), challenge.begin(), challenge.end());
-    if (!SendAll(socket_handle, EncodeXiaomiMessage(auth_start))) {
-        MaybeDebugLog(debug_enabled, debug_log, "Xiaomi classic fallback: failed to send auth challenge");
-        return result;
-    }
-    result.auth_start_sent = true;
-
     bool init_requests_sent = false;
+    if (use_zmi_raw_handshake) {
+        if (!RunZmiRawAuthHandshake(socket_handle, debug_enabled, debug_log)) {
+            return result;
+        }
+        SendXiaomiInfoRequests(socket_handle, &sequence);
+        init_requests_sent = true;
+        result.auth_start_sent = true;
+    } else {
+        const auto challenge = GenerateRandomChallenge();
+        XiaomiMessage auth_start;
+        auth_start.type = XiaomiMessageType::kPhoneRequest;
+        auth_start.opcode = XiaomiOpcode::kAuthChallenge;
+        auth_start.sequence = sequence++;
+        auth_start.payload.push_back(0x01);
+        auth_start.payload.insert(auth_start.payload.end(), challenge.begin(), challenge.end());
+        if (!SendAll(socket_handle, EncodeXiaomiMessage(auth_start))) {
+            MaybeDebugLog(debug_enabled, debug_log, "Xiaomi classic fallback: failed to send auth challenge");
+            return result;
+        }
+        result.auth_start_sent = true;
+    }
+
     std::optional<XiaomiBatterySnapshot> device_info_snapshot;
     std::optional<XiaomiBatterySnapshot> status_snapshot;
     std::optional<std::chrono::steady_clock::time_point> device_info_received_at;
