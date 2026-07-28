@@ -23,6 +23,7 @@ struct XiaomiClassicBatterySessionResult {
 XiaomiClassicBatterySessionResult RunXiaomiClassicBatterySession(
     SOCKET socket_handle,
     std::uint64_t bluetooth_address,
+    bool use_zmi_raw_handshake = false,
     XiaomiModeCacheUpdateFn mode_cache_update = nullptr,
     bool debug_enabled = false,
     XiaomiDebugLogFn debug_log = nullptr);

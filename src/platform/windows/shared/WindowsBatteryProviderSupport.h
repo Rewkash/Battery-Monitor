@@ -31,15 +31,18 @@ struct WindowsBatteryProviderRuntimeOptions {
 
 const WindowsBatteryProviderRuntimeOptions& GetWindowsBatteryProviderRuntimeOptions();
 void WindowsBatteryProviderDebugLog(const std::string& message);
+void WindowsBatteryProviderEventLog(const std::string& message);
 std::string DescribeWinrtBatteryProviderError(const winrt::hresult_error& error);
 void EnsureWindowsBatteryProviderApartmentInitialized();
 
 WindowsBatteryQueryReaderContext MakeWindowsBatteryQueryReaderContext();
 WindowsBleCandidateBatteryCollectorContext MakeWindowsBleCandidateBatteryCollectorContext(
-    const std::string& target_device_id = std::string());
+    const std::string& target_device_id = std::string(),
+    bool force_live_refresh = false);
 WindowsTwsCandidateBatteryCollectorContext MakeWindowsTwsCandidateBatteryCollectorContext(
     bool include_disconnected,
-    const std::string& target_device_id = std::string());
+    const std::string& target_device_id = std::string(),
+    bool force_live_refresh = false);
 XiaomiControlActionContext MakeWindowsXiaomiControlActionContext();
 
 std::optional<winrt::Windows::Devices::Bluetooth::BluetoothLEDevice> TryOpenBleDeviceByAddress(

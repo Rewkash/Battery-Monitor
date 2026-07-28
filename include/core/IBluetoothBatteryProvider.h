@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string>
 #include <vector>
 
 #include "core/BatteryTypes.h"
@@ -14,6 +15,10 @@ class IBluetoothBatteryProvider {
 
     virtual std::vector<DeviceBatteryInfo> GetDevicesBattery(const BatteryQueryOptions& options) = 0;
     virtual INoiseControlProvider* GetNoiseControlProvider() { return nullptr; }
+    virtual void NotifyDeviceConnectionChanged(const std::string& device_id, bool connected) {
+        (void)device_id;
+        (void)connected;
+    }
 
     std::vector<DeviceBatteryInfo> GetConnectedDevicesBattery() {
         return GetDevicesBattery(BatteryQueryOptions{});

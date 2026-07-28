@@ -85,6 +85,7 @@
 
 #ifdef _WIN32
 #include "platform/windows/shared/WindowsBluetoothAddressUtils.h"
+#include "platform/windows/shared/WindowsBatteryProviderSupport.h"
 #endif
 
 namespace battery_monitor {
@@ -105,6 +106,11 @@ std::filesystem::path UiDebugLogPath() {
 }
 
 void UiDebugLog(const std::string& message) {
+#ifdef _WIN32
+    if (UiDebugEnabled()) {
+        WindowsBatteryProviderDebugLog("UI " + message);
+    }
+#else
     if (!UiDebugEnabled()) {
         return;
     }
@@ -121,6 +127,7 @@ void UiDebugLog(const std::string& message) {
     }
     stream << QDateTime::currentDateTime().toString(Qt::ISODateWithMs).toStdString()
            << " [ui] " << message << '\n';
+#endif
 }
 
 std::string OptionalLevelText(const std::optional<std::uint8_t>& value) {
@@ -3168,40 +3175,50 @@ void BatteryWindow::StartBluetoothDeviceWatcher() {
                                      winrt::event_token* added_token,
                                      winrt::event_token* updated_token,
                                      winrt::event_token* removed_token,
-                                     const winrt::hstring& selector) {
+                                     const winrt::hstring& selector,
+                                     const char* transport) {
             *watcher = DeviceInformation::CreateWatcher(selector);
             QPointer<BatteryWindow> self(this);
-            *added_token = watcher->Added([self](auto&&, const auto& info) {
+            *added_token = watcher->Added([self, transport](auto&&, const auto& info) {
                 if (self == nullptr) {
                     return;
                 }
+                WindowsBatteryProviderEventLog("bluetooth event=connected transport=" + std::string(transport) +
+                                               " id='" + winrt::to_string(info.Id()) + "'");
                 self->ScheduleBluetoothDeviceRefresh(winrt::to_string(info.Id()), true);
             });
-            *updated_token = watcher->Updated([self](auto&&, const auto& info) {
+            *updated_token = watcher->Updated([self, transport](auto&&, const auto& info) {
                 if (self == nullptr) {
                     return;
                 }
+                WindowsBatteryProviderEventLog("bluetooth event=updated-connected transport=" + std::string(transport) +
+                                               " id='" + winrt::to_string(info.Id()) + "'");
                 self->ScheduleBluetoothDeviceRefresh(winrt::to_string(info.Id()), true);
             });
-            *removed_token = watcher->Removed([self](auto&&, const auto& info) {
+            *removed_token = watcher->Removed([self, transport](auto&&, const auto& info) {
                 if (self == nullptr) {
                     return;
                 }
+                WindowsBatteryProviderEventLog("bluetooth event=disconnected transport=" + std::string(transport) +
+                                               " id='" + winrt::to_string(info.Id()) + "'");
                 self->ScheduleBluetoothDeviceRefresh(winrt::to_string(info.Id()), false);
             });
             watcher->Start();
+            WindowsBatteryProviderEventLog("bluetooth watcher started transport=" + std::string(transport));
         };
 
         attach_watcher(&bluetooth_classic_watcher_,
                        &bluetooth_classic_added_token_,
                        &bluetooth_classic_updated_token_,
                        &bluetooth_classic_removed_token_,
-                       BluetoothDevice::GetDeviceSelectorFromConnectionStatus(BluetoothConnectionStatus::Connected));
+                       BluetoothDevice::GetDeviceSelectorFromConnectionStatus(BluetoothConnectionStatus::Connected),
+                       "classic");
         attach_watcher(&bluetooth_le_watcher_,
                        &bluetooth_le_added_token_,
                        &bluetooth_le_updated_token_,
                        &bluetooth_le_removed_token_,
-                       BluetoothLEDevice::GetDeviceSelectorFromConnectionStatus(BluetoothConnectionStatus::Connected));
+                       BluetoothLEDevice::GetDeviceSelectorFromConnectionStatus(BluetoothConnectionStatus::Connected),
+                       "ble");
     } catch (...) {
         bluetooth_classic_watcher_ = nullptr;
         bluetooth_le_watcher_ = nullptr;
@@ -3246,6 +3263,8 @@ void BatteryWindow::ScheduleBluetoothDeviceRefresh(const std::string& changed_de
             if (quitting_) {
                 return;
             }
+
+            provider_->NotifyDeviceConnectionChanged(changed_device_id, connected);
 
             const bool applied_locally = ApplyBluetoothDeviceConnectionChange(changed_device_id, connected);
             if (applied_locally && !connected) {
@@ -3309,12 +3328,12 @@ bool BatteryWindow::ApplyBluetoothDeviceConnectionChange(const std::string& chan
     return true;
 }
 
-void BatteryWindow::RefreshBatteryDataForDevice(const std::string& device_id) {
+void BatteryWindow::RefreshBatteryDataForDevice(const std::string& device_id, bool force_live_refresh) {
     const std::uint64_t refresh_id = NextUiRefreshId();
     UiDebugLog("refresh#" + std::to_string(refresh_id) + " targeted requested target='" + device_id + "'");
     if (device_id.empty()) {
         UiDebugLog("refresh#" + std::to_string(refresh_id) + " targeted empty target -> full refresh");
-        RefreshBatteryData(false, true);
+        RefreshBatteryData(false, true, force_live_refresh);
         return;
     }
 
@@ -3345,11 +3364,12 @@ void BatteryWindow::RefreshBatteryDataForDevice(const std::string& device_id) {
     show_all_button_->setEnabled(false);
     status_label_->setText(QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435..."));
 
-    refresh_worker_ = std::thread([this, device_id, refresh_id]() {
+    refresh_worker_ = std::thread([this, device_id, force_live_refresh, refresh_id]() {
         RefreshTaskResult result;
         try {
             BatteryQueryOptions query_options;
             query_options.include_disconnected = false;
+            query_options.force_live_refresh = force_live_refresh;
             query_options.target_device_id = device_id;
             UiDebugLog("refresh#" + std::to_string(refresh_id) +
                        " provider query targeted include_disconnected=false target='" + device_id + "'");
@@ -3617,7 +3637,9 @@ void BatteryWindow::ShowNoiseSubmodeMenu(QWidget* anchor,
     menu.exec(anchor->mapToGlobal(QPoint(0, anchor->height())));
 }
 
-void BatteryWindow::RefreshBatteryData(bool include_disconnected, bool preserve_disconnected_snapshot) {
+void BatteryWindow::RefreshBatteryData(bool include_disconnected,
+                                       bool preserve_disconnected_snapshot,
+                                       bool force_live_refresh) {
     const std::uint64_t refresh_id = NextUiRefreshId();
     UiDebugLog("refresh#" + std::to_string(refresh_id) +
                " full requested include_disconnected=" + (include_disconnected ? "true" : "false") +
@@ -3651,11 +3673,12 @@ void BatteryWindow::RefreshBatteryData(bool include_disconnected, bool preserve_
     show_all_button_->setEnabled(false);
     status_label_->setText(QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435..."));
 
-    refresh_worker_ = std::thread([this, include_disconnected, preserve_disconnected_snapshot, refresh_id]() {
+    refresh_worker_ = std::thread([this, include_disconnected, preserve_disconnected_snapshot, force_live_refresh, refresh_id]() {
         RefreshTaskResult result;
         try {
             BatteryQueryOptions query_options;
             query_options.include_disconnected = include_disconnected;
+            query_options.force_live_refresh = force_live_refresh;
             UiDebugLog("refresh#" + std::to_string(refresh_id) +
                        " provider query full include_disconnected=" +
                        (include_disconnected ? "true" : "false") + " target='' preserve_disconnected_snapshot=" +
@@ -3784,7 +3807,7 @@ void BatteryWindow::RefreshBatteryDataFromUser() {
         bluetooth_refresh_debounce_timer_->stop();
     }
     pending_bluetooth_refresh_device_id_.clear();
-    RefreshBatteryData(true, false);
+    RefreshBatteryData(true, false, true);
 }
 
 void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& devices) {
@@ -4139,12 +4162,12 @@ void BatteryWindow::PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& de
                                                       u8"\u0443\u0441\u0442\u0440\u043E\u0439\u0441\u0442\u0432\u043E"));
         actions_button->setMenu(actions_menu);
 
-        connect(refresh_row_action, &QAction::triggered, this, [this]() {
+        connect(refresh_row_action, &QAction::triggered, this, [this, device_id = device.device_id]() {
             if (bluetooth_refresh_debounce_timer_ != nullptr) {
                 bluetooth_refresh_debounce_timer_->stop();
             }
             pending_bluetooth_refresh_device_id_.clear();
-            RefreshBatteryData(false, false);
+            RefreshBatteryDataForDevice(device_id, true);
         });
         connect(diagnostics_row_action, &QAction::triggered, this,
                 [this, device_id = device.device_id]() { ShowDeviceDiagnostics(device_id); });

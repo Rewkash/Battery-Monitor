@@ -65,7 +65,16 @@ WinRtBatteryProvider::WinRtBatteryProvider()
           GetWindowsBatteryProviderRuntimeOptions().xiaomi_cache_file_path,
           GetWindowsBatteryProviderRuntimeOptions().xiaomi_cache_ttl_minutes,
           GetWindowsBatteryProviderRuntimeOptions().debug_enabled,
-          &WindowsBatteryProviderDebugLog) {}
+           &WindowsBatteryProviderDebugLog) {}
+
+void WinRtBatteryProvider::NotifyDeviceConnectionChanged(const std::string& device_id, bool connected) {
+    const auto address = ParseBluetoothAddressFromDeviceId(device_id);
+    if (!connected && address.has_value()) {
+        WindowsBatteryProviderEventLog(
+            "Bluetooth disconnect observed; preserving RFCOMM service and battery cache address=" +
+            std::to_string(*address));
+    }
+}
 
 std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const BatteryQueryOptions& options) {
     EnsureWindowsBatteryProviderApartmentInitialized();
@@ -83,7 +92,8 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
         try {
             const std::size_t before_tws = device_accumulator.Entries().size();
             CollectTwsCandidateBatteryEntries(
-                MakeWindowsTwsCandidateBatteryCollectorContext(options.include_disconnected, options.target_device_id),
+                MakeWindowsTwsCandidateBatteryCollectorContext(
+                    options.include_disconnected, options.target_device_id, options.force_live_refresh),
                 query_reader_context,
                 &device_accumulator,
                 &xiaomi_classic_cache_);
@@ -94,7 +104,7 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
 
         const std::size_t before_ble = device_accumulator.Entries().size();
         CollectBleCandidateBatteryEntries(
-            MakeWindowsBleCandidateBatteryCollectorContext(options.target_device_id),
+            MakeWindowsBleCandidateBatteryCollectorContext(options.target_device_id, options.force_live_refresh),
             &device_accumulator,
             &xiaomi_classic_cache_);
         LogProviderEntriesSince("Provider stage BLE", device_accumulator.Entries(), before_ble);

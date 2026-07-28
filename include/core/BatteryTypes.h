@@ -24,6 +24,7 @@ struct DeviceBatteryInfo {
 
 struct BatteryQueryOptions {
     bool include_disconnected = false;
+    bool force_live_refresh = false;
     std::string target_device_id;
 };
 

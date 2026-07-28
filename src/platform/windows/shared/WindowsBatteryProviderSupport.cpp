@@ -4,17 +4,22 @@
 #include <array>
 #include <cctype>
 #include <chrono>
+#include <ctime>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
+
+#include <windows.h>
 
 #include <winrt/Windows.Foundation.h>
 
@@ -39,6 +44,72 @@ std::string ToLowerAscii(std::string value) {
 }
 
 bool ReadBooleanEnvEqualsOne(const char* key, bool fallback);
+
+constexpr std::uintmax_t kDiagnosticLogMaxBytes = 5U * 1024U * 1024U;
+constexpr int kDiagnosticLogBackups = 3;
+
+std::string DiagnosticTimestamp() {
+    const auto now = std::chrono::system_clock::now();
+    const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+    const std::time_t time = std::chrono::system_clock::to_time_t(now);
+    std::tm local_time{};
+    localtime_s(&local_time, &time);
+
+    std::ostringstream stream;
+    stream << std::put_time(&local_time, "%Y-%m-%dT%H:%M:%S")
+           << '.' << std::setfill('0') << std::setw(3) << milliseconds.count();
+    return stream.str();
+}
+
+void RotateDiagnosticLogIfNeeded(const std::filesystem::path& log_path) {
+    std::error_code ec;
+    if (!std::filesystem::exists(log_path, ec) ||
+        std::filesystem::file_size(log_path, ec) < kDiagnosticLogMaxBytes || ec) {
+        return;
+    }
+
+    for (int index = kDiagnosticLogBackups; index >= 1; --index) {
+        const auto destination = std::filesystem::path(log_path.string() + "." + std::to_string(index));
+        const auto source = index == 1
+                                ? log_path
+                                : std::filesystem::path(log_path.string() + "." + std::to_string(index - 1));
+        std::filesystem::remove(destination, ec);
+        ec.clear();
+        if (std::filesystem::exists(source, ec)) {
+            std::filesystem::rename(source, destination, ec);
+        }
+        ec.clear();
+    }
+}
+
+void WriteDiagnosticLog(const std::string& level, const std::string& message) {
+    static std::mutex log_mutex;
+    std::lock_guard<std::mutex> lock(log_mutex);
+
+    char* appdata = nullptr;
+    std::size_t length = 0;
+    const errno_t status = _dupenv_s(&appdata, &length, "APPDATA");
+    std::filesystem::path base_path = ".";
+    if (status == 0 && appdata != nullptr && std::string(appdata).size() > 0U) {
+        base_path = appdata;
+    }
+    free(appdata);
+
+    const auto diagnostics_dir = base_path / "battery-monitor" / "diagnostics";
+    std::error_code ec;
+    std::filesystem::create_directories(diagnostics_dir, ec);
+    const auto log_path = diagnostics_dir / "provider-debug.log";
+    RotateDiagnosticLogIfNeeded(log_path);
+
+    std::ofstream stream(log_path.string(), std::ios::out | std::ios::app);
+    if (stream.is_open()) {
+        stream << DiagnosticTimestamp()
+               << " pid=" << GetCurrentProcessId()
+               << " tid=" << std::hash<std::thread::id>{}(std::this_thread::get_id())
+               << " level=" << level
+               << " " << message << '\n';
+    }
+}
 
 DeviceProfileQuery MakeWindowsDeviceProfileQuery(const std::string& primary_name,
                                                  const std::string& secondary_name,
@@ -350,31 +421,18 @@ const WindowsBatteryProviderRuntimeOptions& GetWindowsBatteryProviderRuntimeOpti
 }
 
 void WindowsBatteryProviderDebugLog(const std::string& message) {
-    if (GetWindowsBatteryProviderRuntimeOptions().debug_enabled) {
-        std::cerr << "[battery-monitor][debug] " << message << '\n';
-
-        static std::mutex log_mutex;
-        std::lock_guard<std::mutex> lock(log_mutex);
-
-        char* appdata = nullptr;
-        std::size_t length = 0;
-        const errno_t status = _dupenv_s(&appdata, &length, "APPDATA");
-        std::filesystem::path base_path = ".";
-        if (status == 0 && appdata != nullptr && std::string(appdata).size() > 0U) {
-            base_path = appdata;
-        }
-        free(appdata);
-
-        const auto diagnostics_dir = base_path / "battery-monitor" / "diagnostics";
-        std::error_code ec;
-        std::filesystem::create_directories(diagnostics_dir, ec);
-        const auto log_path = diagnostics_dir / "provider-debug.log";
-
-        std::ofstream stream(log_path.string(), std::ios::out | std::ios::app);
-        if (stream.is_open()) {
-            stream << "[battery-monitor][debug] " << message << '\n';
-        }
+    if (!GetWindowsBatteryProviderRuntimeOptions().debug_enabled) {
+        return;
     }
+    std::cerr << "[battery-monitor][debug] " << message << '\n';
+    WriteDiagnosticLog("debug", message);
+}
+
+void WindowsBatteryProviderEventLog(const std::string& message) {
+    if (GetWindowsBatteryProviderRuntimeOptions().debug_enabled) {
+        std::cerr << "[battery-monitor][event] " << message << '\n';
+    }
+    WriteDiagnosticLog("event", message);
 }
 
 std::string DescribeWinrtBatteryProviderError(const winrt::hresult_error& error) {
@@ -416,12 +474,14 @@ WindowsBatteryQueryReaderContext MakeWindowsBatteryQueryReaderContext() {
 }
 
 WindowsBleCandidateBatteryCollectorContext MakeWindowsBleCandidateBatteryCollectorContext(
-    const std::string& target_device_id) {
+    const std::string& target_device_id,
+    bool force_live_refresh) {
     const auto& runtime_options = GetWindowsBatteryProviderRuntimeOptions();
     return WindowsBleCandidateBatteryCollectorContext{
         .debug_enabled = runtime_options.debug_enabled,
         .debug_log = &WindowsBatteryProviderDebugLog,
         .target_device_id = target_device_id,
+        .force_live_refresh = force_live_refresh,
         .is_likely_tws_device = &IsLikelyTwsDevice,
         .is_likely_xiaomi_earbuds = &IsLikelyXiaomiEarbuds,
         .should_aggressive_xiaomi_classic_retry = &ShouldAggressiveXiaomiClassicRetry,
@@ -430,13 +490,15 @@ WindowsBleCandidateBatteryCollectorContext MakeWindowsBleCandidateBatteryCollect
 
 WindowsTwsCandidateBatteryCollectorContext MakeWindowsTwsCandidateBatteryCollectorContext(
     bool include_disconnected,
-    const std::string& target_device_id) {
+    const std::string& target_device_id,
+    bool force_live_refresh) {
     const auto& runtime_options = GetWindowsBatteryProviderRuntimeOptions();
     return WindowsTwsCandidateBatteryCollectorContext{
         .debug_enabled = runtime_options.debug_enabled,
         .debug_log = &WindowsBatteryProviderDebugLog,
         .include_disconnected = include_disconnected,
         .target_device_id = target_device_id,
+        .force_live_refresh = force_live_refresh,
         .force_aep_scan = runtime_options.force_aep_scan,
         .is_likely_xiaomi_earbuds = &IsLikelyXiaomiEarbuds,
         .should_aggressive_xiaomi_classic_retry = &ShouldAggressiveXiaomiClassicRetry,

@@ -62,9 +62,11 @@ class BatteryWindow : public QWidget {
     void paintEvent(QPaintEvent* event) override;
 
    private:
-     void RefreshBatteryData(bool include_disconnected = false, bool preserve_disconnected_snapshot = true);
+     void RefreshBatteryData(bool include_disconnected = false,
+                             bool preserve_disconnected_snapshot = true,
+                             bool force_live_refresh = false);
      void RefreshBatteryDataFromUser();
-     void RefreshBatteryDataForDevice(const std::string& device_id);
+    void RefreshBatteryDataForDevice(const std::string& device_id, bool force_live_refresh = false);
     void PopulateDeviceCards(const std::vector<DeviceBatteryInfo>& devices);
     void ClearDeviceCards();
      void InitializeTray();

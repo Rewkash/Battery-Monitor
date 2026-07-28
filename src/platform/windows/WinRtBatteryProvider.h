@@ -11,6 +11,7 @@ class WinRtBatteryProvider final : public IBluetoothBatteryProvider, public INoi
     WinRtBatteryProvider();
 
     std::vector<DeviceBatteryInfo> GetDevicesBattery(const BatteryQueryOptions& options) override;
+    void NotifyDeviceConnectionChanged(const std::string& device_id, bool connected) override;
     INoiseControlProvider* GetNoiseControlProvider() override { return this; }
     bool SupportsNoiseControl(const std::string& device_id) override;
     bool SetNoiseControlMode(const std::string& device_id, NoiseControlMode mode) override;
