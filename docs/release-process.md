@@ -47,7 +47,7 @@ Self-signed signatures are only for development and do not establish public trus
 3. Commit and push the version change.
 4. Create and push tag `vX.Y.Z` from the protected release branch.
 5. Approve the `release` GitHub environment.
-6. The workflow validates tag/CMake equality, builds GUI and CLI together, applies Authenticode when configured, creates one `bmup-1` update bundle and one ZIP for first-time installation, hashes the update bundle, generates and signs the manifest, independently verifies the update artifacts, then publishes them.
+6. The workflow validates tag/CMake equality, generates GitHub release notes and embeds them in the signed update manifest, builds GUI and CLI together, applies Authenticode when configured, creates one `bmup-1` update bundle and one ZIP for first-time installation, hashes the update bundle, generates and signs the manifest, independently verifies the update artifacts, then publishes them.
 7. Re-download the three GitHub Release assets and run `verify_release.py` before announcing the release.
 
 For an explicitly self-signed test prerelease, configure `WINDOWS_TEST_SIGNING_PFX_BASE64` and

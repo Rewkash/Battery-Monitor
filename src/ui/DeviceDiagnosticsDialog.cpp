@@ -107,7 +107,7 @@ QString DeviceDiagnosticsDialog::BuildDiagnosticsText() const {
     QTextStream stream(&output);
     const auto now = QDateTime::currentDateTime();
 
-    stream << "Battery Monitor device diagnostics\n";
+    stream << "ChargeView device diagnostics\n";
     stream << "Generated: " << now.toString(Qt::ISODate) << "\n";
     stream << "Entry count: " << entries_.size() << "\n\n";
 

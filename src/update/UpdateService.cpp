@@ -28,7 +28,7 @@ QNetworkRequest MakeRequest(const QUrl& url) {
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
                          QNetworkRequest::NoLessSafeRedirectPolicy);
     request.setHeader(QNetworkRequest::UserAgentHeader,
-                      QStringLiteral("BatteryMonitor/%1").arg(QStringLiteral(BATTERY_MONITOR_VERSION)));
+                      QStringLiteral("ChargeView/%1").arg(QStringLiteral(BATTERY_MONITOR_VERSION)));
     request.setTransferTimeout(15000);
     return request;
 }
@@ -216,7 +216,7 @@ void UpdateService::DownloadAndInstall(const UpdateManifest& manifest) {
         const QStringList arguments = {
             QStringLiteral("--apply"), install_directory, staging_path, backup_directory,
             executable_name, QString::number(QCoreApplication::applicationPid()), token,
-            QString::number(manifest.sequence), state_path};
+            QString::number(manifest.sequence), state_path, manifest.version};
         if (!QProcess::startDetached(maintenance_copy, arguments, root_path)) {
             emit InstallFailed(QStringLiteral("Не удалось запустить maintenance tool."));
             return;

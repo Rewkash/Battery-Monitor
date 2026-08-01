@@ -189,9 +189,6 @@ void CollectBleCandidateBatteryEntries(const WindowsBleCandidateBatteryCollector
                 (likely_zmi || !target_is_likely_zmi) &&
                 context.is_likely_xiaomi_earbuds != nullptr &&
                 context.is_likely_xiaomi_earbuds(device_name, ble_name, device_id);
-            const bool aggressive_xiaomi_retry =
-                context.should_aggressive_xiaomi_classic_retry != nullptr &&
-                context.should_aggressive_xiaomi_classic_retry(device_name, ble_name, device_id);
             if (context.debug_enabled) {
                 if (lowered_probe.find("redmi") != std::string::npos ||
                     lowered_probe.find("buds") != std::string::npos ||
@@ -249,8 +246,7 @@ void CollectBleCandidateBatteryEntries(const WindowsBleCandidateBatteryCollector
                         xiaomi_classic_cache->Read(*resolved_address_for_fallback,
                                                    likely_zmi ? ClassicBatteryService::kZmiPurPodsSerial
                                                               : ClassicBatteryService::kXiaomiDeviceControl,
-                                                   likely_zmi ? context.force_live_refresh
-                                                              : aggressive_xiaomi_retry,
+                                                    context.force_live_refresh,
                                                    2U);
                     if (!classic_result.readings.empty()) {
                         resolved_readings = classic_result.readings;

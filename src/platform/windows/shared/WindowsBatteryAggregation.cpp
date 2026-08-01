@@ -300,23 +300,17 @@ std::vector<DeviceBatteryInfo> FinalizeCollectedEntries(std::vector<DeviceBatter
                                                         bool include_disconnected,
                                                         const PairedBluetoothSnapshot* paired_snapshot) {
     std::unordered_set<std::string> devices_with_real_battery;
-    std::unordered_set<std::string> devices_with_live_battery;
-    std::unordered_set<std::uint64_t> addresses_with_live_battery;
     std::unordered_set<std::uint64_t> addresses_with_any_real_battery;
     std::unordered_set<std::string> devices_with_tws_components;
     std::unordered_set<std::uint64_t> addresses_with_tws_components;
+    std::unordered_set<std::string> devices_with_live_tws_components;
+    std::unordered_set<std::uint64_t> addresses_with_live_tws_components;
     for (const auto& entry : entries) {
         if (entry.battery_level_percent.has_value()) {
             devices_with_real_battery.insert(entry.device_id);
             const auto parsed_address = ParseBluetoothAddressFromDeviceId(entry.device_id);
             if (parsed_address.has_value()) {
                 addresses_with_any_real_battery.insert(*parsed_address);
-            }
-            if (!entry.is_cached) {
-                devices_with_live_battery.insert(entry.device_id);
-                if (parsed_address.has_value()) {
-                    addresses_with_live_battery.insert(*parsed_address);
-                }
             }
         }
 
@@ -326,8 +320,14 @@ std::vector<DeviceBatteryInfo> FinalizeCollectedEntries(std::vector<DeviceBatter
                 const auto parsed_address = ParseBluetoothAddressFromDeviceId(entry.device_id);
                 if (parsed_address.has_value()) {
                     addresses_with_tws_components.insert(*parsed_address);
+                    if (!entry.is_cached) {
+                        addresses_with_live_tws_components.insert(*parsed_address);
+                    }
                 } else {
                     devices_with_tws_components.insert(entry.device_id);
+                    if (!entry.is_cached) {
+                        devices_with_live_tws_components.insert(entry.device_id);
+                    }
                 }
             }
         }
@@ -346,17 +346,18 @@ std::vector<DeviceBatteryInfo> FinalizeCollectedEntries(std::vector<DeviceBatter
             continue;
         }
 
+        if (entry.is_cached &&
+            (normalized_component == "left" || normalized_component == "right" || normalized_component == "case") &&
+            (devices_with_live_tws_components.contains(entry.device_id) ||
+             (parsed_address.has_value() && addresses_with_live_tws_components.contains(*parsed_address)))) {
+            continue;
+        }
+
         if (!entry.battery_level_percent.has_value() &&
             (devices_with_real_battery.contains(entry.device_id) ||
              (parsed_address.has_value() && addresses_with_any_real_battery.contains(*parsed_address)))) {
             continue;
         }
-        if (entry.is_cached &&
-            (devices_with_live_battery.contains(entry.device_id) ||
-             (parsed_address.has_value() && addresses_with_live_battery.contains(*parsed_address)))) {
-            continue;
-        }
-
         std::string key;
         if (!entry.battery_level_percent.has_value()) {
             if (parsed_address.has_value()) {
@@ -366,16 +367,34 @@ std::vector<DeviceBatteryInfo> FinalizeCollectedEntries(std::vector<DeviceBatter
             }
         } else {
             if (parsed_address.has_value()) {
-                key = "resolved|" + std::to_string(*parsed_address) + "|" + entry.battery_component +
-                      "|" + (entry.is_cached ? "cached" : "live");
+                key = "resolved|" + std::to_string(*parsed_address) + "|" + normalized_component;
             } else {
-                key = "resolved|" + entry.device_id + "|" + entry.battery_component +
-                      "|" + (entry.is_cached ? "cached" : "live");
+                key = "resolved|" + entry.device_id + "|" + normalized_component;
             }
         }
         const auto dedup_it = final_dedup.find(key);
         if (dedup_it != final_dedup.end()) {
             auto& existing = filtered_entries[dedup_it->second];
+            if (!existing.is_cached && entry.is_cached) {
+                existing.is_connected = existing.is_connected || entry.is_connected;
+                if (!existing.device_mode.has_value()) {
+                    existing.device_mode = entry.device_mode;
+                }
+                if (!existing.device_submode.has_value()) {
+                    existing.device_submode = entry.device_submode;
+                }
+                if (!existing.bluetooth_le_appearance.has_value()) {
+                    existing.bluetooth_le_appearance = entry.bluetooth_le_appearance;
+                }
+                if (!existing.bluetooth_cod_major.has_value()) {
+                    existing.bluetooth_cod_major = entry.bluetooth_cod_major;
+                }
+                if (!existing.bluetooth_cod_minor.has_value()) {
+                    existing.bluetooth_cod_minor = entry.bluetooth_cod_minor;
+                }
+                AppendUniqueStrings(&existing.device_categories, entry.device_categories);
+                continue;
+            }
             entry.is_connected = existing.is_connected || entry.is_connected;
             if (!entry.device_mode.has_value()) {
                 entry.device_mode = existing.device_mode;

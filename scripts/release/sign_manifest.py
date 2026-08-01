@@ -25,6 +25,7 @@ def main() -> int:
     parser.add_argument("--bundle", required=True, type=pathlib.Path)
     parser.add_argument("--artifact-url", required=True)
     parser.add_argument("--release-notes", default="")
+    parser.add_argument("--release-notes-file", type=pathlib.Path)
     parser.add_argument("--release-notes-url", default="")
     parser.add_argument("--mandatory", action="store_true")
     parser.add_argument("--output-dir", required=True, type=pathlib.Path)
@@ -44,6 +45,14 @@ def main() -> int:
 
     now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     expires = now + dt.timedelta(days=14)
+    release_notes = args.release_notes
+    if args.release_notes_file is not None:
+        if args.release_notes:
+            raise SystemExit("use either --release-notes or --release-notes-file")
+        release_notes = args.release_notes_file.read_text(encoding="utf-8")
+    if len(release_notes.encode("utf-8")) > 48 * 1024:
+        raise SystemExit("release notes exceed 48 KiB")
+
     payload = {
         "artifact": {
             "format": "bmup-1",
@@ -56,7 +65,7 @@ def main() -> int:
         "keyId": hashlib.sha256(public_key).hexdigest(),
         "mandatory": args.mandatory,
         "publishedAt": now.isoformat().replace("+00:00", "Z"),
-        "releaseNotes": args.release_notes,
+        "releaseNotes": release_notes,
         "releaseNotesUrl": args.release_notes_url,
         "schemaVersion": 1,
         "sequence": args.sequence,

@@ -14,6 +14,8 @@
 namespace battery_monitor {
 namespace {
 
+constexpr int kMaximumReleaseNotesBytes = 48 * 1024;
+
 bool Fail(QString* error, const QString& message) {
     if (error != nullptr) {
         *error = message;
@@ -92,6 +94,12 @@ bool ParseAndValidateUpdateManifest(const QByteArray& bytes,
     if (!parsed.published_at.isValid() || !parsed.expires_at.isValid() ||
         parsed.expires_at <= QDateTime::currentDateTimeUtc()) {
         return Fail(error, QStringLiteral("Manifest is expired or has invalid timestamps."));
+    }
+    if (parsed.release_notes.toUtf8().size() > kMaximumReleaseNotesBytes ||
+        (!parsed.release_notes_url.isEmpty() &&
+         (parsed.release_notes_url.scheme() != QStringLiteral("https") ||
+          parsed.release_notes_url.host().toLower() != QStringLiteral("github.com")))) {
+        return Fail(error, QStringLiteral("Manifest release notes are invalid."));
     }
     if (!IsAllowedArtifactHost(parsed.artifact_url) ||
         parsed.artifact_size == 0 || parsed.artifact_size > kMaximumPackageBytes ||

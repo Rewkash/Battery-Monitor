@@ -1,4 +1,4 @@
-# Battery Monitor
+# ChargeView
 
 Current application version is defined once in the root `CMakeLists.txt`. Windows builds include an optional signed GitHub Releases updater; see [auto-update design](docs/auto-update-design.md) and [release process](docs/release-process.md).
 

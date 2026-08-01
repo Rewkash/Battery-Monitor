@@ -138,6 +138,41 @@ std::optional<XiaomiModePayload> TryParseRequestedMode(const std::string& mode) 
     return std::nullopt;
 }
 
+bool WaitForModeConfirmation(SOCKET socket_handle,
+                             std::uint64_t address,
+                             std::uint8_t expected_mode) {
+    std::vector<std::uint8_t> rx_buffer;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1800);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto chunk = ReceiveChunk(socket_handle);
+        if (!chunk.has_value()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+            continue;
+        }
+        const auto messages = AppendAndDecodeXiaomiMessages(&rx_buffer, *chunk);
+        for (const auto& response : messages) {
+            if (IsXiaomiReportStatusNotification(response)) {
+                SendXiaomiReportStatusAck(socket_handle, response);
+            }
+            const auto parsed_mode =
+                ParseXiaomiNoiseModeCode(static_cast<std::uint8_t>(response.opcode), response.payload);
+            if (!parsed_mode.has_value()) {
+                continue;
+            }
+
+            const auto parsed_submode =
+                static_cast<std::uint8_t>(response.opcode) == 0xF4U
+                    ? ParseXiaomiNoiseSubmodeCodeFromF4Payload(response.payload)
+                    : std::optional<std::uint8_t>{};
+            PutXiaomiModeCacheEntry(address, *parsed_mode, parsed_submode);
+            if (*parsed_mode == expected_mode) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 }  // namespace
 
 bool SetXiaomiNoiseModeForTarget(const ResolvedBluetoothTarget& target,
@@ -249,19 +284,59 @@ bool SetXiaomiNoiseSubmodeForTarget(const ResolvedBluetoothTarget& target,
 bool SetNoiseControlModeForAddress(std::uint64_t address,
                                    NoiseControlMode mode,
                                    const XiaomiControlActionContext& context) {
-    const char* mode_name = nullptr;
+    XiaomiControlConnection connection;
+    if (!OpenControlConnection(address, &connection, context, "", true, false)) {
+        return false;
+    }
+
+    std::uint8_t mode_value = 0;
     switch (mode) {
         case NoiseControlMode::Off:
-            mode_name = "off";
+            mode_value = 0x00;
             break;
         case NoiseControlMode::Anc:
-            mode_name = "anc";
+            mode_value = 0x01;
             break;
         case NoiseControlMode::Transparency:
-            mode_name = "transparency";
+            mode_value = 0x02;
             break;
     }
-    return SetXiaomiNoiseModeForTarget({std::string(), address}, mode_name, context);
+
+    if (connection.connected_path().starts_with("ZMI-1101")) {
+        const std::uint8_t f4_tail_value = mode == NoiseControlMode::Anc ? 0x02U
+                                               : mode == NoiseControlMode::Transparency ? 0x01U
+                                                                                         : 0x00U;
+        XiaomiMessage mode_message;
+        mode_message.type = XiaomiMessageType::kPhoneRequest;
+        mode_message.opcode = static_cast<XiaomiOpcode>(0x0EU);
+        mode_message.sequence = connection.sequence()++;
+        mode_message.payload = {0x02, 0x04, mode_value};
+        if (!SendAll(connection.socket_handle(), EncodeXiaomiMessage(mode_message))) {
+            return false;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        XiaomiMessage detail_message;
+        detail_message.type = XiaomiMessageType::kPhoneRequest;
+        detail_message.opcode = static_cast<XiaomiOpcode>(0xF4U);
+        detail_message.sequence = connection.sequence()++;
+        detail_message.payload = {0x04, 0x00, 0x0B, mode_value, f4_tail_value};
+        if (!SendAll(connection.socket_handle(), EncodeXiaomiMessage(detail_message))) {
+            return false;
+        }
+        return WaitForModeConfirmation(connection.socket_handle(), address, mode_value);
+    }
+
+    XiaomiMessage message;
+    message.type = static_cast<XiaomiMessageType>(0xC1U);
+    message.opcode = static_cast<XiaomiOpcode>(0x08U);
+    message.sequence = connection.sequence()++;
+    message.payload = {0x02, 0x04, mode_value};
+    if (!SendAll(connection.socket_handle(), EncodeXiaomiMessage(message))) {
+        return false;
+    }
+
+    return WaitForModeConfirmation(connection.socket_handle(), address, mode_value);
 }
 
 }  // namespace battery_monitor

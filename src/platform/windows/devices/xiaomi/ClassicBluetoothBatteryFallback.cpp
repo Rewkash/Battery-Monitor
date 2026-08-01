@@ -2,7 +2,10 @@
 
 #include <chrono>
 #include <cstdint>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <winsock2.h>
@@ -15,6 +18,9 @@
 namespace battery_monitor {
 
 namespace {
+
+std::mutex g_successful_service_mutex;
+std::unordered_map<std::uint64_t, ClassicBatteryService> g_successful_services;
 
 void LogDebug(bool debug_enabled, XiaomiDebugLogFn debug_log, const std::string& message) {
     WindowsBatteryProviderEventLog(message);
@@ -79,6 +85,18 @@ bool TryConnectServiceSocket(const SOCKADDR_BTH& base_address,
 
 }  // namespace
 
+std::optional<ClassicBatteryService> TryGetSuccessfulClassicBatteryService(std::uint64_t bluetooth_address) {
+    std::lock_guard<std::mutex> lock(g_successful_service_mutex);
+    const auto found = g_successful_services.find(bluetooth_address);
+    return found == g_successful_services.end() ? std::nullopt
+                                                : std::optional<ClassicBatteryService>{found->second};
+}
+
+void RememberSuccessfulClassicBatteryService(std::uint64_t bluetooth_address, ClassicBatteryService service) {
+    std::lock_guard<std::mutex> lock(g_successful_service_mutex);
+    g_successful_services[bluetooth_address] = service;
+}
+
 std::vector<BatteryReading> TryReadXiaomiClassicBattery(std::uint64_t bluetooth_address,
                                                         ClassicBatteryService service,
                                                         bool* service_connected,
@@ -118,7 +136,6 @@ std::vector<BatteryReading> TryReadXiaomiClassicBattery(std::uint64_t bluetooth_
     if (service_connected != nullptr) {
         *service_connected = true;
     }
-
     const auto session_started_at = std::chrono::steady_clock::now();
     LogDebug(debug_enabled, debug_log,
              "Classic RFCOMM: battery session started path=" + connected_path);

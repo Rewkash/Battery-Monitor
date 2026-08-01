@@ -36,7 +36,7 @@ namespace {
 
 #ifdef _WIN32
 bool ClaimGuiInstanceAndCloseLegacyCopies() {
-    static HANDLE instance_mutex = CreateMutexW(nullptr, TRUE, L"Local\\ChargeViewerGuiInstance");
+    static HANDLE instance_mutex = CreateMutexW(nullptr, TRUE, L"Local\\ChargeViewGuiInstance");
     if (instance_mutex == nullptr) {
         return true;
     }
@@ -88,6 +88,7 @@ int RunCliApplication(int argc, char** argv, const CommandLineOptions& options) 
 int RunGuiApplication(int argc, char** argv) {
 #ifdef BATTERY_MONITOR_WITH_QT
     QApplication app(argc, argv);
+    QApplication::setApplicationDisplayName(QStringLiteral("ChargeView"));
 #ifdef _WIN32
     if (!ClaimGuiInstanceAndCloseLegacyCopies()) {
         return 0;

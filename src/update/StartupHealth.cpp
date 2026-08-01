@@ -1,5 +1,7 @@
 #include "update/StartupHealth.h"
 
+#include "BatteryMonitorVersion.h"
+
 #ifdef _WIN32
 #include <windows.h>
 
@@ -17,7 +19,15 @@ void SignalUpdateStartupHealth(int argc, char** argv) {
         }
         char* end = nullptr;
         const unsigned long long raw = std::strtoull(argv[index + 1], &end, 10);
-        if (end != argv[index + 1] && *end == '\0' && raw != 0) {
+        bool expected_version_matches = true;
+        for (int version_index = 1; version_index + 1 < argc; ++version_index) {
+            if (std::string_view(argv[version_index]) == "--update-health-version") {
+                expected_version_matches =
+                    std::string_view(argv[version_index + 1]) == BATTERY_MONITOR_VERSION;
+                break;
+            }
+        }
+        if (expected_version_matches && end != argv[index + 1] && *end == '\0' && raw != 0) {
             HANDLE event = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(raw));
             SetEvent(event);
             CloseHandle(event);

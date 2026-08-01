@@ -87,14 +87,16 @@ bool IsSafeTransaction(const std::filesystem::path& current,
 }
 
 bool StartProcess(const std::filesystem::path& executable,
-                  const std::filesystem::path& working_directory,
-                  HANDLE health_event,
-                  PROCESS_INFORMATION* process) {
+                   const std::filesystem::path& working_directory,
+                   HANDLE health_event,
+                   const std::wstring& expected_version,
+                   PROCESS_INFORMATION* process) {
     std::wstring command = QuoteArgument(executable.wstring());
     BOOL inherit_handles = FALSE;
     if (health_event != nullptr) {
         command += L" --update-health-handle " +
-                   std::to_wstring(reinterpret_cast<std::uintptr_t>(health_event));
+                    std::to_wstring(reinterpret_cast<std::uintptr_t>(health_event)) +
+                    L" --update-health-version " + QuoteArgument(expected_version);
         inherit_handles = TRUE;
     }
     std::vector<wchar_t> buffer(command.begin(), command.end());
@@ -179,13 +181,14 @@ std::wstring MutexName(const std::filesystem::path& current) {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    if (argc != 10 || std::wstring_view(argv[1]) != L"--apply") return 2;
+    if (argc != 11 || std::wstring_view(argv[1]) != L"--apply") return 2;
     const std::filesystem::path current = argv[2];
     const std::filesystem::path staging = argv[3];
     const std::filesystem::path backup = argv[4];
     const std::wstring executable = argv[5];
     const std::wstring token = argv[7];
     const std::filesystem::path state = argv[9];
+    const std::wstring expected_version = argv[10];
     std::uint64_t old_pid = 0;
     std::uint64_t sequence = 0;
     if (!ParseUint64(argv[6], &old_pid) || old_pid > MAXDWORD ||
@@ -209,7 +212,7 @@ int wmain(int argc, wchar_t** argv) {
     PROCESS_INFORMATION child{};
     const auto new_executable = current / executable;
     bool healthy = health_event.get() != nullptr &&
-                   StartProcess(new_executable, current, health_event.get(), &child);
+                    StartProcess(new_executable, current, health_event.get(), expected_version, &child);
     Handle child_process(healthy ? child.hProcess : nullptr);
     Handle child_thread(healthy ? child.hThread : nullptr);
     if (healthy) {
@@ -225,7 +228,7 @@ int wmain(int argc, wchar_t** argv) {
     const auto failed = current.parent_path() / (L".battery-monitor-failed-" + token);
     if (!RenameDirectory(current, failed) || !RenameDirectory(backup, current)) return 7;
     PROCESS_INFORMATION restored{};
-    if (StartProcess(current / executable, current, nullptr, &restored)) {
+    if (StartProcess(current / executable, current, nullptr, std::wstring(), &restored)) {
         CloseHandle(restored.hThread);
         CloseHandle(restored.hProcess);
     }

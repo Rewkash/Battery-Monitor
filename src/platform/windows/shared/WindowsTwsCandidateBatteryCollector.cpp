@@ -114,7 +114,7 @@ void AddCandidateReadings(DeviceBatteryAccumulator* accumulator,
         entry.battery_level_percent = battery_reading.percent;
         PopulateBluetoothVisualHintsFromEndpointCandidate(candidate, &entry);
         entry.is_cached = is_cached;
-        entry.is_connected = is_connected;
+        entry.is_connected = candidate.is_connected || is_connected;
         accumulator->AddEntry(std::move(entry));
     }
 }
@@ -215,12 +215,7 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
         const auto classic_service = candidate_is_likely_zmi
                                          ? ClassicBatteryService::kZmiPurPodsSerial
                                          : ClassicBatteryService::kXiaomiDeviceControl;
-        const bool aggressive_xiaomi_retry =
-            candidate.from_connected_scan &&
-            !context.include_disconnected &&
-            context.should_aggressive_xiaomi_classic_retry != nullptr &&
-            context.should_aggressive_xiaomi_classic_retry(
-                candidate.endpoint_name, candidate.endpoint_name, candidate.endpoint_id);
+        const bool force_classic_refresh = context.force_live_refresh;
 
         std::vector<BatteryReading> partial_classic_readings;
         bool partial_classic_from_cache = false;
@@ -228,11 +223,10 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
             const auto& classic_result =
                 xiaomi_classic_cache->Read(candidate.bluetooth_address,
                                            classic_service,
-                                           candidate_is_likely_zmi ? context.force_live_refresh
-                                                                   : aggressive_xiaomi_retry,
+                                           force_classic_refresh,
                                            2U);
             if (!classic_result.readings.empty()) {
-                if (candidate_is_likely_zmi && !classic_result.from_persistent_cache &&
+                if (!classic_result.from_persistent_cache &&
                     XiaomiResolvedTwsComponentCount(classic_result.readings) >= 1U) {
                     AddCandidateReadings(
                         accumulator,
@@ -241,7 +235,7 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
                         classic_result.from_persistent_cache,
                         candidate.is_connected);
                     LogDebug(context.debug_log,
-                             "AEP ZMI classic partial accepted for '" + candidate.endpoint_name + "'");
+                              "AEP Xiaomi classic partial accepted for '" + candidate.endpoint_name + "'");
                     continue;
                 }
                 if (!HasUsefulXiaomiTwsReadings(classic_result.readings)) {
@@ -300,8 +294,7 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
             const auto& classic_result =
                 xiaomi_classic_cache->Read(candidate.bluetooth_address,
                                            classic_service,
-                                           candidate_is_likely_zmi ? context.force_live_refresh
-                                                                   : aggressive_xiaomi_retry,
+                                           force_classic_refresh,
                                            2U);
             if (!classic_result.readings.empty()) {
                 resolved_readings = classic_result.readings;

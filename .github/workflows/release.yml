@@ -87,13 +87,17 @@ jobs:
         shell: pwsh
         env:
           BATTERY_MONITOR_ED25519_PRIVATE_KEY_B64: ${{ secrets.BATTERY_MONITOR_ED25519_PRIVATE_KEY_B64 }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           py -3.11 -m pip install --disable-pip-version-check --no-deps --only-binary=:all: --require-hashes -r scripts\release\requirements.txt
           py -3.11 -m pip check
           py -3.11 -c "import _cffi_backend; from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey; assert len(Ed25519PrivateKey.generate().sign(b'release-check')) == 64"
           py -3.11 scripts\release\build_bundle.py --input release-staging\app --output release-staging\battery-monitor-${{ github.ref_name }}-win-x64.bmup
           $version = "${{ steps.release_meta.outputs.version }}"
-          py -3.11 scripts\release\sign_manifest.py --version $version --sequence ${{ github.run_number }} --bundle release-staging\battery-monitor-${{ github.ref_name }}-win-x64.bmup --artifact-url "https://github.com/Rewkash/Battery-Monitor/releases/download/${{ github.ref_name }}/battery-monitor-${{ github.ref_name }}-win-x64.bmup" --release-notes-url "https://github.com/Rewkash/Battery-Monitor/releases/tag/${{ github.ref_name }}" --output-dir release-staging
+          $notes = (gh api --method POST "repos/${{ github.repository }}/releases/generate-notes" -f tag_name="${{ github.ref_name }}" -f target_commitish="${{ github.sha }}" --jq .body | Out-String).TrimEnd()
+          $notesPath = Join-Path $env:RUNNER_TEMP release-notes.md
+          [IO.File]::WriteAllText($notesPath, $notes, [Text.UTF8Encoding]::new($false))
+          py -3.11 scripts\release\sign_manifest.py --version $version --sequence ${{ github.run_number }} --bundle release-staging\battery-monitor-${{ github.ref_name }}-win-x64.bmup --artifact-url "https://github.com/Rewkash/Battery-Monitor/releases/download/${{ github.ref_name }}/battery-monitor-${{ github.ref_name }}-win-x64.bmup" --release-notes-file $notesPath --release-notes-url "https://github.com/Rewkash/Battery-Monitor/releases/tag/${{ github.ref_name }}" --output-dir release-staging
           py -3.11 scripts\release\verify_release.py --manifest release-staging\update-manifest.json --signature release-staging\update-manifest.json.sig --bundle release-staging\battery-monitor-${{ github.ref_name }}-win-x64.bmup
           Compress-Archive -Path release-staging\app\* -DestinationPath release-staging\battery-monitor-${{ github.ref_name }}-win-x64.zip -CompressionLevel Optimal
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2

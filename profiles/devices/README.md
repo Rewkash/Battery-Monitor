@@ -1,6 +1,6 @@
 # Device Profiles
 
-`Battery Monitor` ищет JSON-профили устройств в папке `profiles/devices`.
+`ChargeView` ищет JSON-профили устройств в папке `profiles/devices`.
 
 Порядок поиска:
 - `BATTERY_MONITOR_PROFILE_DIR`, если задана переменная окружения

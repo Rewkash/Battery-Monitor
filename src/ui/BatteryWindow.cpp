@@ -2019,7 +2019,7 @@ BatteryWindow::BatteryWindow(std::unique_ptr<IBluetoothBatteryProvider> provider
       provider_(std::move(provider)),
       noise_control_provider_(provider_ != nullptr ? provider_->GetNoiseControlProvider() : nullptr) {
     setObjectName(QStringLiteral("trayPanelWindow"));
-    setWindowTitle(QStringLiteral("ChargeViewer"));
+    setWindowTitle(QStringLiteral("ChargeView"));
     setWindowFlag(Qt::Tool, true);
     setWindowFlag(Qt::WindowStaysOnTopHint, true);
     setWindowFlag(Qt::FramelessWindowHint, true);
@@ -2209,7 +2209,7 @@ QWidget#listContainer {
     top_layout->setContentsMargins(10, 0, 10, 0);
     top_layout->setSpacing(6);
 
-    auto* title_label = new QLabel(QStringLiteral("ChargeViewer"), this);
+    auto* title_label = new QLabel(QStringLiteral("ChargeView"), this);
     title_label->setObjectName(QStringLiteral("titleLabel"));
 
     refresh_button_ = new SmoothPushButton(QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u0438\u0442\u044C"), this);
@@ -2578,7 +2578,7 @@ void BatteryWindow::InitializeTray() {
             });
 
     tray_icon_->setContextMenu(tray_menu_);
-    tray_icon_->setToolTip(QStringLiteral("ChargeViewer"));
+    tray_icon_->setToolTip(QStringLiteral("ChargeView"));
     tray_icon_->show();
 
     UpdateToggleActionText();
@@ -2702,7 +2702,7 @@ void BatteryWindow::UpdateTrayTooltip(const std::vector<DeviceBatteryInfo>& devi
 
     const auto grouped = GroupDevices(devices, hidden_device_ids_);
     const auto ordered = ApplyCustomOrder(grouped, connected_device_order_, disconnected_device_order_);
-    QString tooltip = QString::fromUtf8(u8"ChargeViewer\n"
+    QString tooltip = QString::fromUtf8(u8"ChargeView\n"
                                        u8"\u0423\u0441\u0442\u0440\u043E\u0439\u0441\u0442\u0432: %1")
                           .arg(ordered.size());
 

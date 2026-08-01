@@ -1,8 +1,10 @@
 ﻿#include "platform/windows/devices/xiaomi/XiaomiControlSocket.h"
 
 #include "platform/windows/bluetooth/BluetoothSocketUtils.h"
+#include "platform/windows/devices/xiaomi/ClassicBluetoothBatteryFallback.h"
 #include "platform/windows/shared/WindowsBluetoothConstants.h"
 
+#include <array>
 #include <string>
 
 #include <ws2bth.h>
@@ -58,9 +60,34 @@ bool ConnectXiaomiControlSocket(std::uint64_t bluetooth_address,
         return connect_once(true, "") || connect_once(false, "-insecure");
     };
 
-    return try_connect(kXiaomiDeviceCtrlServiceUuid, "FD2D") ||
-           try_connect(kBluetoothSerialPortServiceUuid, "SPP-1101") ||
-           try_connect(kZmiPurPodsSerialServiceUuid, "ZMI-1101");
+    const auto try_service = [&](ClassicBatteryService service) {
+        const bool connected = service == ClassicBatteryService::kZmiPurPodsSerial
+                                   ? try_connect(kZmiPurPodsSerialServiceUuid, "ZMI-1101")
+                               : service == ClassicBatteryService::kBluetoothSerialPort
+                                   ? try_connect(kBluetoothSerialPortServiceUuid, "SPP-1101")
+                                   : try_connect(kXiaomiDeviceCtrlServiceUuid, "FD2D");
+        if (connected) {
+            RememberSuccessfulClassicBatteryService(bluetooth_address, service);
+        }
+        return connected;
+    };
+
+    const auto preferred = TryGetSuccessfulClassicBatteryService(bluetooth_address);
+    if (preferred.has_value() && try_service(*preferred)) {
+        return true;
+    }
+
+    constexpr std::array services = {
+        ClassicBatteryService::kXiaomiDeviceControl,
+        ClassicBatteryService::kBluetoothSerialPort,
+        ClassicBatteryService::kZmiPurPodsSerial,
+    };
+    for (const auto service : services) {
+        if ((!preferred.has_value() || service != *preferred) && try_service(service)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 }  // namespace battery_monitor

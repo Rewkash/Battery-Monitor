@@ -15,7 +15,7 @@ namespace battery_monitor {
 UpdateDialog::UpdateDialog(const UpdateManifest& manifest, QWidget* parent)
     : QDialog(parent), manifest_(manifest) {
     setAttribute(Qt::WA_DeleteOnClose);
-    setWindowTitle(QString::fromUtf8(u8"Обновление ChargeViewer"));
+    setWindowTitle(QString::fromUtf8(u8"Обновление ChargeView"));
     setMinimumWidth(470);
 
     auto* layout = new QVBoxLayout(this);
@@ -33,6 +33,15 @@ UpdateDialog::UpdateDialog(const UpdateManifest& manifest, QWidget* parent)
                            : manifest.release_notes);
     notes->setMaximumHeight(220);
     layout->addWidget(notes);
+
+    if (manifest.release_notes_url.isValid()) {
+        auto* release_link = new QLabel(
+            QString::fromUtf8(u8"<a href=\"%1\">Открыть страницу выпуска на GitHub</a>")
+                .arg(manifest.release_notes_url.toString().toHtmlEscaped()),
+            this);
+        release_link->setOpenExternalLinks(true);
+        layout->addWidget(release_link);
+    }
 
     status_label_ = new QLabel(QString::fromUtf8(u8"Пакет будет проверен по Ed25519 и SHA-256."), this);
     status_label_->setWordWrap(true);

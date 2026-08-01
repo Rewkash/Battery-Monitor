@@ -47,7 +47,6 @@ class XiaomiClassicBatteryCache {
     std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> last_successful_live_read_;
     std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> last_failed_live_read_;
     std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> live_read_in_progress_;
-    std::unordered_map<std::uint64_t, ClassicBatteryService> successful_service_;
     std::unordered_map<std::uint64_t, bool> services_exhausted_;
 };
 

@@ -1,5 +1,6 @@
 ﻿#include "platform/windows/devices/xiaomi/XiaomiBatteryCaches.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <mutex>
@@ -14,7 +15,7 @@ namespace battery_monitor {
 
 namespace {
 
-constexpr auto kClassicLiveReadInterval = std::chrono::minutes(10);
+constexpr auto kClassicLiveReadInterval = std::chrono::seconds(30);
 
 void LogDebug(XiaomiDebugLogFn debug_log, const std::string& message) {
     if (debug_log != nullptr) {
@@ -48,13 +49,17 @@ XiaomiReadResult XiaomiClassicBatteryCache::Read(std::uint64_t address,
         const auto now = std::chrono::steady_clock::now();
         auto found = cache_.find(address);
         const bool has_cached_result = found != cache_.end();
-        if (preferred_service == ClassicBatteryService::kZmiPurPodsSerial && has_cached_result && !aggressive_retry) {
+        if (preferred_service == ClassicBatteryService::kZmiPurPodsSerial && has_cached_result &&
+            !last_failed_live_read_.contains(address) && !aggressive_retry) {
             LogDebug(debug_log_,
                      "ZMI classic fallback: reusing session cache without another RFCOMM connection address=" +
                          std::to_string(address));
-            return found->second;
+            auto result = found->second;
+            result.from_persistent_cache = true;
+            return result;
         }
-        if (services_exhausted_[address]) {
+        if (preferred_service == ClassicBatteryService::kZmiPurPodsSerial &&
+            services_exhausted_[address] && !aggressive_retry) {
             LogDebug(debug_log_,
                      "Xiaomi classic fallback: all RFCOMM services already failed for current connection address=" +
                          std::to_string(address));
@@ -63,25 +68,22 @@ XiaomiReadResult XiaomiClassicBatteryCache::Read(std::uint64_t address,
         if (const auto successful = last_successful_live_read_.find(address);
             !aggressive_retry && has_cached_result && successful != last_successful_live_read_.end() &&
             now - successful->second < kClassicLiveReadInterval) {
-            return found->second;
+            auto result = found->second;
+            result.from_persistent_cache = true;
+            return result;
         }
         if (const auto in_progress = live_read_in_progress_.find(address);
             in_progress != live_read_in_progress_.end()) {
             LogDebug(debug_log_,
                      "Xiaomi classic fallback: skipping live read already in progress for address=" +
                          std::to_string(address));
-            if (has_cached_result) {
-                auto result = found->second;
-                result.from_persistent_cache = true;
-                return result;
-            }
             return {};
         }
         if (const auto failed = last_failed_live_read_.find(address);
             !aggressive_retry && failed != last_failed_live_read_.end() &&
             now - failed->second < kClassicLiveReadInterval) {
             LogDebug(debug_log_,
-                     "Xiaomi classic fallback: skipping recent failed live read for address=" +
+                     "Xiaomi classic fallback: suppressing stale snapshot after recent failed live read for address=" +
                          std::to_string(address));
             return {};
         }
@@ -93,41 +95,34 @@ XiaomiReadResult XiaomiClassicBatteryCache::Read(std::uint64_t address,
     std::vector<BatteryReading> readings;
     std::optional<ClassicBatteryService> connected_service;
     try {
-        std::array<ClassicBatteryService, 3> services = {
-            preferred_service,
-            ClassicBatteryService::kBluetoothSerialPort,
-            ClassicBatteryService::kZmiPurPodsSerial,
-        };
-        std::size_t service_count = services.size();
-        if (preferred_service == ClassicBatteryService::kZmiPurPodsSerial) {
-            services = {
-                ClassicBatteryService::kZmiPurPodsSerial,
-                ClassicBatteryService::kZmiPurPodsSerial,
-                ClassicBatteryService::kZmiPurPodsSerial,
-            };
-            service_count = 1U;
-        } else {
-            services[2] = ClassicBatteryService::kZmiPurPodsSerial;
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (const auto known = successful_service_.find(address); known != successful_service_.end()) {
-                services = {known->second, known->second, known->second};
-                service_count = 1U;
+        std::array<ClassicBatteryService, 3> services{};
+        std::size_t service_count = 0U;
+        const auto add_service = [&](ClassicBatteryService service) {
+            if (std::find(services.begin(), services.begin() + service_count, service) ==
+                services.begin() + service_count) {
+                services[service_count++] = service;
             }
+        };
+        if (preferred_service == ClassicBatteryService::kZmiPurPodsSerial) {
+            add_service(ClassicBatteryService::kZmiPurPodsSerial);
+        } else {
+            if (const auto known = TryGetSuccessfulClassicBatteryService(address); known.has_value()) {
+                add_service(*known);
+            }
+            add_service(preferred_service);
+            add_service(ClassicBatteryService::kBluetoothSerialPort);
+            add_service(ClassicBatteryService::kZmiPurPodsSerial);
         }
 
         for (std::size_t index = 0; index < service_count; ++index) {
-            bool service_connected = false;
             readings = TryReadXiaomiClassicBattery(
                 address,
                 services[index],
-                &service_connected,
+                nullptr,
                 &PutXiaomiModeCacheEntry,
                 debug_enabled_,
                 debug_log_);
-            if (service_connected) {
+            if (!readings.empty()) {
                 connected_service = services[index];
                 break;
             }
@@ -147,9 +142,9 @@ XiaomiReadResult XiaomiClassicBatteryCache::Read(std::uint64_t address,
     std::lock_guard<std::mutex> lock(mutex_);
     live_read_in_progress_.erase(address);
     if (connected_service.has_value()) {
-        successful_service_[address] = *connected_service;
+        RememberSuccessfulClassicBatteryService(address, *connected_service);
         services_exhausted_.erase(address);
-    } else {
+    } else if (preferred_service == ClassicBatteryService::kZmiPurPodsSerial) {
         services_exhausted_[address] = true;
     }
     if (!readings.empty()) {
