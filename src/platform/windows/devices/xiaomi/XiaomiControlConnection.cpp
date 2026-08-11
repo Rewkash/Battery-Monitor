@@ -11,16 +11,36 @@ XiaomiControlConnection::~XiaomiControlConnection() {
 }
 
 XiaomiControlSocketStatus XiaomiControlConnection::OpenSocket(std::uint64_t bluetooth_address) {
+    return OpenSocket(bluetooth_address, ClassicBatteryService::kXiaomiDeviceControl);
+}
+
+XiaomiControlSocketStatus XiaomiControlConnection::OpenSocket(
+    std::uint64_t bluetooth_address,
+    ClassicBatteryService preferred_service) {
     Close();
 
     if (!wsa_.started()) {
         return XiaomiControlSocketStatus::kWsaStartupFailed;
     }
 
-    if (!ConnectXiaomiControlSocket(bluetooth_address, &socket_handle_, &connected_path_)) {
+    if (!ConnectXiaomiControlSocket(
+            bluetooth_address, preferred_service, &socket_handle_, &connected_path_)) {
         return XiaomiControlSocketStatus::kSocketOpenFailed;
     }
 
+    sequence_ = 0;
+    return XiaomiControlSocketStatus::kOk;
+}
+
+XiaomiControlSocketStatus XiaomiControlConnection::OpenSocketForService(
+    std::uint64_t bluetooth_address,
+    ClassicBatteryService service) {
+    Close();
+    if (!wsa_.started()) return XiaomiControlSocketStatus::kWsaStartupFailed;
+    if (!ConnectXiaomiControlSocketForService(
+            bluetooth_address, service, &socket_handle_, &connected_path_)) {
+        return XiaomiControlSocketStatus::kSocketOpenFailed;
+    }
     sequence_ = 0;
     return XiaomiControlSocketStatus::kOk;
 }

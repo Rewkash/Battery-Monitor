@@ -15,6 +15,8 @@
 
 namespace battery_monitor {
 
+class XiaomiRfcommSessionManager;
+
 struct XiaomiReadResult {
     std::vector<BatteryReading> readings;
     bool from_persistent_cache = false;
@@ -24,9 +26,10 @@ class XiaomiClassicBatteryCache {
    public:
     XiaomiClassicBatteryCache(bool persist_write_enabled,
                               bool persist_read_enabled,
-                              std::filesystem::path cache_file,
-                              int ttl_minutes,
-                              bool debug_enabled = false,
+                               std::filesystem::path cache_file,
+                               int ttl_minutes,
+                               XiaomiRfcommSessionManager* session_manager,
+                               bool debug_enabled = false,
                               XiaomiDebugLogFn debug_log = nullptr);
 
     XiaomiReadResult Read(std::uint64_t address,
@@ -42,6 +45,7 @@ class XiaomiClassicBatteryCache {
     int ttl_minutes_ = 180;
     bool debug_enabled_ = false;
     XiaomiDebugLogFn debug_log_ = nullptr;
+    XiaomiRfcommSessionManager* session_manager_ = nullptr;
     mutable std::mutex mutex_;
     std::unordered_map<std::uint64_t, XiaomiReadResult> cache_;
     std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> last_successful_live_read_;

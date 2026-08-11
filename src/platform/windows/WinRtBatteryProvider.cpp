@@ -59,16 +59,26 @@ void LogProviderEntries(const std::string& stage, const std::vector<DeviceBatter
 }  // namespace
 
 WinRtBatteryProvider::WinRtBatteryProvider()
-    : xiaomi_classic_cache_(
+    : xiaomi_sessions_(GetWindowsBatteryProviderRuntimeOptions().debug_enabled,
+                       &WindowsBatteryProviderDebugLog),
+      xiaomi_classic_cache_(
           GetWindowsBatteryProviderRuntimeOptions().persistent_xiaomi_cache_write_enabled,
           GetWindowsBatteryProviderRuntimeOptions().persistent_xiaomi_cache_read_enabled,
           GetWindowsBatteryProviderRuntimeOptions().xiaomi_cache_file_path,
           GetWindowsBatteryProviderRuntimeOptions().xiaomi_cache_ttl_minutes,
+          &xiaomi_sessions_,
           GetWindowsBatteryProviderRuntimeOptions().debug_enabled,
            &WindowsBatteryProviderDebugLog) {}
 
+WinRtBatteryProvider::~WinRtBatteryProvider() {
+    xiaomi_sessions_.Shutdown();
+}
+
 void WinRtBatteryProvider::NotifyDeviceConnectionChanged(const std::string& device_id, bool connected) {
     const auto address = ParseBluetoothAddressFromDeviceId(device_id);
+    if (address.has_value()) {
+        xiaomi_sessions_.NotifyConnectionChanged(*address, connected);
+    }
     if (!connected && address.has_value()) {
         WindowsBatteryProviderEventLog(
             "Bluetooth disconnect observed; preserving RFCOMM service and battery cache address=" +
@@ -197,7 +207,9 @@ bool WinRtBatteryProvider::SetXiaomiNoiseMode(const std::string& mode, const std
         return false;
     }
 
-    return SetXiaomiNoiseModeForTarget(*target, mode, MakeWindowsXiaomiControlActionContext());
+    auto context = MakeWindowsXiaomiControlActionContext();
+    context.session_manager = &xiaomi_sessions_;
+    return SetXiaomiNoiseModeForTarget(*target, mode, context);
 }
 
 bool WinRtBatteryProvider::SupportsNoiseControl(const std::string& device_id) {
@@ -211,7 +223,9 @@ bool WinRtBatteryProvider::SetNoiseControlMode(const std::string& device_id, Noi
     }
 
     EnsureWindowsBatteryProviderApartmentInitialized();
-    return SetNoiseControlModeForAddress(*address, mode, MakeWindowsXiaomiControlActionContext());
+    auto context = MakeWindowsXiaomiControlActionContext();
+    context.session_manager = &xiaomi_sessions_;
+    return SetNoiseControlModeForAddress(*address, mode, context);
 }
 
 bool WinRtBatteryProvider::SupportsNoiseSubmodes(const std::string& device_id, NoiseControlMode mode) {
@@ -273,7 +287,9 @@ bool WinRtBatteryProvider::SetXiaomiNoiseSubmode(const std::string& family,
         return false;
     }
 
-    return SetXiaomiNoiseSubmodeForTarget(*target, family, submode, MakeWindowsXiaomiControlActionContext());
+    auto context = MakeWindowsXiaomiControlActionContext();
+    context.session_manager = &xiaomi_sessions_;
+    return SetXiaomiNoiseSubmodeForTarget(*target, family, submode, context);
 }
 
 }  // namespace battery_monitor

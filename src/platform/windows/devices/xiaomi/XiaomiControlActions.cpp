@@ -18,6 +18,7 @@
 #include "platform/windows/devices/xiaomi/XiaomiModeCache.h"
 #include "platform/windows/devices/xiaomi/XiaomiNoiseModeCodec.h"
 #include "platform/windows/devices/xiaomi/XiaomiProtocol.h"
+#include "platform/windows/devices/xiaomi/XiaomiRfcommSessionManager.h"
 
 namespace battery_monitor {
 
@@ -188,6 +189,15 @@ bool SetXiaomiNoiseModeForTarget(const ResolvedBluetoothTarget& target,
     std::cout << "Setting mode on device: " << target.first << " address=" << target.second << "\n";
     std::cout << "Requested mode: " << normalized_mode << " (experimental)\n";
 
+    if (context.session_manager != nullptr) {
+        const bool sent = context.session_manager->SetExperimentalNoiseMode(
+            target.second, mode_payload->mode_value, mode_payload->f4_tail_value);
+        if (sent) {
+            std::cout << "Command finished.\n";
+        }
+        return sent;
+    }
+
     XiaomiControlConnection connection;
     if (!OpenControlConnection(
             target.second, &connection, context, "Failed to open Xiaomi control socket.", true, true)) {
@@ -253,6 +263,11 @@ bool SetXiaomiNoiseSubmodeForTarget(const ResolvedBluetoothTarget& target,
         return false;
     }
 
+    if (context.session_manager != nullptr) {
+        return context.session_manager->SetNoiseSubmode(
+            target.second, family_code, static_cast<std::uint8_t>(submode));
+    }
+
     XiaomiControlConnection connection;
     if (!OpenControlConnection(
             target.second, &connection, context, "Failed to open Xiaomi control socket.", true, false)) {
@@ -284,6 +299,10 @@ bool SetXiaomiNoiseSubmodeForTarget(const ResolvedBluetoothTarget& target,
 bool SetNoiseControlModeForAddress(std::uint64_t address,
                                    NoiseControlMode mode,
                                    const XiaomiControlActionContext& context) {
+    if (context.session_manager != nullptr) {
+        return context.session_manager->SetNoiseControlMode(address, mode);
+    }
+
     XiaomiControlConnection connection;
     if (!OpenControlConnection(address, &connection, context, "", true, false)) {
         return false;

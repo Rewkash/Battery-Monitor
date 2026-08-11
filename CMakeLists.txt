@@ -134,6 +134,7 @@ if(WIN32)
             src/platform/windows/devices/xiaomi/XiaomiNoiseModeCodec.cpp
             src/platform/windows/devices/xiaomi/XiaomiPersistentCache.cpp
             src/platform/windows/devices/xiaomi/XiaomiProtocol.cpp
+            src/platform/windows/devices/xiaomi/XiaomiRfcommSessionManager.cpp
             src/platform/windows/WinRtBatteryProvider.cpp
     )
 

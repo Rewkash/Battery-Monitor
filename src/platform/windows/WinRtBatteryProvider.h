@@ -3,12 +3,14 @@
 #include "core/IBluetoothBatteryProvider.h"
 #include "core/INoiseControlProvider.h"
 #include "platform/windows/devices/xiaomi/XiaomiBatteryCaches.h"
+#include "platform/windows/devices/xiaomi/XiaomiRfcommSessionManager.h"
 
 namespace battery_monitor {
 
 class WinRtBatteryProvider final : public IBluetoothBatteryProvider, public INoiseControlProvider {
    public:
     WinRtBatteryProvider();
+    ~WinRtBatteryProvider() override;
 
     std::vector<DeviceBatteryInfo> GetDevicesBattery(const BatteryQueryOptions& options) override;
     void NotifyDeviceConnectionChanged(const std::string& device_id, bool connected) override;
@@ -25,6 +27,7 @@ class WinRtBatteryProvider final : public IBluetoothBatteryProvider, public INoi
     bool SetXiaomiNoiseSubmode(const std::string& family, int submode, const std::string& device_hint = std::string());
 
    private:
+    XiaomiRfcommSessionManager xiaomi_sessions_;
     XiaomiClassicBatteryCache xiaomi_classic_cache_;
 };
 

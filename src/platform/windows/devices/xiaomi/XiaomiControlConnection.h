@@ -6,6 +6,7 @@
 #include <winsock2.h>
 
 #include "platform/windows/bluetooth/BluetoothSocketUtils.h"
+#include "platform/windows/devices/xiaomi/ClassicBluetoothBatteryFallback.h"
 
 namespace battery_monitor {
 
@@ -23,15 +24,18 @@ class XiaomiControlConnection {
     ~XiaomiControlConnection();
 
     XiaomiControlSocketStatus OpenSocket(std::uint64_t bluetooth_address);
+    XiaomiControlSocketStatus OpenSocket(std::uint64_t bluetooth_address,
+                                         ClassicBatteryService preferred_service);
+    XiaomiControlSocketStatus OpenSocketForService(std::uint64_t bluetooth_address,
+                                                   ClassicBatteryService service);
     bool Authenticate(bool debug_enabled = false, XiaomiDebugLogFn debug_log = nullptr);
 
     SOCKET socket_handle() const;
     const std::string& connected_path() const;
     std::uint8_t& sequence();
-
-   private:
     void Close();
 
+   private:
     ScopedWsa wsa_{};
     SOCKET socket_handle_ = INVALID_SOCKET;
     std::string connected_path_;

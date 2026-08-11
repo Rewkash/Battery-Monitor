@@ -9,9 +9,12 @@
 
 namespace battery_monitor {
 
+class XiaomiRfcommSessionManager;
+
 struct XiaomiControlActionContext {
     bool debug_enabled = false;
     XiaomiDebugLogFn debug_log = nullptr;
+    XiaomiRfcommSessionManager* session_manager = nullptr;
 };
 
 bool SetXiaomiNoiseModeForTarget(const ResolvedBluetoothTarget& target,
