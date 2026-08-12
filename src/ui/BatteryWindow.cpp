@@ -3152,12 +3152,15 @@ void BatteryWindow::SetDeviceDragActive(bool active) {
         refresh_pending_ = false;
         const bool next_include_disconnected = pending_include_disconnected_;
         const bool next_preserve_disconnected_snapshot = pending_preserve_disconnected_snapshot_;
+        const bool next_force_live_refresh = pending_force_live_refresh_;
         pending_include_disconnected_ = false;
         pending_preserve_disconnected_snapshot_ = true;
+        pending_force_live_refresh_ = false;
         QMetaObject::invokeMethod(
             this,
-            [this, next_include_disconnected, next_preserve_disconnected_snapshot]() {
-                RefreshBatteryData(next_include_disconnected, next_preserve_disconnected_snapshot);
+            [this, next_include_disconnected, next_preserve_disconnected_snapshot, next_force_live_refresh]() {
+                RefreshBatteryData(next_include_disconnected, next_preserve_disconnected_snapshot,
+                                   next_force_live_refresh);
             },
             Qt::QueuedConnection);
     }
@@ -3341,6 +3344,7 @@ void BatteryWindow::RefreshBatteryDataForDevice(const std::string& device_id, bo
         UiDebugLog("refresh#" + std::to_string(refresh_id) + " targeted deferred because drag_in_progress target='" + device_id + "'");
         refresh_pending_ = true;
         pending_preserve_disconnected_snapshot_ = true;
+        pending_force_live_refresh_ = pending_force_live_refresh_ || force_live_refresh;
         status_label_->setText(QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435 "
                                                  u8"\u043E\u0442\u043B\u043E\u0436\u0435\u043D\u043E: "
                                                  u8"\u0438\u0434\u0451\u0442 \u043F\u0435\u0440\u0435\u0442\u0430\u0441\u043A\u0438\u0432\u0430\u043D\u0438\u0435"));
@@ -3348,9 +3352,17 @@ void BatteryWindow::RefreshBatteryDataForDevice(const std::string& device_id, bo
     }
 
     if (refresh_in_progress_.load(std::memory_order_acquire)) {
+        if (force_live_refresh && active_force_live_refresh_ &&
+            (active_refresh_target_device_id_.empty() ||
+             DeviceIdsReferToSameBluetoothDevice(active_refresh_target_device_id_, device_id))) {
+            UiDebugLog("refresh#" + std::to_string(refresh_id) +
+                       " targeted satisfied by active forced refresh target='" + device_id + "'");
+            return;
+        }
         UiDebugLog("refresh#" + std::to_string(refresh_id) + " targeted deferred because refresh_in_progress target='" + device_id + "'");
         refresh_pending_ = true;
         pending_preserve_disconnected_snapshot_ = true;
+        pending_force_live_refresh_ = pending_force_live_refresh_ || force_live_refresh;
         status_label_->setText(QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435..."));
         return;
     }
@@ -3359,6 +3371,8 @@ void BatteryWindow::RefreshBatteryDataForDevice(const std::string& device_id, bo
         refresh_worker_.join();
     }
     refresh_in_progress_.store(true, std::memory_order_release);
+    active_force_live_refresh_ = force_live_refresh;
+    active_refresh_target_device_id_ = device_id;
 
     refresh_button_->setEnabled(false);
     show_all_button_->setEnabled(false);
@@ -3393,8 +3407,10 @@ void BatteryWindow::RefreshBatteryDataForDevice(const std::string& device_id, bo
 
         QMetaObject::invokeMethod(
             this,
-            [this, device_id, refresh_id, result = std::move(result)]() mutable {
+            [this, device_id, force_live_refresh, refresh_id, result = std::move(result)]() mutable {
                 refresh_in_progress_.store(false, std::memory_order_release);
+                active_force_live_refresh_ = false;
+                active_refresh_target_device_id_.clear();
 
                 if (quitting_) {
                     UiDebugLog("refresh#" + std::to_string(refresh_id) + " targeted ignored because quitting");
@@ -3404,7 +3420,7 @@ void BatteryWindow::RefreshBatteryDataForDevice(const std::string& device_id, bo
                 if (result.error_text.isEmpty()) {
                     if (result.devices.empty()) {
                         UiDebugLog("refresh#" + std::to_string(refresh_id) + " targeted empty result -> full refresh");
-                        RefreshBatteryData(false, true);
+                        RefreshBatteryData(false, true, force_live_refresh);
                         return;
                     }
 
@@ -3452,10 +3468,13 @@ void BatteryWindow::RefreshBatteryDataForDevice(const std::string& device_id, bo
                 if (refresh_pending_) {
                     const bool next_include_disconnected = pending_include_disconnected_;
                     const bool next_preserve_disconnected_snapshot = pending_preserve_disconnected_snapshot_;
+                    const bool next_force_live_refresh = pending_force_live_refresh_;
                     refresh_pending_ = false;
                     pending_include_disconnected_ = false;
                     pending_preserve_disconnected_snapshot_ = true;
-                    RefreshBatteryData(next_include_disconnected, next_preserve_disconnected_snapshot);
+                    pending_force_live_refresh_ = false;
+                    RefreshBatteryData(next_include_disconnected, next_preserve_disconnected_snapshot,
+                                       next_force_live_refresh);
                 }
             },
             Qt::QueuedConnection);
@@ -3649,6 +3668,7 @@ void BatteryWindow::RefreshBatteryData(bool include_disconnected,
         refresh_pending_ = true;
         pending_include_disconnected_ = pending_include_disconnected_ || include_disconnected;
         pending_preserve_disconnected_snapshot_ = pending_preserve_disconnected_snapshot_ || preserve_disconnected_snapshot;
+        pending_force_live_refresh_ = pending_force_live_refresh_ || force_live_refresh;
         status_label_->setText(QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435 "
                                                  u8"\u043E\u0442\u043B\u043E\u0436\u0435\u043D\u043E: "
                                                  u8"\u0438\u0434\u0451\u0442 \u043F\u0435\u0440\u0435\u0442\u0430\u0441\u043A\u0438\u0432\u0430\u043D\u0438\u0435"));
@@ -3656,10 +3676,15 @@ void BatteryWindow::RefreshBatteryData(bool include_disconnected,
     }
 
     if (refresh_in_progress_.load(std::memory_order_acquire)) {
+        if (force_live_refresh && active_force_live_refresh_ && active_refresh_target_device_id_.empty()) {
+            UiDebugLog("refresh#" + std::to_string(refresh_id) + " full satisfied by active forced refresh");
+            return;
+        }
         UiDebugLog("refresh#" + std::to_string(refresh_id) + " full deferred because refresh_in_progress");
         refresh_pending_ = true;
         pending_include_disconnected_ = pending_include_disconnected_ || include_disconnected;
         pending_preserve_disconnected_snapshot_ = pending_preserve_disconnected_snapshot_ || preserve_disconnected_snapshot;
+        pending_force_live_refresh_ = pending_force_live_refresh_ || force_live_refresh;
         status_label_->setText(QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435..."));
         return;
     }
@@ -3668,6 +3693,8 @@ void BatteryWindow::RefreshBatteryData(bool include_disconnected,
         refresh_worker_.join();
     }
     refresh_in_progress_.store(true, std::memory_order_release);
+    active_force_live_refresh_ = force_live_refresh;
+    active_refresh_target_device_id_.clear();
 
     refresh_button_->setEnabled(false);
     show_all_button_->setEnabled(false);
@@ -3708,6 +3735,8 @@ void BatteryWindow::RefreshBatteryData(bool include_disconnected,
              result = std::move(result),
              preserve_disconnected_snapshot]() mutable {
                 refresh_in_progress_.store(false, std::memory_order_release);
+                active_force_live_refresh_ = false;
+                active_refresh_target_device_id_.clear();
 
                 if (quitting_) {
                     UiDebugLog("refresh#" + std::to_string(refresh_id) + " full ignored because quitting");
@@ -3791,10 +3820,13 @@ void BatteryWindow::RefreshBatteryData(bool include_disconnected,
                 if (refresh_pending_) {
                     const bool next_include_disconnected = pending_include_disconnected_;
                     const bool next_preserve_disconnected_snapshot = pending_preserve_disconnected_snapshot_;
+                    const bool next_force_live_refresh = pending_force_live_refresh_;
                     refresh_pending_ = false;
                     pending_include_disconnected_ = true;
                     pending_preserve_disconnected_snapshot_ = false;
-                    RefreshBatteryData(next_include_disconnected, next_preserve_disconnected_snapshot);
+                    pending_force_live_refresh_ = false;
+                    RefreshBatteryData(next_include_disconnected, next_preserve_disconnected_snapshot,
+                                       next_force_live_refresh);
                 }
             },
             Qt::QueuedConnection);

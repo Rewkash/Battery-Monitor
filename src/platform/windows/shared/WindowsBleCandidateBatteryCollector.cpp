@@ -6,6 +6,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <winrt/Windows.Devices.Bluetooth.h>
@@ -345,7 +346,18 @@ void CollectBleCandidateBatteryEntries(const WindowsBleCandidateBatteryCollector
                 });
             if (likely_tws && !resolved_from_persistent_cache && has_tws_components &&
                 resolved_address_for_fallback.has_value()) {
-                accumulator->RemoveTwsBatteryEntriesForAddress(*resolved_address_for_fallback);
+                std::unordered_set<std::string> tws_components;
+                for (const auto& reading : resolved_readings) {
+                    const std::string component = ToLowerAscii(reading.component);
+                    if (component == "left" || component == "right" || component == "case") {
+                        tws_components.insert(component);
+                    }
+                }
+                if (tws_components.contains("left") || tws_components.contains("right")) {
+                    tws_components.insert("left");
+                    tws_components.insert("right");
+                }
+                accumulator->RemoveTwsBatteryEntriesForAddress(*resolved_address_for_fallback, tws_components);
             }
 
             for (const auto& battery_reading : resolved_readings) {

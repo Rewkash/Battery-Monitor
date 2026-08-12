@@ -157,7 +157,10 @@ class BatteryWindow : public QWidget {
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> runtime_state_key_by_component_;
     std::thread refresh_worker_;
     std::atomic<bool> refresh_in_progress_{false};
+    bool active_force_live_refresh_ = false;
+    std::string active_refresh_target_device_id_;
     bool refresh_pending_ = false;
+    bool pending_force_live_refresh_ = false;
     bool pending_include_disconnected_ = false;
     bool pending_preserve_disconnected_snapshot_ = true;
     bool drag_in_progress_ = false;

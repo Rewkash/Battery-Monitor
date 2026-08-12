@@ -111,6 +111,11 @@ class XiaomiRfcommSessionManager::Session final {
     }
 
     void Stop() {
+        RequestStop();
+        if (worker_.joinable()) worker_.join();
+    }
+
+    void RequestStop() {
         {
             std::lock_guard lock(mutex_);
             if (stopping_) return;
@@ -118,7 +123,6 @@ class XiaomiRfcommSessionManager::Session final {
             if (published_socket_ != INVALID_SOCKET) shutdown(published_socket_, SD_BOTH);
         }
         condition_.notify_all();
-        if (worker_.joinable()) worker_.join();
     }
 
    private:
@@ -153,6 +157,7 @@ class XiaomiRfcommSessionManager::Session final {
     void PublishSocket(SOCKET value) {
         std::lock_guard lock(mutex_);
         published_socket_ = value;
+        if (stopping_ && published_socket_ != INVALID_SOCKET) shutdown(published_socket_, SD_BOTH);
     }
 
     void CloseConnection() {
@@ -348,9 +353,12 @@ class XiaomiRfcommSessionManager::Session final {
         return sent;
     }
 
-    void CompleteFailure(const std::shared_ptr<SessionRequest>& request) {
-        if (request->kind == RequestKind::kBattery) request->completion.set_value(std::vector<BatteryReading>{});
-        else request->completion.set_value(false);
+    void CompleteFailure(const std::shared_ptr<SessionRequest>& request) noexcept {
+        try {
+            if (request->kind == RequestKind::kBattery) request->completion.set_value(std::vector<BatteryReading>{});
+            else request->completion.set_value(false);
+        } catch (const std::future_error&) {
+        }
     }
 
     void HandleRequest(const std::shared_ptr<SessionRequest>& request) {
@@ -385,7 +393,19 @@ class XiaomiRfcommSessionManager::Session final {
                 }
             }
             if (request != nullptr) {
-                HandleRequest(request);
+                try {
+                    HandleRequest(request);
+                } catch (const std::exception& error) {
+                    Log("Xiaomi persistent RFCOMM: request failed address=" + std::to_string(address_) +
+                        " error=" + error.what());
+                    CompleteFailure(request);
+                    CloseConnection();
+                } catch (...) {
+                    Log("Xiaomi persistent RFCOMM: request failed address=" + std::to_string(address_) +
+                        " error=unknown exception");
+                    CompleteFailure(request);
+                    CloseConnection();
+                }
                 if (!connected_) next_reconnect = Clock::now() + reconnect_delay_;
                 continue;
             }
@@ -435,12 +455,35 @@ class XiaomiRfcommSessionManager::Session final {
 
 struct XiaomiRfcommSessionManager::State {
     std::mutex mutex;
+    std::condition_variable condition;
     bool stopping = false;
     std::unordered_map<std::uint64_t, std::shared_ptr<Session>> sessions;
+    std::deque<std::shared_ptr<Session>> retired_sessions;
+    std::thread cleanup_worker;
 };
 
 XiaomiRfcommSessionManager::XiaomiRfcommSessionManager(bool debug_enabled, XiaomiDebugLogFn debug_log)
-    : debug_enabled_(debug_enabled), debug_log_(debug_log), state_(std::make_unique<State>()) {}
+    : debug_enabled_(debug_enabled), debug_log_(debug_log), state_(std::make_unique<State>()) {
+    State* const state = state_.get();
+    state->cleanup_worker = std::thread([state]() {
+        while (true) {
+            std::shared_ptr<Session> session;
+            {
+                std::unique_lock lock(state->mutex);
+                state->condition.wait(lock, [state] {
+                    return state->stopping || !state->retired_sessions.empty();
+                });
+                if (state->retired_sessions.empty()) {
+                    if (state->stopping) break;
+                    continue;
+                }
+                session = std::move(state->retired_sessions.front());
+                state->retired_sessions.pop_front();
+            }
+            session->Stop();
+        }
+    });
+}
 
 XiaomiRfcommSessionManager::~XiaomiRfcommSessionManager() { Shutdown(); }
 
@@ -476,26 +519,33 @@ bool XiaomiRfcommSessionManager::SetNoiseSubmode(std::uint64_t address, std::uin
 
 void XiaomiRfcommSessionManager::NotifyConnectionChanged(std::uint64_t address, bool connected) {
     if (connected) return;
-    std::shared_ptr<Session> session;
-    {
-        std::lock_guard lock(state_->mutex);
-        const auto found = state_->sessions.find(address);
-        if (found == state_->sessions.end()) return;
-        session = std::move(found->second);
-        state_->sessions.erase(found);
-    }
-    session->Stop();
-}
-
-void XiaomiRfcommSessionManager::Shutdown() {
-    std::unordered_map<std::uint64_t, std::shared_ptr<Session>> sessions;
     {
         std::lock_guard lock(state_->mutex);
         if (state_->stopping) return;
-        state_->stopping = true;
-        sessions.swap(state_->sessions);
+        const auto found = state_->sessions.find(address);
+        if (found == state_->sessions.end()) return;
+        found->second->RequestStop();
+        state_->retired_sessions.push_back(std::move(found->second));
+        state_->sessions.erase(found);
     }
-    for (const auto& entry : sessions) entry.second->Stop();
+    state_->condition.notify_one();
+}
+
+void XiaomiRfcommSessionManager::Shutdown() {
+    {
+        std::lock_guard lock(state_->mutex);
+        if (!state_->stopping) {
+            state_->stopping = true;
+            for (auto& [address, session] : state_->sessions) {
+                (void)address;
+                session->RequestStop();
+                state_->retired_sessions.push_back(std::move(session));
+            }
+            state_->sessions.clear();
+        }
+    }
+    state_->condition.notify_all();
+    if (state_->cleanup_worker.joinable()) state_->cleanup_worker.join();
 }
 
 }  // namespace battery_monitor

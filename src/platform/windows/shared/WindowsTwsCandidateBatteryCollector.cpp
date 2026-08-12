@@ -4,6 +4,7 @@
 #include <chrono>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -97,13 +98,15 @@ void AddCandidateReadings(DeviceBatteryAccumulator* accumulator,
         device_name_override != nullptr && !device_name_override->empty() ? *device_name_override
                                                                            : ResolveCandidateDeviceName(candidate);
 
-    const bool has_tws_components = std::any_of(
-        readings.begin(), readings.end(), [](const BatteryReading& reading) {
-            const std::string component = ToLowerAscii(reading.component);
-            return component == "left" || component == "right" || component == "case";
-        });
-    if (!is_cached && has_tws_components) {
-        accumulator->RemoveTwsBatteryEntriesForAddress(candidate.bluetooth_address);
+    std::unordered_set<std::string> tws_components;
+    for (const auto& reading : readings) {
+        const std::string component = ToLowerAscii(reading.component);
+        if (component == "left" || component == "right" || component == "case") {
+            tws_components.insert(component);
+        }
+    }
+    if (!is_cached && !tws_components.empty()) {
+        accumulator->RemoveTwsBatteryEntriesForAddress(candidate.bluetooth_address, tws_components);
     }
 
     for (const auto& battery_reading : readings) {
@@ -219,6 +222,7 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
 
         std::vector<BatteryReading> partial_classic_readings;
         bool partial_classic_from_cache = false;
+        std::unordered_set<std::string> authoritative_classic_components;
         if (should_try_classic_for_candidate) {
             const auto& classic_result =
                 xiaomi_classic_cache->Read(candidate.bluetooth_address,
@@ -228,15 +232,27 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
             if (!classic_result.readings.empty()) {
                 if (!classic_result.from_persistent_cache &&
                     XiaomiResolvedTwsComponentCount(classic_result.readings) >= 1U) {
+                    const std::unordered_set<std::string> earbud_components = {"left", "right"};
+                    accumulator->RemoveTwsBatteryEntriesForAddress(candidate.bluetooth_address,
+                                                                   earbud_components);
                     AddCandidateReadings(
                         accumulator,
                         candidate,
                         classic_result.readings,
                         classic_result.from_persistent_cache,
                         candidate.is_connected);
+                    authoritative_classic_components.insert("left");
+                    authoritative_classic_components.insert("right");
+                    for (const auto& reading : classic_result.readings) {
+                        const std::string component = ToLowerAscii(reading.component);
+                        if (component == "case") {
+                            authoritative_classic_components.insert(component);
+                        }
+                    }
                     LogDebug(context.debug_log,
-                              "AEP Xiaomi classic partial accepted for '" + candidate.endpoint_name + "'");
-                    continue;
+                              "AEP Xiaomi classic partial accepted for '" + candidate.endpoint_name +
+                                  "'; continue fallbacks for missing components");
+                    if (HasUsefulXiaomiTwsReadings(classic_result.readings)) continue;
                 }
                 if (!HasUsefulXiaomiTwsReadings(classic_result.readings)) {
                     partial_classic_readings = classic_result.readings;
@@ -275,6 +291,8 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
                 continue;
             }
 
+            if (!authoritative_classic_components.empty()) continue;
+
             AddUnknownCandidateEntry(accumulator, candidate, candidate.is_connected);
             continue;
         }
@@ -290,7 +308,8 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
         }
 
         bool resolved_from_persistent_cache = false;
-        if (should_try_classic_for_candidate && !HasUsefulXiaomiTwsReadings(resolved_readings)) {
+        if (should_try_classic_for_candidate && authoritative_classic_components.empty() &&
+            !HasUsefulXiaomiTwsReadings(resolved_readings)) {
             const auto& classic_result =
                 xiaomi_classic_cache->Read(candidate.bluetooth_address,
                                            classic_service,
@@ -360,6 +379,16 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
             !resolved_from_persistent_cache &&
             HasUsefulXiaomiTwsReadings(resolved_readings, 2U)) {
             xiaomi_classic_cache->Persist(candidate.bluetooth_address, resolved_readings);
+        }
+
+        if (!authoritative_classic_components.empty()) {
+            resolved_readings.erase(
+                std::remove_if(resolved_readings.begin(), resolved_readings.end(),
+                               [&](const BatteryReading& reading) {
+                                   return authoritative_classic_components.contains(ToLowerAscii(reading.component));
+                               }),
+                resolved_readings.end());
+            if (resolved_readings.empty()) continue;
         }
 
         std::string device_name = candidate.endpoint_name;

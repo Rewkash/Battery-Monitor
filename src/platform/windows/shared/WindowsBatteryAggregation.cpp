@@ -131,16 +131,18 @@ void DeviceBatteryAccumulator::AddEntry(DeviceBatteryInfo entry) {
     entries_.push_back(std::move(entry));
 }
 
-void DeviceBatteryAccumulator::RemoveTwsBatteryEntriesForAddress(std::uint64_t address) {
+void DeviceBatteryAccumulator::RemoveTwsBatteryEntriesForAddress(
+    std::uint64_t address,
+    const std::unordered_set<std::string>& components) {
     entries_.erase(
         std::remove_if(entries_.begin(), entries_.end(),
-                       [address](const DeviceBatteryInfo& entry) {
+                       [address, &components](const DeviceBatteryInfo& entry) {
                            const auto parsed_address = ParseBluetoothAddressFromDeviceId(entry.device_id);
                            if (!parsed_address.has_value() || *parsed_address != address) {
                                return false;
                            }
                            const std::string component = ToLowerAscii(entry.battery_component);
-                           return component == "left" || component == "right" || component == "case";
+                            return components.contains(component);
                        }),
         entries_.end());
 
@@ -304,7 +306,7 @@ std::vector<DeviceBatteryInfo> FinalizeCollectedEntries(std::vector<DeviceBatter
     std::unordered_set<std::string> devices_with_tws_components;
     std::unordered_set<std::uint64_t> addresses_with_tws_components;
     std::unordered_set<std::string> devices_with_live_tws_components;
-    std::unordered_set<std::uint64_t> addresses_with_live_tws_components;
+    std::unordered_set<std::string> addresses_with_live_tws_components;
     for (const auto& entry : entries) {
         if (entry.battery_level_percent.has_value()) {
             devices_with_real_battery.insert(entry.device_id);
@@ -321,12 +323,22 @@ std::vector<DeviceBatteryInfo> FinalizeCollectedEntries(std::vector<DeviceBatter
                 if (parsed_address.has_value()) {
                     addresses_with_tws_components.insert(*parsed_address);
                     if (!entry.is_cached) {
-                        addresses_with_live_tws_components.insert(*parsed_address);
+                        if (component == "left" || component == "right") {
+                            addresses_with_live_tws_components.insert(std::to_string(*parsed_address) + "|left");
+                            addresses_with_live_tws_components.insert(std::to_string(*parsed_address) + "|right");
+                        } else {
+                            addresses_with_live_tws_components.insert(std::to_string(*parsed_address) + "|case");
+                        }
                     }
                 } else {
                     devices_with_tws_components.insert(entry.device_id);
                     if (!entry.is_cached) {
-                        devices_with_live_tws_components.insert(entry.device_id);
+                        if (component == "left" || component == "right") {
+                            devices_with_live_tws_components.insert(entry.device_id + "|left");
+                            devices_with_live_tws_components.insert(entry.device_id + "|right");
+                        } else {
+                            devices_with_live_tws_components.insert(entry.device_id + "|case");
+                        }
                     }
                 }
             }
@@ -348,8 +360,9 @@ std::vector<DeviceBatteryInfo> FinalizeCollectedEntries(std::vector<DeviceBatter
 
         if (entry.is_cached &&
             (normalized_component == "left" || normalized_component == "right" || normalized_component == "case") &&
-            (devices_with_live_tws_components.contains(entry.device_id) ||
-             (parsed_address.has_value() && addresses_with_live_tws_components.contains(*parsed_address)))) {
+            (devices_with_live_tws_components.contains(entry.device_id + "|" + normalized_component) ||
+             (parsed_address.has_value() && addresses_with_live_tws_components.contains(
+                                                  std::to_string(*parsed_address) + "|" + normalized_component)))) {
             continue;
         }
 
