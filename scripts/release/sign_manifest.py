@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import pathlib
+import urllib.parse
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
@@ -18,18 +19,27 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 EXPECTED_PUBLIC_KEY_B64 = "bfwjZfSItKzGrGJ8TXHWilvU8QvJgJZtj+yM/DIatRc="
 
 
+def require_release_url(value: str, label: str) -> None:
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme != "https" or parsed.hostname not in {"github.com", "objects.githubusercontent.com"}:
+        raise SystemExit(f"{label} must be an HTTPS GitHub release URL")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--version", required=True)
     parser.add_argument("--sequence", required=True, type=int)
     parser.add_argument("--bundle", required=True, type=pathlib.Path)
     parser.add_argument("--artifact-url", required=True)
+    parser.add_argument("--msi", type=pathlib.Path)
+    parser.add_argument("--msi-url")
     parser.add_argument("--release-notes", default="")
     parser.add_argument("--release-notes-file", type=pathlib.Path)
     parser.add_argument("--release-notes-url", default="")
     parser.add_argument("--mandatory", action="store_true")
     parser.add_argument("--output-dir", required=True, type=pathlib.Path)
     args = parser.parse_args()
+    require_release_url(args.artifact_url, "artifact URL")
 
     seed_b64 = os.environ.get("BATTERY_MONITOR_ED25519_PRIVATE_KEY_B64", "")
     try:
@@ -71,6 +81,16 @@ def main() -> int:
         "sequence": args.sequence,
         "version": args.version,
     }
+    if args.msi is not None or args.msi_url is not None:
+        if args.msi is None or not args.msi_url:
+            raise SystemExit("--msi and --msi-url must be used together")
+        require_release_url(args.msi_url, "MSI URL")
+        payload["msiArtifact"] = {
+            "format": "msi",
+            "sha256": hashlib.sha256(args.msi.read_bytes()).hexdigest(),
+            "size": args.msi.stat().st_size,
+            "url": args.msi_url,
+        }
     manifest = (json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
     signature = private_key.sign(manifest)
     args.output_dir.mkdir(parents=True, exist_ok=True)

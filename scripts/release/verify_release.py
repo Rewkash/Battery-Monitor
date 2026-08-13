@@ -44,6 +44,7 @@ def main() -> int:
     parser.add_argument("--manifest", required=True, type=pathlib.Path)
     parser.add_argument("--signature", required=True, type=pathlib.Path)
     parser.add_argument("--bundle", required=True, type=pathlib.Path)
+    parser.add_argument("--msi", type=pathlib.Path)
     args = parser.parse_args()
     manifest_bytes = args.manifest.read_bytes()
     signature = base64.b64decode(args.signature.read_text(encoding="ascii").strip(), validate=True)
@@ -52,6 +53,14 @@ def main() -> int:
     artifact = manifest["artifact"]
     if args.bundle.stat().st_size != artifact["size"] or hashlib.sha256(args.bundle.read_bytes()).hexdigest() != artifact["sha256"]:
         raise SystemExit("bundle does not match signed manifest")
+    msi_artifact = manifest.get("msiArtifact")
+    if args.msi is not None:
+        if (not isinstance(msi_artifact, dict) or msi_artifact.get("format") != "msi" or
+                args.msi.stat().st_size != msi_artifact.get("size") or
+                hashlib.sha256(args.msi.read_bytes()).hexdigest() != msi_artifact.get("sha256")):
+            raise SystemExit("MSI does not match signed manifest")
+    elif msi_artifact is not None:
+        raise SystemExit("signed manifest contains an MSI that was not supplied for verification")
     with args.bundle.open("rb") as stream:
         if stream.read(8) != b"BMUP0001":
             raise SystemExit("invalid bundle magic")

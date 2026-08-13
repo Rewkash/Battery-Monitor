@@ -19,6 +19,7 @@
 #include "BatteryMonitorVersion.h"
 #include "update/UpdateSecurity.h"
 #include "update/UpdateState.h"
+#include "update/WindowsInstallMode.h"
 
 namespace battery_monitor {
 namespace {
@@ -128,7 +129,19 @@ void UpdateService::FailCheck(bool user_initiated, const QString& error) {
 }
 
 void UpdateService::DownloadAndInstall(const UpdateManifest& manifest) {
-    if (active_reply_ != nullptr || !IsAllowedDownloadUrl(manifest.artifact_url)) {
+    const bool msi_install = DetectWindowsInstallMode() == WindowsInstallMode::PerUserMsi;
+    UpdateArtifact artifact{manifest.artifact_url, manifest.artifact_size,
+                            manifest.artifact_sha256, manifest.artifact_format};
+    if (msi_install) {
+        artifact = manifest.msi_artifact;
+    }
+    if (msi_install && artifact.url.isEmpty()) {
+        emit InstallFailed(QStringLiteral("Для MSI-установки в этом выпуске нет MSI-обновления."));
+        return;
+    }
+    if (active_reply_ != nullptr || !IsAllowedDownloadUrl(artifact.url) ||
+        (msi_install && artifact.format != QStringLiteral("msi")) ||
+        (!msi_install && artifact.format != QStringLiteral("bmup-1"))) {
         emit InstallFailed(QStringLiteral("Недопустимый или уже выполняющийся запрос обновления."));
         return;
     }
@@ -139,9 +152,11 @@ void UpdateService::DownloadAndInstall(const UpdateManifest& manifest) {
         return;
     }
     const QString token = UniqueToken();
-    const QString package_path = root.filePath(QStringLiteral("downloads/%1.bmup").arg(token));
+    const QString package_path = root.filePath(
+        QStringLiteral("downloads/%1.%2").arg(token, msi_install ? QStringLiteral("msi")
+                                                                : QStringLiteral("bmup")));
 
-    active_reply_ = network_->get(MakeRequest(manifest.artifact_url));
+    active_reply_ = network_->get(MakeRequest(artifact.url));
     auto* output = new QSaveFile(package_path, active_reply_);
     if (!output->open(QIODevice::WriteOnly)) {
         active_reply_->abort();
@@ -150,15 +165,16 @@ void UpdateService::DownloadAndInstall(const UpdateManifest& manifest) {
         emit InstallFailed(QStringLiteral("Не удалось создать файл загрузки."));
         return;
     }
-    connect(active_reply_, &QNetworkReply::readyRead, this, [this, output, manifest]() {
+    connect(active_reply_, &QNetworkReply::readyRead, this, [this, output, artifact]() {
         const QByteArray chunk = active_reply_->readAll();
-        if (output->pos() + chunk.size() > static_cast<qint64>(manifest.artifact_size) ||
+        if (output->pos() + chunk.size() > static_cast<qint64>(artifact.size) ||
             output->write(chunk) != chunk.size()) {
             active_reply_->abort();
         }
     });
     connect(active_reply_, &QNetworkReply::downloadProgress, this, &UpdateService::DownloadProgress);
-    connect(active_reply_, &QNetworkReply::finished, this, [this, output, package_path, manifest, root_path, token]() {
+    connect(active_reply_, &QNetworkReply::finished, this,
+            [this, output, package_path, manifest, artifact, msi_install, root_path, token]() {
         QNetworkReply* reply = active_reply_;
         active_reply_ = nullptr;
         const bool network_ok = reply->error() == QNetworkReply::NoError;
@@ -171,11 +187,34 @@ void UpdateService::DownloadAndInstall(const UpdateManifest& manifest) {
         }
 
         QString error;
-        if (!VerifySha256(package_path, manifest.artifact_sha256, manifest.artifact_size, &error)) {
+        if (!VerifySha256(package_path, artifact.sha256, artifact.size, &error)) {
             emit InstallFailed(error);
             return;
         }
         const QString install_directory = QCoreApplication::applicationDirPath();
+        const QString state_path = QDir(root_path).filePath(QStringLiteral("state.json"));
+        const QString maintenance_source = QDir(install_directory)
+                                               .filePath(QStringLiteral("battery-monitor-maintenance.exe"));
+        const QString maintenance_copy = QDir(root_path).filePath(QStringLiteral("maintenance-%1.exe").arg(token));
+        QFile::remove(maintenance_copy);
+        if (!QFile::copy(maintenance_source, maintenance_copy)) {
+            emit InstallFailed(QStringLiteral("Maintenance tool отсутствует в сборке."));
+            return;
+        }
+        const QString executable_name = QFileInfo(QCoreApplication::applicationFilePath()).fileName();
+        if (msi_install) {
+            const QStringList arguments = {
+                QStringLiteral("--apply-msi"), package_path, install_directory, executable_name,
+                QString::number(QCoreApplication::applicationPid()), token,
+                QString::number(manifest.sequence), state_path, manifest.version};
+            if (!QProcess::startDetached(maintenance_copy, arguments, root_path)) {
+                emit InstallFailed(QStringLiteral("Не удалось запустить MSI maintenance tool."));
+                return;
+            }
+            emit InstallReady();
+            return;
+        }
+
         QDir install_parent(QFileInfo(install_directory).absolutePath());
         const QString staging_name = QStringLiteral(".battery-monitor-stage-%1").arg(token);
         const QString backup_name = QStringLiteral(".battery-monitor-backup-%1").arg(token);
@@ -203,16 +242,6 @@ void UpdateService::DownloadAndInstall(const UpdateManifest& manifest) {
             }
         }
 
-        const QString maintenance_source = QDir(QCoreApplication::applicationDirPath())
-                                               .filePath(QStringLiteral("battery-monitor-maintenance.exe"));
-        const QString maintenance_copy = QDir(root_path).filePath(QStringLiteral("maintenance-%1.exe").arg(token));
-        QFile::remove(maintenance_copy);
-        if (!QFile::copy(maintenance_source, maintenance_copy)) {
-            emit InstallFailed(QStringLiteral("Maintenance tool отсутствует в сборке."));
-            return;
-        }
-        const QString executable_name = QFileInfo(QCoreApplication::applicationFilePath()).fileName();
-        const QString state_path = QDir(ResolveUpdateDataRoot()).filePath(QStringLiteral("state.json"));
         const QStringList arguments = {
             QStringLiteral("--apply"), install_directory, staging_path, backup_directory,
             executable_name, QString::number(QCoreApplication::applicationPid()), token,

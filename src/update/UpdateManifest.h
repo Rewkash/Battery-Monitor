@@ -9,6 +9,13 @@
 
 namespace battery_monitor {
 
+struct UpdateArtifact {
+    QUrl url;
+    std::uint64_t size = 0;
+    QByteArray sha256;
+    QString format;
+};
+
 struct UpdateManifest {
     int schema_version = 0;
     std::uint64_t sequence = 0;
@@ -23,6 +30,7 @@ struct UpdateManifest {
     std::uint64_t artifact_size = 0;
     QByteArray artifact_sha256;
     QString artifact_format;
+    UpdateArtifact msi_artifact;
 };
 
 [[nodiscard]] bool ParseAndValidateUpdateManifest(const QByteArray& bytes,

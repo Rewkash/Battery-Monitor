@@ -33,6 +33,24 @@ bool IsAllowedArtifactHost(const QUrl& url) {
            host == QStringLiteral("release-assets.githubusercontent.com");
 }
 
+bool ParseArtifact(const QJsonObject& object,
+                   const QString& expected_format,
+                   UpdateArtifact* artifact) {
+    if (artifact == nullptr || object.isEmpty()) return false;
+    UpdateArtifact parsed;
+    parsed.url = QUrl(object.value(QStringLiteral("url")).toString());
+    parsed.size = static_cast<std::uint64_t>(object.value(QStringLiteral("size")).toDouble(-1));
+    parsed.sha256 = QByteArray::fromHex(object.value(QStringLiteral("sha256")).toString().toLatin1());
+    parsed.format = object.value(QStringLiteral("format")).toString();
+    if (!IsAllowedArtifactHost(parsed.url) || parsed.size == 0 ||
+        parsed.size > kMaximumPackageBytes || parsed.sha256.size() != 32 ||
+        parsed.format != expected_format) {
+        return false;
+    }
+    *artifact = parsed;
+    return true;
+}
+
 QList<int> ParseVersion(const QString& version) {
     const QString core = version.section(QLatin1Char('-'), 0, 0);
     const QStringList parts = core.split(QLatin1Char('.'));
@@ -85,6 +103,13 @@ bool ParseAndValidateUpdateManifest(const QByteArray& bytes,
     parsed.artifact_size = static_cast<std::uint64_t>(artifact.value(QStringLiteral("size")).toDouble(-1));
     parsed.artifact_sha256 = QByteArray::fromHex(artifact.value(QStringLiteral("sha256")).toString().toLatin1());
     parsed.artifact_format = artifact.value(QStringLiteral("format")).toString();
+
+    const QJsonValue msi_artifact_value = root.value(QStringLiteral("msiArtifact"));
+    if (!msi_artifact_value.isUndefined() &&
+        (!msi_artifact_value.isObject() ||
+         !ParseArtifact(msi_artifact_value.toObject(), QStringLiteral("msi"), &parsed.msi_artifact))) {
+        return Fail(error, QStringLiteral("Manifest MSI artifact is invalid."));
+    }
 
     static const QRegularExpression version_pattern(QStringLiteral(R"(^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$)"));
     if (parsed.schema_version != 1 || parsed.sequence == 0 ||

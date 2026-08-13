@@ -83,6 +83,43 @@ jobs:
           } finally {
             Remove-Item $pfx -Force -ErrorAction SilentlyContinue
           }
+      - name: Build per-user MSI
+        if: steps.release_meta.outputs.test != 'true'
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          py -3.11 scripts\release\build_msi.py --input release-staging\app --version "${{ steps.release_meta.outputs.version }}" --output "release-staging\battery-monitor-${{ github.ref_name }}-win-x64.msi"
+          wix msi validate "release-staging\battery-monitor-${{ github.ref_name }}-win-x64.msi"
+      - name: Authenticode sign MSI
+        if: steps.release_meta.outputs.test != 'true'
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+          WINDOWS_TEST_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_TEST_SIGNING_PFX_BASE64 }}
+          WINDOWS_TEST_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_TEST_SIGNING_PFX_PASSWORD }}
+        run: |
+          $production = [bool]$env:WINDOWS_SIGNING_PFX_BASE64
+          $encoded = if ($production) { $env:WINDOWS_SIGNING_PFX_BASE64 } else { $env:WINDOWS_TEST_SIGNING_PFX_BASE64 }
+          $password = if ($production) { $env:WINDOWS_SIGNING_PFX_PASSWORD } else { $env:WINDOWS_TEST_SIGNING_PFX_PASSWORD }
+          if (-not $encoded) { throw "Production or test signing certificate is required." }
+          $pfx = Join-Path $env:RUNNER_TEMP msi-signing.pfx
+          try {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($encoded))
+            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+              Where-Object FullName -Match "\\x64\\signtool.exe$" | Sort-Object FullName -Descending | Select-Object -First 1
+            if (-not $signtool) { throw "signtool.exe not found" }
+            $msi = "release-staging\battery-monitor-${{ github.ref_name }}-win-x64.msi"
+            if ($production) {
+              & $signtool.FullName sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f $pfx /p $password $msi
+              if ($LASTEXITCODE -eq 0) { & $signtool.FullName verify /pa /all /tw $msi }
+            } else {
+              & $signtool.FullName sign /fd SHA256 /f $pfx /p $password $msi
+            }
+            if ($LASTEXITCODE -ne 0) { throw "MSI signing or verification failed" }
+          } finally {
+            Remove-Item $pfx -Force -ErrorAction SilentlyContinue
+          }
       - name: Build and sign update
         shell: pwsh
         env:
@@ -97,8 +134,17 @@ jobs:
           $notes = (gh api --method POST "repos/${{ github.repository }}/releases/generate-notes" -f tag_name="${{ github.ref_name }}" -f target_commitish="${{ github.sha }}" --jq .body | Out-String).TrimEnd()
           $notesPath = Join-Path $env:RUNNER_TEMP release-notes.md
           [IO.File]::WriteAllText($notesPath, $notes, [Text.UTF8Encoding]::new($false))
-          py -3.11 scripts\release\sign_manifest.py --version $version --sequence ${{ github.run_number }} --bundle release-staging\battery-monitor-${{ github.ref_name }}-win-x64.bmup --artifact-url "https://github.com/Rewkash/Battery-Monitor/releases/download/${{ github.ref_name }}/battery-monitor-${{ github.ref_name }}-win-x64.bmup" --release-notes-file $notesPath --release-notes-url "https://github.com/Rewkash/Battery-Monitor/releases/tag/${{ github.ref_name }}" --output-dir release-staging
-          py -3.11 scripts\release\verify_release.py --manifest release-staging\update-manifest.json --signature release-staging\update-manifest.json.sig --bundle release-staging\battery-monitor-${{ github.ref_name }}-win-x64.bmup
+          $manifestArgs = @("scripts\release\sign_manifest.py", "--version", $version, "--sequence", "${{ github.run_number }}", "--bundle", "release-staging\battery-monitor-${{ github.ref_name }}-win-x64.bmup", "--artifact-url", "https://github.com/Rewkash/Battery-Monitor/releases/download/${{ github.ref_name }}/battery-monitor-${{ github.ref_name }}-win-x64.bmup", "--release-notes-file", $notesPath, "--release-notes-url", "https://github.com/Rewkash/Battery-Monitor/releases/tag/${{ github.ref_name }}", "--output-dir", "release-staging")
+          $verifyArgs = @("scripts\release\verify_release.py", "--manifest", "release-staging\update-manifest.json", "--signature", "release-staging\update-manifest.json.sig", "--bundle", "release-staging\battery-monitor-${{ github.ref_name }}-win-x64.bmup")
+          if ("${{ steps.release_meta.outputs.test }}" -ne "true") {
+            $msi = "release-staging\battery-monitor-${{ github.ref_name }}-win-x64.msi"
+            $manifestArgs += @("--msi", $msi, "--msi-url", "https://github.com/Rewkash/Battery-Monitor/releases/download/${{ github.ref_name }}/battery-monitor-${{ github.ref_name }}-win-x64.msi")
+            $verifyArgs += @("--msi", $msi)
+          }
+          py -3.11 @manifestArgs
+          if ($LASTEXITCODE -ne 0) { throw "Manifest signing failed" }
+          py -3.11 @verifyArgs
+          if ($LASTEXITCODE -ne 0) { throw "Release verification failed" }
           Compress-Archive -Path release-staging\app\* -DestinationPath release-staging\battery-monitor-${{ github.ref_name }}-win-x64.zip -CompressionLevel Optimal
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
@@ -107,5 +153,6 @@ jobs:
           files: |
             release-staging/*.bmup
             release-staging/*.zip
+            release-staging/*.msi
             release-staging/update-manifest.json
             release-staging/update-manifest.json.sig

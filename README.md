@@ -2,7 +2,7 @@
 
 Current application version is defined once in the root `CMakeLists.txt`. Windows builds include an optional signed GitHub Releases updater; see [auto-update design](docs/auto-update-design.md) and [release process](docs/release-process.md).
 
-For first-time installation, download the Windows x64 ZIP from [GitHub Releases](https://github.com/Rewkash/Battery-Monitor/releases), extract it into a writable directory, and run `battery-monitor.exe`. The `.bmup` asset is used internally by automatic updates.
+For first-time installation on Windows, download the x64 MSI from [GitHub Releases](https://github.com/Rewkash/Battery-Monitor/releases). The ZIP remains available for portable use, and the `.bmup` asset is used internally by portable automatic updates.
 
 Version and update check:
 

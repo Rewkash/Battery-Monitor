@@ -1,6 +1,6 @@
 ﻿cmake_minimum_required(VERSION 3.21)
 
-project(BatteryMonitor VERSION 0.1.4 LANGUAGES C CXX)
+project(BatteryMonitor VERSION 0.1.5 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,6 +13,12 @@ option(BATTERY_MONITOR_ENABLE_UPDATER "Enable the Windows auto-update client" ON
 configure_file(
     ${PROJECT_SOURCE_DIR}/cmake/BatteryMonitorVersion.h.in
     ${PROJECT_BINARY_DIR}/generated/BatteryMonitorVersion.h
+    @ONLY
+)
+set(BATTERY_MONITOR_MSI_UPGRADE_CODE "{1501C966-0814-47D0-A2CB-A66771F7D619}")
+configure_file(
+    ${PROJECT_SOURCE_DIR}/cmake/BatteryMonitorInstallerIdentity.h.in
+    ${PROJECT_BINARY_DIR}/generated/BatteryMonitorInstallerIdentity.h
     @ONLY
 )
 
@@ -94,9 +100,11 @@ if(WIN32)
             src/update/UpdateState.cpp
             src/update/UpdateService.cpp
             src/update/StartupHealth.cpp
+            src/update/WindowsInstallMode.cpp
         )
         target_compile_definitions(battery-monitor-app PRIVATE BATTERY_MONITOR_WITH_UPDATER)
         target_link_libraries(battery-monitor-app PUBLIC battery-monitor-monocypher)
+        target_link_libraries(battery-monitor-app PRIVATE Advapi32)
     endif()
 
     target_sources(

@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Generate a WiX source for the staged Windows application and build a per-user MSI."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import pathlib
+import re
+import subprocess
+import uuid
+import xml.etree.ElementTree as ET
+
+
+DEFAULT_IDENTITY_FILE = pathlib.Path(__file__).resolve().parents[2] / "CMakeLists.txt"
+MARKER_COMPONENT_GUID = "59EEEA3B-8682-45A1-BE17-872452508E3E"
+GUID_NAMESPACE = uuid.UUID("06eb77f5-4cb2-44d8-909f-7c2407bbb8ab")
+WIX_NAMESPACE = "http://wixtoolset.org/schemas/v4/wxs"
+
+
+def wix_id(prefix: str, value: str) -> str:
+    return prefix + hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
+
+
+def add_directory(parent: ET.Element, name: str, relative_path: str) -> ET.Element:
+    return ET.SubElement(parent, "Directory", Id=wix_id("D", relative_path), Name=name)
+
+
+def read_upgrade_code(identity_file: pathlib.Path) -> str:
+    match = re.search(
+        r'set\s*\(\s*BATTERY_MONITOR_MSI_UPGRADE_CODE\s+"\{([0-9A-Fa-f-]{36})\}"\s*\)',
+        identity_file.read_text(encoding="utf-8"),
+    )
+    if match is None:
+        raise SystemExit("BATTERY_MONITOR_MSI_UPGRADE_CODE is missing or invalid")
+    return match.group(1).upper()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", required=True, type=pathlib.Path)
+    parser.add_argument("--output", required=True, type=pathlib.Path)
+    parser.add_argument("--version", required=True)
+    parser.add_argument("--wix", default="wix")
+    parser.add_argument("--identity-file", default=DEFAULT_IDENTITY_FILE, type=pathlib.Path)
+    args = parser.parse_args()
+
+    source_root = args.input.resolve()
+    upgrade_code = read_upgrade_code(args.identity_file)
+    required = ("battery-monitor.exe", "battery-monitor-cli.exe", "battery-monitor-maintenance.exe")
+    if not source_root.is_dir() or any(not (source_root / name).is_file() for name in required):
+        raise SystemExit("staged application is incomplete")
+    if len(args.version.split(".")) != 3 or not all(part.isdigit() for part in args.version.split(".")):
+        raise SystemExit("MSI version must be numeric X.Y.Z")
+
+    ET.register_namespace("", WIX_NAMESPACE)
+    wix = ET.Element(f"{{{WIX_NAMESPACE}}}Wix")
+    package = ET.SubElement(
+        wix, "Package", Name="ChargeView", Manufacturer="Orion Group", Version=args.version,
+        UpgradeCode=upgrade_code, Scope="perUser", Language="1049", Compressed="yes",
+        ProductCode=str(uuid.uuid5(GUID_NAMESPACE, "product/" + args.version)).upper(),
+    )
+    ET.SubElement(package, "SummaryInformation", Description="ChargeView Battery Monitor", Manufacturer="Orion Group")
+    ET.SubElement(package, "MajorUpgrade", DowngradeErrorMessage="A newer version of ChargeView is already installed.")
+    ET.SubElement(package, "MediaTemplate", EmbedCab="yes")
+
+    standard = ET.SubElement(package, "StandardDirectory", Id="LocalAppDataFolder")
+    programs = add_directory(standard, "Programs", "Programs")
+    publisher = add_directory(programs, "Orion Group", "Programs/Orion Group")
+    install = ET.SubElement(publisher, "Directory", Id="INSTALLFOLDER", Name="ChargeView")
+
+    directories: dict[pathlib.PurePosixPath, ET.Element] = {pathlib.PurePosixPath(): install}
+    component_ids: list[str] = []
+    for file_path in sorted((path for path in source_root.rglob("*") if path.is_file()),
+                            key=lambda path: path.relative_to(source_root).as_posix().casefold()):
+        relative = pathlib.PurePosixPath(file_path.relative_to(source_root).as_posix())
+        current = pathlib.PurePosixPath()
+        parent = install
+        for part in relative.parts[:-1]:
+            current /= part
+            if current not in directories:
+                directories[current] = add_directory(parent, part, current.as_posix())
+            parent = directories[current]
+        component_id = wix_id("C", relative.as_posix())
+        component_ids.append(component_id)
+        component = ET.SubElement(
+            parent, "Component", Id=component_id,
+            Guid=str(uuid.uuid5(GUID_NAMESPACE, relative.as_posix())).upper(),
+        )
+        ET.SubElement(component, "File", Id=wix_id("F", relative.as_posix()),
+                      Source=str(file_path))
+        ET.SubElement(component, "RegistryValue", Root="HKCU",
+                      Key=r"Software\Orion Group\Battery Monitor\Components",
+                      Name=component_id, Type="integer", Value="1", KeyPath="yes")
+
+    marker = ET.SubElement(install, "Component", Id="InstallerMarker", Guid=MARKER_COMPONENT_GUID)
+    component_ids.append("InstallerMarker")
+    registry_key = ET.SubElement(marker, "RegistryKey", Root="HKCU",
+                                 Key=r"Software\Orion Group\Battery Monitor\Install")
+    ET.SubElement(registry_key, "RegistryValue", Name="InstallMode", Type="string",
+                  Value="msi-per-user", KeyPath="yes")
+    ET.SubElement(registry_key, "RegistryValue", Name="InstallLocation", Type="string", Value="[INSTALLFOLDER]")
+    ET.SubElement(registry_key, "RegistryValue", Name="ProductCode", Type="string", Value="[ProductCode]")
+    ET.SubElement(registry_key, "RegistryValue", Name="UpgradeCode", Type="string", Value="{" + upgrade_code + "}")
+    ET.SubElement(registry_key, "RegistryValue", Name="Version", Type="string", Value="[ProductVersion]")
+    for relative_directory, directory_element in directories.items():
+        ET.SubElement(marker, "RemoveFolder", Id=wix_id("R", relative_directory.as_posix() or "install"),
+                      Directory=directory_element.attrib["Id"], On="uninstall")
+    ET.SubElement(marker, "RemoveFolder", Id="RemovePublisherFolder", Directory=publisher.attrib["Id"],
+                  On="uninstall")
+    ET.SubElement(marker, "RemoveFolder", Id="RemoveProgramsFolder", Directory=programs.attrib["Id"],
+                  On="uninstall")
+
+    menu = ET.SubElement(package, "StandardDirectory", Id="ProgramMenuFolder")
+    menu_dir = ET.SubElement(menu, "Directory", Id="ApplicationProgramsFolder", Name="ChargeView")
+    shortcut_component = ET.SubElement(menu_dir, "Component", Id="StartMenuShortcut",
+                                       Guid=str(uuid.uuid5(GUID_NAMESPACE, "start-menu")).upper())
+    component_ids.append("StartMenuShortcut")
+    ET.SubElement(shortcut_component, "Shortcut", Id="ApplicationStartMenuShortcut", Name="ChargeView",
+                  Target="[INSTALLFOLDER]battery-monitor.exe", WorkingDirectory="INSTALLFOLDER")
+    ET.SubElement(shortcut_component, "RemoveFolder", Id="RemoveApplicationProgramsFolder", On="uninstall")
+    ET.SubElement(shortcut_component, "RegistryValue", Root="HKCU",
+                  Key=r"Software\Orion Group\Battery Monitor\Install", Name="StartMenuShortcut",
+                  Type="integer", Value="1", KeyPath="yes")
+
+    feature = ET.SubElement(package, "Feature", Id="MainFeature", Title="ChargeView", Level="1")
+    for component_id in component_ids:
+        ET.SubElement(feature, "ComponentRef", Id=component_id)
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    source = args.output.with_suffix(".wxs")
+    ET.ElementTree(wix).write(source, encoding="utf-8", xml_declaration=True)
+    subprocess.run([args.wix, "build", "-arch", "x64", "-o", str(args.output), str(source)], check=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
