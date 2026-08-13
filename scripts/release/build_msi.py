@@ -151,7 +151,15 @@ def main() -> int:
 
     ET.SubElement(package, "CustomAction", Id="LaunchChargeView", FileRef=wix_id("F", "battery-monitor.exe"),
                   ExeCommand="", Execute="immediate", Impersonate="yes", Return="asyncNoWait")
+    ET.SubElement(package, "CustomAction", Id="AppendChargeViewToDriveRoot", Property="INSTALLFOLDER",
+                  Value="[INSTALLFOLDER]ChargeView")
     ui = ET.SubElement(package, "UI")
+    for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+        ET.SubElement(ui, "Publish", Dialog="InstallDirDlg", Control="Next", Event="DoAction",
+                      Value="AppendChargeViewToDriveRoot", Order="2",
+                      Condition=f'INSTALLFOLDER = "{letter}:\\"')
+    ET.SubElement(ui, "Publish", Dialog="InstallDirDlg", Control="Next", Event="SetTargetPath",
+                  Value="INSTALLFOLDER", Order="3")
     ET.SubElement(ui, "Publish", Dialog="ExitDialog", Control="Finish", Event="DoAction",
                   Value="LaunchChargeView",
                   Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed")
