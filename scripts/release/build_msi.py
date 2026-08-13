@@ -54,6 +54,7 @@ def main() -> int:
         raise SystemExit("MSI version must be numeric X.Y.Z")
 
     ET.register_namespace("", WIX_NAMESPACE)
+    ET.register_namespace("ui", "http://wixtoolset.org/schemas/v4/wxs/ui")
     wix = ET.Element(f"{{{WIX_NAMESPACE}}}Wix")
     package = ET.SubElement(
         wix, "Package", Name="ChargeView", Manufacturer="Orion Group", Version=args.version,
@@ -63,11 +64,26 @@ def main() -> int:
     ET.SubElement(package, "SummaryInformation", Description="ChargeView Battery Monitor", Manufacturer="Orion Group")
     ET.SubElement(package, "MajorUpgrade", DowngradeErrorMessage="A newer version of ChargeView is already installed.")
     ET.SubElement(package, "MediaTemplate", EmbedCab="yes")
+    ET.SubElement(package, "Property", Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT",
+                  Value="Launch ChargeView")
+    ET.SubElement(package, "Property", Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX", Value="1")
+    ET.SubElement(package, f"{{http://wixtoolset.org/schemas/v4/wxs/ui}}WixUI",
+                  Id="WixUI_InstallDir", InstallDirectory="INSTALLFOLDER")
 
     standard = ET.SubElement(package, "StandardDirectory", Id="LocalAppDataFolder")
     programs = add_directory(standard, "Programs", "Programs")
     publisher = add_directory(programs, "Orion Group", "Programs/Orion Group")
     install = ET.SubElement(publisher, "Directory", Id="INSTALLFOLDER", Name="ChargeView")
+
+    previous_install_folder = ET.SubElement(package, "Property", Id="PREVIOUSINSTALLFOLDER", Secure="yes")
+    ET.SubElement(previous_install_folder, "RegistrySearch", Id="PreviousInstallFolderRegistry", Root="HKCU",
+                  Key=r"Software\Orion Group\Battery Monitor\Install", Name="InstallLocation",
+                  Type="raw", Bitness="always64")
+    set_install_folder = ET.SubElement(package, "SetProperty", Id="INSTALLFOLDER",
+                                       Value="[PREVIOUSINSTALLFOLDER]", After="AppSearch",
+                                       Condition="PREVIOUSINSTALLFOLDER AND NOT Installed")
+    ET.SubElement(package, "SetProperty", Id="ARPINSTALLLOCATION", Value="[INSTALLFOLDER]",
+                  After="CostFinalize", Condition="NOT Installed")
 
     directories: dict[pathlib.PurePosixPath, ET.Element] = {pathlib.PurePosixPath(): install}
     component_ids: list[str] = []
@@ -123,6 +139,23 @@ def main() -> int:
                   Key=r"Software\Orion Group\Battery Monitor\Install", Name="StartMenuShortcut",
                   Type="integer", Value="1", KeyPath="yes")
 
+    desktop = ET.SubElement(package, "StandardDirectory", Id="DesktopFolder")
+    desktop_component = ET.SubElement(desktop, "Component", Id="DesktopShortcut",
+                                      Guid=str(uuid.uuid5(GUID_NAMESPACE, "desktop")).upper())
+    component_ids.append("DesktopShortcut")
+    ET.SubElement(desktop_component, "Shortcut", Id="ApplicationDesktopShortcut", Name="ChargeView",
+                  Target="[INSTALLFOLDER]battery-monitor.exe", WorkingDirectory="INSTALLFOLDER")
+    ET.SubElement(desktop_component, "RegistryValue", Root="HKCU",
+                  Key=r"Software\Orion Group\Battery Monitor\Install", Name="DesktopShortcut",
+                  Type="integer", Value="1", KeyPath="yes")
+
+    ET.SubElement(package, "CustomAction", Id="LaunchChargeView", FileRef=wix_id("F", "battery-monitor.exe"),
+                  ExeCommand="", Execute="immediate", Impersonate="yes", Return="asyncNoWait")
+    ui = ET.SubElement(package, "UI")
+    ET.SubElement(ui, "Publish", Dialog="ExitDialog", Control="Finish", Event="DoAction",
+                  Value="LaunchChargeView",
+                  Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed")
+
     feature = ET.SubElement(package, "Feature", Id="MainFeature", Title="ChargeView", Level="1")
     for component_id in component_ids:
         ET.SubElement(feature, "ComponentRef", Id=component_id)
@@ -130,7 +163,8 @@ def main() -> int:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     source = args.output.with_suffix(".wxs")
     ET.ElementTree(wix).write(source, encoding="utf-8", xml_declaration=True)
-    subprocess.run([args.wix, "build", "-arch", "x64", "-o", str(args.output), str(source)], check=True)
+    subprocess.run([args.wix, "build", "-arch", "x64", "-ext", "WixToolset.UI.wixext",
+                    "-o", str(args.output), str(source)], check=True)
     return 0
 
 
