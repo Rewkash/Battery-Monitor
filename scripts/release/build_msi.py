@@ -172,6 +172,24 @@ def main() -> int:
 
     ET.SubElement(package, "CustomAction", Id="LaunchChargeView", FileRef=wix_id("F", "battery-monitor.exe"),
                   ExeCommand="", Execute="immediate", Impersonate="yes", Return="asyncNoWait")
+    # Appends the product folder when the picked location is a drive root
+    # (e.g. "H:\" -> "H:\ChargeView"). The check lives inside the script, so a
+    # single action covers every drive letter and re-runs are no-ops.
+    # NOTE: property assignment via a ControlEvent row (Event="INSTALLFOLDER")
+    # raises installer error 2812, and a type-51 SetProperty triggered through
+    # DoAction is silently ignored -- an immediate script action invoked with
+    # DoAction is the only mechanism that works from a wizard button.
+    script_path = args.output.with_name("append_drive_root.vbs")
+    script_path.write_text(
+        'Dim p\n'
+        'p = Session.Property("INSTALLFOLDER")\n'
+        'If Len(p) = 3 And Right(p, 2) = ":\\" Then\n'
+        '  Session.Property("INSTALLFOLDER") = p & "ChargeView"\n'
+        'End If\n',
+        encoding="ascii",
+    )
+    ET.SubElement(package, "CustomAction", Id="AppendChargeViewToDriveRoot",
+                  Script="vbscript", ScriptSourceFile=str(script_path))
     ui = ET.SubElement(package, "UI")
     # The product ships no EULA, so route around WixUI_InstallDir's
     # LicenseAgreementDlg (which would show placeholder lorem-ipsum text and
@@ -182,21 +200,17 @@ def main() -> int:
                   Value="InstallDirDlg", Order="2", Condition="NOT Installed AND NOT PATCH")
     ET.SubElement(ui, "Publish", Dialog="InstallDirDlg", Control="Back", Event="NewDialog",
                   Value="WelcomeDlg", Order="2")
-    # Append the product folder when the picked location is a drive root.
-    # On BrowseDlg OK this runs before InstallDirDlg is re-rendered, so the
-    # edit box visibly shows the final path (e.g. "H:\\ChargeView") right
-    # after browsing -- the behavior users expect from installers. The
-    # InstallDirDlg Next rows are a silent safety net for a path typed
-    # directly into the box. Setting the property through a ControlEvent
-    # (instead of a type-51 custom action triggered via DoAction) is
-    # processed reliably in the UI sequence.
-    for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
-        ET.SubElement(ui, "Publish", Dialog="BrowseDlg", Control="OK", Event="INSTALLFOLDER",
-                      Value="[INSTALLFOLDER]ChargeView", Order="3",
-                      Condition=f'INSTALLFOLDER = "{letter}:\\"')
-        ET.SubElement(ui, "Publish", Dialog="InstallDirDlg", Control="Next", Event="INSTALLFOLDER",
-                      Value="[INSTALLFOLDER]ChargeView", Order="2",
-                      Condition=f'INSTALLFOLDER = "{letter}:\\"')
+    # Append right after the browse dialog applies its selection: the edit box
+    # then visibly shows the final folder when InstallDirDlg re-renders.
+    ET.SubElement(ui, "Publish", Dialog="BrowseDlg", Control="OK", Event="DoAction",
+                  Value="AppendChargeViewToDriveRoot", Order="3")
+    ET.SubElement(ui, "Publish", Dialog="BrowseDlg", Control="OK", Event="SetTargetPath",
+                  Value="INSTALLFOLDER", Order="4")
+    # Safety net for a drive root typed directly into the box; SetTargetPath
+    # re-resolves the directory after the append so files land in the
+    # appended folder.
+    ET.SubElement(ui, "Publish", Dialog="InstallDirDlg", Control="Next", Event="DoAction",
+                  Value="AppendChargeViewToDriveRoot", Order="2")
     ET.SubElement(ui, "Publish", Dialog="InstallDirDlg", Control="Next", Event="SetTargetPath",
                   Value="INSTALLFOLDER", Order="3")
     ET.SubElement(ui, "Publish", Dialog="ExitDialog", Control="Finish", Event="DoAction",
