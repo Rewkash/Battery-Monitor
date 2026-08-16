@@ -13,10 +13,24 @@ namespace battery_monitor {
 
 namespace {
 
+void LogSocketAttempt(bool debug_enabled,
+                      XiaomiDebugLogFn debug_log,
+                      const std::string& service_name,
+                      const char* mode_suffix,
+                      int wsa_error) {
+    if (!debug_enabled || debug_log == nullptr) {
+        return;
+    }
+    debug_log("RFCOMM connect " + service_name + mode_suffix +
+              (wsa_error == 0 ? std::string(" ok") : (" failed wsa=" + std::to_string(wsa_error))));
+}
+
 bool ConnectForService(std::uint64_t bluetooth_address,
                        ClassicBatteryService service,
                        SOCKET* socket_handle,
-                       std::string* connected_path) {
+                       std::string* connected_path,
+                       bool debug_enabled = false,
+                       XiaomiDebugLogFn debug_log = nullptr) {
     SOCKADDR_BTH address{};
     address.addressFamily = AF_BTH;
     address.btAddr = bluetooth_address;
@@ -39,9 +53,12 @@ bool ConnectForService(std::uint64_t bluetooth_address,
             auto service_address = address;
             service_address.serviceClassId = service_uuid;
             if (!ConnectWithTimeout(candidate_socket, service_address, timeout_ms)) {
+                const int wsa_error = WSAGetLastError();
                 closesocket(candidate_socket);
+                LogSocketAttempt(debug_enabled, debug_log, service_name, mode_suffix, wsa_error);
                 return false;
             }
+            LogSocketAttempt(debug_enabled, debug_log, service_name, mode_suffix, 0);
             *socket_handle = candidate_socket;
             *connected_path = std::string(service_name) + mode_suffix;
             return true;
@@ -60,17 +77,23 @@ bool ConnectForService(std::uint64_t bluetooth_address,
 
 bool ConnectXiaomiControlSocket(std::uint64_t bluetooth_address,
                                 SOCKET* socket_handle,
-                                std::string* connected_path) {
+                                std::string* connected_path,
+                                bool debug_enabled,
+                                XiaomiDebugLogFn debug_log) {
     return ConnectXiaomiControlSocket(bluetooth_address,
                                       ClassicBatteryService::kXiaomiDeviceControl,
                                       socket_handle,
-                                      connected_path);
+                                      connected_path,
+                                      debug_enabled,
+                                      debug_log);
 }
 
 bool ConnectXiaomiControlSocket(std::uint64_t bluetooth_address,
                                 ClassicBatteryService preferred_service,
                                 SOCKET* socket_handle,
-                                std::string* connected_path) {
+                                std::string* connected_path,
+                                bool debug_enabled,
+                                XiaomiDebugLogFn debug_log) {
     if (socket_handle == nullptr || connected_path == nullptr) {
         return false;
     }
@@ -80,7 +103,7 @@ bool ConnectXiaomiControlSocket(std::uint64_t bluetooth_address,
 
     const auto try_service = [&](ClassicBatteryService service) {
         const bool connected = ConnectForService(
-            bluetooth_address, service, socket_handle, connected_path);
+            bluetooth_address, service, socket_handle, connected_path, debug_enabled, debug_log);
         if (connected) {
             RememberSuccessfulClassicBatteryService(bluetooth_address, service);
         }
@@ -113,11 +136,14 @@ bool ConnectXiaomiControlSocket(std::uint64_t bluetooth_address,
 bool ConnectXiaomiControlSocketForService(std::uint64_t bluetooth_address,
                                           ClassicBatteryService service,
                                           SOCKET* socket_handle,
-                                          std::string* connected_path) {
+                                          std::string* connected_path,
+                                          bool debug_enabled,
+                                          XiaomiDebugLogFn debug_log) {
     if (socket_handle == nullptr || connected_path == nullptr) return false;
     *socket_handle = INVALID_SOCKET;
     connected_path->clear();
-    return ConnectForService(bluetooth_address, service, socket_handle, connected_path);
+    return ConnectForService(bluetooth_address, service, socket_handle, connected_path,
+                             debug_enabled, debug_log);
 }
 
 }  // namespace battery_monitor

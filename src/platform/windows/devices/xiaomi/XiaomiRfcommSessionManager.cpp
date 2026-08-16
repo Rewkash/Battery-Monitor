@@ -194,7 +194,7 @@ class XiaomiRfcommSessionManager::Session final {
         add_service(ClassicBatteryService::kZmiPurPodsSerial);
 
         for (std::size_t index = 0; index < services.size() && !IsStopping(); ++index) {
-            if (connection_.OpenSocketForService(address_, services[index]) !=
+            if (connection_.OpenSocketForService(address_, services[index], debug_enabled_, debug_log_) !=
                 XiaomiControlSocketStatus::kOk) {
                 continue;
             }
@@ -207,6 +207,7 @@ class XiaomiRfcommSessionManager::Session final {
             connected_ = true;
             reconnect_service_ = services[index];
             reconnect_delay_ = std::chrono::milliseconds(250);
+            consecutive_connect_failures_ = 0;
             Log("Xiaomi persistent RFCOMM: connected address=" + std::to_string(address_) +
                 " path=" + connection_.connected_path());
             return true;
@@ -304,6 +305,7 @@ class XiaomiRfcommSessionManager::Session final {
             !SendInfoRequest(XiaomiOpcode::kGetDeviceRunInfo)) {
             return {};
         }
+        bool received_any_message = false;
         const auto deadline = Clock::now() + std::chrono::milliseconds(1600);
         while (connected_ && !IsStopping() && Clock::now() < deadline) {
             const auto now = Clock::now();
@@ -312,8 +314,29 @@ class XiaomiRfcommSessionManager::Session final {
                 now - *observation.device_info_received_at > std::chrono::milliseconds(500)) break;
             if (observation.report_status_seen_at.has_value() &&
                 now - *observation.report_status_seen_at > std::chrono::milliseconds(900)) break;
-            const auto status = ReceiveAndDispatch(&observation);
-            if (status == ReceiveStatus::kClosed || status == ReceiveStatus::kFailed) connected_ = false;
+            std::vector<std::uint8_t> chunk;
+            const auto status = Receive(&chunk);
+            if (status == ReceiveStatus::kData) {
+                received_any_message = true;
+                for (const auto& message : AppendAndDecodeXiaomiMessages(&rx_buffer_, chunk)) {
+                    ObserveMessage(message, &observation);
+                }
+                if (!connected_) break;
+                continue;
+            }
+            if (status == ReceiveStatus::kClosed || status == ReceiveStatus::kFailed) {
+                connected_ = false;
+                break;
+            }
+        }
+        // A socket that stays silent for the whole request window is a zombie
+        // (open but ignored by the device, e.g. after the earbuds' SPP server
+        // wedged). Keeping it "connected" would block the reconnect path and
+        // pin the app to HFP-quantized battery values forever.
+        if (connected_ && !received_any_message && !observation.status.has_value()) {
+            Log("Xiaomi persistent RFCOMM: silent session detected, reconnecting address=" +
+                std::to_string(address_));
+            connected_ = false;
         }
         return ResolveReadings(observation);
     }
@@ -420,8 +443,16 @@ class XiaomiRfcommSessionManager::Session final {
             }
             if (!connected_ && requested_connection_.load() && Clock::now() >= next_reconnect) {
                 if (!Connect(reconnect_service_)) {
+                    ++consecutive_connect_failures_;
+                    // Escalate the retry interval for a wedged device: hammering
+                    // an unresponsive SPP server hundreds of times per hour can
+                    // keep it wedged. 5s -> 15s -> 60s.
+                    reconnect_delay_ = consecutive_connect_failures_ > 20
+                                           ? std::chrono::milliseconds(60000)
+                                       : consecutive_connect_failures_ > 8
+                                           ? std::chrono::milliseconds(15000)
+                                           : std::chrono::milliseconds(5000);
                     next_reconnect = Clock::now() + reconnect_delay_;
-                    reconnect_delay_ = std::min(reconnect_delay_ * 2, std::chrono::milliseconds(5000));
                 }
                 continue;
             }
@@ -455,6 +486,7 @@ class XiaomiRfcommSessionManager::Session final {
     XiaomiControlConnection connection_;
     bool connected_ = false;
     std::chrono::milliseconds reconnect_delay_{250};
+    int consecutive_connect_failures_ = 0;
     ClassicBatteryService reconnect_service_ = ClassicBatteryService::kXiaomiDeviceControl;
     std::vector<std::uint8_t> rx_buffer_;
     BatteryObservation background_battery_;

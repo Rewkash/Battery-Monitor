@@ -27,7 +27,9 @@ class XiaomiControlConnection {
     XiaomiControlSocketStatus OpenSocket(std::uint64_t bluetooth_address,
                                          ClassicBatteryService preferred_service);
     XiaomiControlSocketStatus OpenSocketForService(std::uint64_t bluetooth_address,
-                                                   ClassicBatteryService service);
+                                                   ClassicBatteryService service,
+                                                   bool debug_enabled = false,
+                                                   XiaomiDebugLogFn debug_log = nullptr);
     bool Authenticate(bool debug_enabled = false, XiaomiDebugLogFn debug_log = nullptr);
 
     SOCKET socket_handle() const;

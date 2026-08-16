@@ -34,11 +34,13 @@ XiaomiControlSocketStatus XiaomiControlConnection::OpenSocket(
 
 XiaomiControlSocketStatus XiaomiControlConnection::OpenSocketForService(
     std::uint64_t bluetooth_address,
-    ClassicBatteryService service) {
+    ClassicBatteryService service,
+    bool debug_enabled,
+    XiaomiDebugLogFn debug_log) {
     Close();
     if (!wsa_.started()) return XiaomiControlSocketStatus::kWsaStartupFailed;
     if (!ConnectXiaomiControlSocketForService(
-            bluetooth_address, service, &socket_handle_, &connected_path_)) {
+            bluetooth_address, service, &socket_handle_, &connected_path_, debug_enabled, debug_log)) {
         return XiaomiControlSocketStatus::kSocketOpenFailed;
     }
     sequence_ = 0;
