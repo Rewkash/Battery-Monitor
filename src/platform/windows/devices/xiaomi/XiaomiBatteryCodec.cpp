@@ -32,6 +32,58 @@ int XiaomiBatteryPresenceCount(const XiaomiBatterySnapshot& snapshot) {
     return count;
 }
 
+// Structured TLV walk for the newer "Vela" firmware replies (e.g. Redmi
+// Buds 8 Pro): entries are [len][tag][value...] where len counts the tag
+// byte. Battery status arrives as tag 0x07 with [left, right, case] levels
+// (0xFF = component absent, e.g. earbud in the closed case) and tag 0x02
+// with the currently active level. The legacy byte-scan below cannot read
+// these replies: it misaligns on nested TLV headers and drops the right
+// earbud and the case.
+std::optional<XiaomiBatterySnapshot> ParseVelaBatteryTlv(const std::vector<std::uint8_t>& payload,
+                                                         bool debug_enabled,
+                                                         XiaomiBatteryDebugLogFn debug_log) {
+    std::optional<XiaomiBatterySnapshot> result;
+    std::size_t index = 0;
+    while (index + 1U < payload.size()) {
+        // Entry [index .. index+len] inclusive: the length byte plus len
+        // following bytes (tag + value).
+        const std::size_t len = payload[index];
+        if (len < 1U || index + len >= payload.size()) {
+            break;
+        }
+        const std::uint8_t tag = payload[index + 1U];
+        const std::size_t value_size = len - 1U;
+        const std::size_t value_start = index + 2U;
+
+        if (tag == 0x07U && value_size >= 3U) {
+            XiaomiBatterySnapshot snapshot;
+            snapshot.left = ParseXiaomiBatteryRaw(payload[value_start]);
+            snapshot.right = ParseXiaomiBatteryRaw(payload[value_start + 1U]);
+            snapshot.case_level = ParseXiaomiBatteryRaw(payload[value_start + 2U]);
+            if (XiaomiBatteryPresenceCount(snapshot) > 0) {
+                if (debug_enabled && debug_log != nullptr) {
+                    const auto level_text = [](const std::optional<std::uint8_t>& level) {
+                        return level.has_value() ? std::to_string(*level) : std::string("na");
+                    };
+                    debug_log("Xiaomi Vela battery TLV tag=07 level=(" + level_text(snapshot.left) + "," +
+                              level_text(snapshot.right) + "," + level_text(snapshot.case_level) + ")");
+                }
+                if (!result.has_value()) {
+                    result = snapshot;
+                } else {
+                    if (snapshot.left.has_value()) result->left = snapshot.left;
+                    if (snapshot.right.has_value()) result->right = snapshot.right;
+                    if (snapshot.case_level.has_value()) result->case_level = snapshot.case_level;
+                }
+            }
+        }
+
+        index += len + 1U;
+    }
+    return result;
+}
+
+
 std::optional<XiaomiBatterySnapshot> ExtractBatterySnapshotFromXiaomiPayload(
     const std::vector<std::uint8_t>& payload,
     std::optional<std::uint8_t> preferred_tag,
@@ -44,6 +96,11 @@ std::optional<XiaomiBatterySnapshot> ExtractBatterySnapshotFromXiaomiPayload(
     };
 
     std::optional<Candidate> best_candidate;
+
+    // Structured Vela TLVs win over the legacy heuristic scan.
+    if (const auto vela = ParseVelaBatteryTlv(payload, debug_enabled, debug_log); vela.has_value()) {
+        return *vela;
+    }
 
     std::size_t index = 0;
     while (index + 1U < payload.size()) {
