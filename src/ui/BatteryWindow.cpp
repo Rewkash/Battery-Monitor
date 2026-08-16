@@ -2474,13 +2474,24 @@ void BatteryWindow::Launch() {
 }
 
 void BatteryWindow::closeEvent(QCloseEvent* event) {
-    if (tray_icon_ != nullptr && tray_icon_->isVisible() && !quitting_) {
+    // A close request aimed at a hidden window or issued during session
+    // shutdown comes from an external actor (installer's Restart Manager,
+    // OS shutdown), not from the user: quitting is the only correct answer,
+    // otherwise upgrades and shutdown are blocked by files-in-use. A user
+    // close always arrives while the window is visible and hides to tray.
+    const bool external_close = !isVisible() || qApp->isSavingSession();
+    if (!external_close && tray_icon_ != nullptr && tray_icon_->isVisible() && !quitting_) {
         event->ignore();
         HideWindowToTray();
         return;
     }
 
+    quitting_ = true;
     QWidget::closeEvent(event);
+    // Accepting a close of an already hidden window does not end the Qt event
+    // loop (lastWindowClosed never fires for it), so an externally closed
+    // tray app would keep running with its files locked.
+    QApplication::quit();
 }
 
 bool BatteryWindow::event(QEvent* event) {

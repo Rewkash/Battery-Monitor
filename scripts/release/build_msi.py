@@ -96,9 +96,13 @@ def main() -> int:
     ET.SubElement(previous_install_folder, "RegistrySearch", Id="PreviousInstallFolderRegistry", Root="HKCU",
                   Key=r"Software\Orion Group\Battery Monitor\Install", Name="InstallLocation",
                   Type="raw", Bitness="always64")
-    set_install_folder = ET.SubElement(package, "SetProperty", Id="INSTALLFOLDER",
-                                       Value="[PREVIOUSINSTALLFOLDER]", After="AppSearch",
-                                       Condition="PREVIOUSINSTALLFOLDER AND NOT Installed")
+    # Official WiX "remember install location" pattern: the remembered path
+    # must be applied before costing so the Directory table resolves with it
+    # (files, shortcuts and ARP then agree). Verified end-to-end: upgrades
+    # keep the previous folder.
+    ET.SubElement(package, "SetProperty", Id="INSTALLFOLDER",
+                  Value="[PREVIOUSINSTALLFOLDER]", After="AppSearch",
+                  Condition="PREVIOUSINSTALLFOLDER AND NOT Installed")
     ET.SubElement(package, "SetProperty", Id="ARPINSTALLLOCATION", Value="[INSTALLFOLDER]",
                   After="CostFinalize", Condition="NOT Installed")
 
@@ -168,12 +172,30 @@ def main() -> int:
 
     ET.SubElement(package, "CustomAction", Id="LaunchChargeView", FileRef=wix_id("F", "battery-monitor.exe"),
                   ExeCommand="", Execute="immediate", Impersonate="yes", Return="asyncNoWait")
-    ET.SubElement(package, "CustomAction", Id="AppendChargeViewToDriveRoot", Property="INSTALLFOLDER",
-                  Value="[INSTALLFOLDER]ChargeView")
     ui = ET.SubElement(package, "UI")
+    # The product ships no EULA, so route around WixUI_InstallDir's
+    # LicenseAgreementDlg (which would show placeholder lorem-ipsum text and
+    # a disabled Next button). Ordering after the stock NewDialog rows makes
+    # these the effective navigation on fresh installs and upgrades; the
+    # Installed AND PATCH maintenance path keeps its stock VerifyReadyDlg.
+    ET.SubElement(ui, "Publish", Dialog="WelcomeDlg", Control="Next", Event="NewDialog",
+                  Value="InstallDirDlg", Order="2", Condition="NOT Installed AND NOT PATCH")
+    ET.SubElement(ui, "Publish", Dialog="InstallDirDlg", Control="Back", Event="NewDialog",
+                  Value="WelcomeDlg", Order="2")
+    # Append the product folder when the picked location is a drive root.
+    # On BrowseDlg OK this runs before InstallDirDlg is re-rendered, so the
+    # edit box visibly shows the final path (e.g. "H:\\ChargeView") right
+    # after browsing -- the behavior users expect from installers. The
+    # InstallDirDlg Next rows are a silent safety net for a path typed
+    # directly into the box. Setting the property through a ControlEvent
+    # (instead of a type-51 custom action triggered via DoAction) is
+    # processed reliably in the UI sequence.
     for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
-        ET.SubElement(ui, "Publish", Dialog="InstallDirDlg", Control="Next", Event="DoAction",
-                      Value="AppendChargeViewToDriveRoot", Order="2",
+        ET.SubElement(ui, "Publish", Dialog="BrowseDlg", Control="OK", Event="INSTALLFOLDER",
+                      Value="[INSTALLFOLDER]ChargeView", Order="3",
+                      Condition=f'INSTALLFOLDER = "{letter}:\\"')
+        ET.SubElement(ui, "Publish", Dialog="InstallDirDlg", Control="Next", Event="INSTALLFOLDER",
+                      Value="[INSTALLFOLDER]ChargeView", Order="2",
                       Condition=f'INSTALLFOLDER = "{letter}:\\"')
     ET.SubElement(ui, "Publish", Dialog="InstallDirDlg", Control="Next", Event="SetTargetPath",
                   Value="INSTALLFOLDER", Order="3")
