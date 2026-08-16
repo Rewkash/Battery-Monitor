@@ -181,6 +181,7 @@ struct ComponentEntry {
     std::optional<std::uint8_t> battery_level_percent;
     bool is_cached = false;
     bool is_connected = true;
+    bool is_charging = false;
 };
 
 struct DeviceEntry {
@@ -732,9 +733,17 @@ QString BuildComponentTriplet(const DeviceEntry& device) {
         return {};
     }
 
-    const auto left_text = FormatOptionalPercent(left != nullptr ? left->battery_level_percent : std::nullopt);
-    const auto right_text = FormatOptionalPercent(right != nullptr ? right->battery_level_percent : std::nullopt);
-    const auto case_text = FormatOptionalPercent(case_level != nullptr ? case_level->battery_level_percent : std::nullopt);
+    const auto charging_mark = [](const ComponentEntry* component) {
+        return (component != nullptr && component->is_charging)
+                   ? QString::fromUtf8(u8"\u26A1")
+                   : QString();
+    };
+    const auto left_text = FormatOptionalPercent(left != nullptr ? left->battery_level_percent : std::nullopt) +
+                           charging_mark(left);
+    const auto right_text = FormatOptionalPercent(right != nullptr ? right->battery_level_percent : std::nullopt) +
+                            charging_mark(right);
+    const auto case_text = FormatOptionalPercent(case_level != nullptr ? case_level->battery_level_percent : std::nullopt) +
+                           charging_mark(case_level);
 
     return QString::fromUtf8(u8"\u041B:%1 \u041F:%2 \u041A:%3").arg(left_text, right_text, case_text);
 }
@@ -1488,6 +1497,7 @@ std::vector<DeviceEntry> GroupDevices(const std::vector<DeviceBatteryInfo>& devi
         incoming.battery_level_percent = item.battery_level_percent;
         incoming.is_cached = item.is_cached;
         incoming.is_connected = item.is_connected;
+        incoming.is_charging = item.is_charging.value_or(false);
         if (IsDisconnectedEarbudLevel(incoming.component, incoming.battery_level_percent)) {
             incoming.battery_level_percent = std::nullopt;
         }
@@ -2724,8 +2734,11 @@ void BatteryWindow::UpdateTrayTooltip(const std::vector<DeviceBatteryInfo>& devi
         }
 
         const auto primary = ComputePrimaryBattery(device);
+        const bool any_charging = std::any_of(device.components.begin(), device.components.end(),
+                                              [](const ComponentEntry& component) { return component.is_charging; });
         const QString level_text = primary.level.has_value()
-                                       ? QStringLiteral("%1%").arg(*primary.level)
+                                       ? QStringLiteral("%1%%2").arg(*primary.level).arg(
+                                             any_charging ? QString::fromUtf8(u8" \u26A1") : QString())
                                        : QString::fromUtf8(u8"\u041D/\u0414");
         tooltip += QStringLiteral("\n%1: %2").arg(ToQString(device.device_name), level_text);
         ++shown;

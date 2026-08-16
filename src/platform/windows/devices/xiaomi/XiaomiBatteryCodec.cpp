@@ -18,6 +18,10 @@ std::optional<std::uint8_t> ParseXiaomiBatteryRaw(std::uint8_t raw_value) {
     return level;
 }
 
+bool ParseXiaomiBatteryCharging(std::uint8_t raw_value) {
+    return raw_value != 0xFFU && (raw_value & 0x80U) != 0U;
+}
+
 int XiaomiBatteryPresenceCount(const XiaomiBatterySnapshot& snapshot) {
     int count = 0;
     if (snapshot.left.has_value()) {
@@ -60,20 +64,36 @@ std::optional<XiaomiBatterySnapshot> ParseVelaBatteryTlv(const std::vector<std::
             snapshot.left = ParseXiaomiBatteryRaw(payload[value_start]);
             snapshot.right = ParseXiaomiBatteryRaw(payload[value_start + 1U]);
             snapshot.case_level = ParseXiaomiBatteryRaw(payload[value_start + 2U]);
+            snapshot.left_charging = snapshot.left.has_value() && ParseXiaomiBatteryCharging(payload[value_start]);
+            snapshot.right_charging =
+                snapshot.right.has_value() && ParseXiaomiBatteryCharging(payload[value_start + 1U]);
+            snapshot.case_charging =
+                snapshot.case_level.has_value() && ParseXiaomiBatteryCharging(payload[value_start + 2U]);
             if (XiaomiBatteryPresenceCount(snapshot) > 0) {
                 if (debug_enabled && debug_log != nullptr) {
                     const auto level_text = [](const std::optional<std::uint8_t>& level) {
                         return level.has_value() ? std::to_string(*level) : std::string("na");
                     };
                     debug_log("Xiaomi Vela battery TLV tag=07 level=(" + level_text(snapshot.left) + "," +
-                              level_text(snapshot.right) + "," + level_text(snapshot.case_level) + ")");
+                              level_text(snapshot.right) + "," + level_text(snapshot.case_level) + ") charging=(" +
+                              (snapshot.left_charging ? "1" : "0") + "," + (snapshot.right_charging ? "1" : "0") +
+                              "," + (snapshot.case_charging ? "1" : "0") + ")");
                 }
                 if (!result.has_value()) {
                     result = snapshot;
                 } else {
-                    if (snapshot.left.has_value()) result->left = snapshot.left;
-                    if (snapshot.right.has_value()) result->right = snapshot.right;
-                    if (snapshot.case_level.has_value()) result->case_level = snapshot.case_level;
+                    if (snapshot.left.has_value()) {
+                        result->left = snapshot.left;
+                        result->left_charging = snapshot.left_charging;
+                    }
+                    if (snapshot.right.has_value()) {
+                        result->right = snapshot.right;
+                        result->right_charging = snapshot.right_charging;
+                    }
+                    if (snapshot.case_level.has_value()) {
+                        result->case_level = snapshot.case_level;
+                        result->case_charging = snapshot.case_charging;
+                    }
                 }
             }
         }
@@ -124,6 +144,9 @@ std::optional<XiaomiBatterySnapshot> ExtractBatterySnapshotFromXiaomiPayload(
         snapshot.left = ParseXiaomiBatteryRaw(left_raw);
         snapshot.right = ParseXiaomiBatteryRaw(right_raw);
         snapshot.case_level = ParseXiaomiBatteryRaw(case_raw);
+        snapshot.left_charging = snapshot.left.has_value() && ParseXiaomiBatteryCharging(left_raw);
+        snapshot.right_charging = snapshot.right.has_value() && ParseXiaomiBatteryCharging(right_raw);
+        snapshot.case_charging = snapshot.case_level.has_value() && ParseXiaomiBatteryCharging(case_raw);
 
         if (!snapshot.left.has_value() && !snapshot.right.has_value() && !snapshot.case_level.has_value()) {
             index += len + 1U;
@@ -207,12 +230,15 @@ XiaomiBatterySnapshot MergeXiaomiSnapshots(const XiaomiBatterySnapshot& preferre
     XiaomiBatterySnapshot merged = preferred;
     if (!merged.left.has_value()) {
         merged.left = fallback.left;
+        merged.left_charging = fallback.left_charging;
     }
     if (!merged.right.has_value()) {
         merged.right = fallback.right;
+        merged.right_charging = fallback.right_charging;
     }
     if (!merged.case_level.has_value()) {
         merged.case_level = fallback.case_level;
+        merged.case_charging = fallback.case_charging;
     }
     return merged;
 }
@@ -220,13 +246,13 @@ XiaomiBatterySnapshot MergeXiaomiSnapshots(const XiaomiBatterySnapshot& preferre
 std::vector<BatteryReading> BuildXiaomiBatteryReadings(const XiaomiBatterySnapshot& snapshot) {
     std::vector<BatteryReading> readings;
     if (snapshot.left.has_value()) {
-        readings.push_back(BatteryReading{"left", *snapshot.left});
+        readings.push_back(BatteryReading{"left", *snapshot.left, snapshot.left_charging});
     }
     if (snapshot.right.has_value()) {
-        readings.push_back(BatteryReading{"right", *snapshot.right});
+        readings.push_back(BatteryReading{"right", *snapshot.right, snapshot.right_charging});
     }
     if (snapshot.case_level.has_value()) {
-        readings.push_back(BatteryReading{"case", *snapshot.case_level});
+        readings.push_back(BatteryReading{"case", *snapshot.case_level, snapshot.case_charging});
     }
     return readings;
 }

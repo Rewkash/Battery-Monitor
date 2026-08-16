@@ -115,6 +115,9 @@ void AddCandidateReadings(DeviceBatteryAccumulator* accumulator,
         entry.device_name = device_name;
         entry.battery_component = battery_reading.component;
         entry.battery_level_percent = battery_reading.percent;
+        if (battery_reading.charging) {
+            entry.is_charging = true;
+        }
         PopulateBluetoothVisualHintsFromEndpointCandidate(candidate, &entry);
         entry.is_cached = is_cached;
         entry.is_connected = candidate.is_connected || is_connected;

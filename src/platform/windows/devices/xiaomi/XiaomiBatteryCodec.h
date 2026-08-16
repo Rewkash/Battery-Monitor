@@ -10,17 +10,23 @@ namespace battery_monitor {
 struct BatteryReading {
     std::string component;
     std::uint8_t percent = 0;
+    bool charging = false;
 };
 
 struct XiaomiBatterySnapshot {
     std::optional<std::uint8_t> left;
     std::optional<std::uint8_t> right;
     std::optional<std::uint8_t> case_level;
+    bool left_charging = false;
+    bool right_charging = false;
+    bool case_charging = false;
 };
 
 using XiaomiBatteryDebugLogFn = void (*)(const std::string&);
 
 std::optional<std::uint8_t> ParseXiaomiBatteryRaw(std::uint8_t raw_value);
+// Battery bytes carry a charging flag in bit 7 (0x80); 0xFF means "absent".
+bool ParseXiaomiBatteryCharging(std::uint8_t raw_value);
 int XiaomiBatteryPresenceCount(const XiaomiBatterySnapshot& snapshot);
 std::optional<XiaomiBatterySnapshot> ExtractBatterySnapshotFromXiaomiPayload(
     const std::vector<std::uint8_t>& payload,

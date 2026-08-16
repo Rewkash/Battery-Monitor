@@ -48,6 +48,8 @@ struct DeviceBatteryInfo {
     std::vector<std::string> device_categories;
     bool is_cached = false;
     bool is_connected = true;
+    // Component is charging (Xiaomi protocol charge flag); nullopt = unknown.
+    std::optional<bool> is_charging;
 };
 
 struct BatteryQueryOptions {

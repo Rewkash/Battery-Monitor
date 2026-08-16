@@ -389,6 +389,9 @@ std::vector<DeviceBatteryInfo> FinalizeCollectedEntries(std::vector<DeviceBatter
             // equal or lower-priority duplicates only enrich metadata, never the value.
             if (existing_priority >= incoming_priority) {
                 existing.is_connected = existing.is_connected || entry.is_connected;
+                if (!existing.is_charging.has_value()) {
+                    existing.is_charging = entry.is_charging;
+                }
                 if (!existing.device_mode.has_value()) {
                     existing.device_mode = entry.device_mode;
                 }
@@ -408,6 +411,9 @@ std::vector<DeviceBatteryInfo> FinalizeCollectedEntries(std::vector<DeviceBatter
                 continue;
             }
             entry.is_connected = existing.is_connected || entry.is_connected;
+            if (!entry.is_charging.has_value()) {
+                entry.is_charging = existing.is_charging;
+            }
             if (!entry.device_mode.has_value()) {
                 entry.device_mode = existing.device_mode;
             }

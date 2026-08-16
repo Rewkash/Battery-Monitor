@@ -100,7 +100,9 @@ void PrintJson(const std::vector<DeviceBatteryInfo>& devices, std::ostream& stre
                << (device.device_submode.has_value() ? ("\"" + EscapeJson(*device.device_submode) + "\"") : "null")
                << ","
                << "\"isCached\":" << (device.is_cached ? "true" : "false") << ","
-               << "\"isConnected\":" << (device.is_connected ? "true" : "false") << "}";
+               << "\"isConnected\":" << (device.is_connected ? "true" : "false") << ","
+               << "\"isCharging\":"
+               << (device.is_charging.has_value() ? (*device.is_charging ? "true" : "false") : "null") << "}";
         if (i + 1 < devices.size()) {
             stream << ",";
         }
