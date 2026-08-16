@@ -166,16 +166,36 @@ std::uint64_t LoadSequence(const std::filesystem::path& state) {
     return parsed;
 }
 
+// A committed state file always stores a sequence >= 1, so a primary file that
+// is missing or yields 0 is treated as absent/corrupt and the backup is used.
+std::uint64_t LoadHighestSequence(const std::filesystem::path& state) {
+    const std::uint64_t primary = LoadSequence(state);
+    if (primary != 0) return primary;
+    return LoadSequence(state.wstring() + L".bak");
+}
+
 bool CommitSequence(const std::filesystem::path& state, std::uint64_t sequence) {
     std::error_code error;
     std::filesystem::create_directories(state.parent_path(), error);
     if (error) return false;
+    // Keep the last known-good state as a recovery backup before replacing it.
+    std::error_code ignored;
+    if (std::filesystem::is_regular_file(state, ignored)) {
+        const std::filesystem::path backup = state.wstring() + L".bak";
+        const std::filesystem::path backup_temporary = state.wstring() + L".bak.tmp";
+        if (CopyFileW(state.c_str(), backup_temporary.c_str(), FALSE) != FALSE) {
+            if (!MoveFileExW(backup_temporary.c_str(), backup.c_str(),
+                             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                DeleteFileW(backup_temporary.c_str());
+            }
+        }
+    }
     const std::filesystem::path temporary = state.wstring() + L".new";
     {
         std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
         if (!output) return false;
         output << "{\"schemaVersion\":1,\"highestSequence\":\""
-               << std::max(sequence, LoadSequence(state)) << "\"}";
+               << std::max(sequence, LoadHighestSequence(state)) << "\"}";
         if (!output) return false;
     }
     if (!MoveFileExW(temporary.c_str(), state.c_str(),
@@ -226,7 +246,7 @@ int ApplyMsi(int argc, wchar_t** argv) {
 
     Handle mutex(CreateMutexW(nullptr, FALSE, MutexName(current).c_str()));
     if (mutex.get() == nullptr || WaitForSingleObject(mutex.get(), 0) != WAIT_OBJECT_0 ||
-        sequence <= LoadSequence(state)) return 9;
+        sequence <= LoadHighestSequence(state)) return 9;
     Handle old_process(OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(old_pid)));
     if (old_process.get() != nullptr && WaitForSingleObject(old_process.get(), 60000) != WAIT_OBJECT_0) return 4;
 
@@ -281,7 +301,7 @@ int wmain(int argc, wchar_t** argv) {
 
     Handle mutex(CreateMutexW(nullptr, FALSE, MutexName(current).c_str()));
     if (mutex.get() == nullptr || WaitForSingleObject(mutex.get(), 0) != WAIT_OBJECT_0 ||
-        sequence <= LoadSequence(state)) return 9;
+        sequence <= LoadHighestSequence(state)) return 9;
 
     Handle old_process(OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(old_pid)));
     if (old_process.get() != nullptr && WaitForSingleObject(old_process.get(), 60000) != WAIT_OBJECT_0) return 4;

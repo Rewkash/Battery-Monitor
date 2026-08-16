@@ -177,8 +177,21 @@ HistoricalProfiles BuildHistoricalProfiles(const BatteryHistoryData& history) {
             }
 
             const qint64 delta_ms = std::max<qint64>(0, sample.timestamp_ms - previous_sample.timestamp_ms);
-            pending_ms += delta_ms;
             const int current_level = *current_level_opt;
+
+            if (current_level > previous_level) {
+                // Level increase means the device was charging or
+                // disconnected: treat it as a discharge-segment boundary and
+                // never attribute the rising interval to the discharge rate.
+                previous_sample = sample;
+                previous_level = current_level;
+                pending_ms = 0;
+                continue;
+            }
+
+            // Exclude sample intervals longer than the session gap limit from
+            // the accumulated discharge time.
+            pending_ms += std::min<qint64>(delta_ms, kSeriesGapBreakMs);
 
             if (current_level < previous_level) {
                 const int drop = previous_level - current_level;
@@ -320,7 +333,16 @@ std::optional<LiveRateEstimate> ComputeLiveRate(const BatteryHistoryData& histor
         const auto& current_sample = *tail_samples[index];
         const int previous_level = *SampleLevel(previous_sample, component_key);
         const int current_level = *SampleLevel(current_sample, component_key);
-        pending_ms += std::max<qint64>(0, current_sample.timestamp_ms - previous_sample.timestamp_ms);
+        if (current_level > previous_level) {
+            // Rising interval (charging or reconnect): segment boundary, the
+            // interval is not used for the discharge rate.
+            pending_ms = 0;
+            continue;
+        }
+        const qint64 delta_ms = std::min<qint64>(
+            std::max<qint64>(0, current_sample.timestamp_ms - previous_sample.timestamp_ms),
+            kSeriesGapBreakMs);
+        pending_ms += delta_ms;
         if (current_level < previous_level) {
             total_ms += pending_ms;
             total_drop += previous_level - current_level;
@@ -445,6 +467,7 @@ QHash<QString, AverageRuntimeSummary> ComputeAverageRuntimeSummaries(const Batte
                                       previous_level < 0 || current_level < 0 ||
                                       IsDisconnectedLevel(previous_level) || IsDisconnectedLevel(current_level) ||
                                       delta_ms > kSeriesGapBreakMs ||
+                                      current_level > previous_level ||
                                       (current_level - previous_level) > kChargeJumpBreakPercent;
 
             if (!invalid_pair) {
@@ -530,7 +553,16 @@ QVector<ContextRuntimeSummary> ComputeContextRuntimeSummaries(const BatteryHisto
             }
 
             const int current_level = *current_level_opt;
-            session_duration_ms += std::max<qint64>(0, sample.timestamp_ms - previous_sample.timestamp_ms);
+            if (current_level > previous_level) {
+                // Rising interval (charging or reconnect): a new discharge
+                // segment starts here; the rising interval is not counted.
+                previous_sample = sample;
+                previous_level = current_level;
+                continue;
+            }
+            session_duration_ms += std::min<qint64>(
+                std::max<qint64>(0, sample.timestamp_ms - previous_sample.timestamp_ms),
+                kSeriesGapBreakMs);
             if (current_level < previous_level) {
                 session_drop += previous_level - current_level;
             }

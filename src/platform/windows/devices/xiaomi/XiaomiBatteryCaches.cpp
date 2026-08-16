@@ -43,7 +43,8 @@ XiaomiClassicBatteryCache::XiaomiClassicBatteryCache(bool persist_write_enabled,
 XiaomiReadResult XiaomiClassicBatteryCache::Read(std::uint64_t address,
                                                    ClassicBatteryService preferred_service,
                                                    bool aggressive_retry,
-                                                  std::size_t min_tws_components) {
+                                                   std::size_t min_tws_components,
+                                                   const ProviderOperationContext& operation) {
     (void)min_tws_components;
 
     {
@@ -103,7 +104,7 @@ XiaomiReadResult XiaomiClassicBatteryCache::Read(std::uint64_t address,
     std::optional<ClassicBatteryService> connected_service;
     try {
         if (session_manager_ != nullptr) {
-            readings = session_manager_->ReadBattery(address, preferred_service);
+            readings = session_manager_->ReadBattery(address, preferred_service, operation);
             if (!readings.empty()) {
                 connected_service = TryGetSuccessfulClassicBatteryService(address);
             }
@@ -126,6 +127,7 @@ XiaomiReadResult XiaomiClassicBatteryCache::Read(std::uint64_t address,
             }
 
             for (std::size_t index = 0; index < services.size(); ++index) {
+                if (operation.IsCancelled()) break;
                 readings = TryReadXiaomiClassicBattery(address,
                                                        services[index],
                                                        nullptr,
@@ -152,6 +154,9 @@ XiaomiReadResult XiaomiClassicBatteryCache::Read(std::uint64_t address,
 
     std::lock_guard<std::mutex> lock(mutex_);
     live_read_in_progress_.erase(address);
+    if (operation.IsCancelled()) {
+        return read_result;
+    }
     if (connected_service.has_value()) {
         RememberSuccessfulClassicBatteryService(address, *connected_service);
         services_exhausted_.erase(address);

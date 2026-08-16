@@ -1,5 +1,18 @@
 # Windows release process
 
+## Product naming
+
+- **Display name: `ChargeView`** — the human-readable name shown in UI titles, the installer
+  wizard, shortcuts and release notes. Defined once as `BATTERY_MONITOR_DISPLAY_NAME` (with
+  `BATTERY_MONITOR_PUBLISHER`) in `CMakeLists.txt`; the installer derives its display strings
+  from these defines.
+- **Internal identity: `BatteryMonitor` / `battery-monitor`** — the CMake project name, target
+  and executable names (`battery-monitor.exe`, `battery-monitor-cli.exe`,
+  `battery-monitor-maintenance.exe`), artifact file names
+  (`battery-monitor-vX.Y.Z-win-x64.{msi,zip,bmup}`), the MSI UpgradeCode, registry keys under
+  `Software\Orion Group\Battery Monitor`, and QSettings identifiers. This identity is frozen:
+  renaming any of it breaks upgrades, auto-updates and settings migration.
+
 ## One-time GitHub setup
 
 1. Configure repository secret `BATTERY_MONITOR_ED25519_PRIVATE_KEY_B64` with the 32-byte Ed25519 seed in Base64.
@@ -41,14 +54,28 @@ Self-signed signatures are only for development and do not establish public trus
    ```powershell
    cmake --fresh -S . -B build -G "Visual Studio 17 2022" -A x64
    cmake --build build --config Release
+   ctest --test-dir build -C Release --output-on-failure --no-tests=ignore
    .\build\Release\battery-monitor-cli.exe --version
    ```
 
 3. Commit and push the version change.
 4. Create and push tag `vX.Y.Z` from the protected release branch.
 5. Approve the `release` GitHub environment.
-6. The workflow validates tag/CMake equality, generates GitHub release notes and embeds them in the signed update manifest, builds GUI and CLI together, applies Authenticode when configured, creates the per-user MSI, portable `bmup-1` update bundle, and ZIP, generates and signs the manifest, independently verifies the update artifacts, then publishes them.
-7. Re-download the GitHub Release assets and run `verify_release.py` with both `--bundle` and `--msi` before announcing the release.
+6. The workflow validates tag/CMake equality, builds GUI and CLI together, runs CTest, then a
+   CLI smoke test that must print exactly the released version. The distributable is staged by
+   a single `cmake --install` into `release-staging/app` (executables, the Qt runtime via
+   windeployqt, `profiles/` and `resources/` — packaging scripts consume only this staging).
+   From the staging it applies Authenticode when configured, builds and validates the per-user
+   MSI, verifies the MSI product identity (ProductVersion equals the release version, UpgradeCode
+   equals `BATTERY_MONITOR_MSI_UPGRADE_CODE`) via `scripts/release/Get-MsiInfo.ps1`, creates the
+   portable `bmup-1` update bundle and ZIP, generates and signs the manifest, independently
+   re-verifies everything (`verify_release.py`: manifest signature, bundle traversal with no
+   duplicate paths and per-file hashes, bundle/MSI sizes and hashes, MSI identity, and version
+   consistency across the tag, manifest and MSI), and smoke-tests the exact ZIP contents before
+   publishing.
+7. Re-download the GitHub Release assets and run `verify_release.py` with both `--bundle` and
+   `--msi` (plus `--expected-version` and, when re-checking the MSI database,
+   `--msi-info <json from Get-MsiInfo.ps1>`) before announcing the release.
 
 For an explicitly self-signed test prerelease, configure `WINDOWS_TEST_SIGNING_PFX_BASE64` and
 `WINDOWS_TEST_SIGNING_PFX_PASSWORD`, then tag `vX.Y.Z-test.N`. Test tags never fall back to the

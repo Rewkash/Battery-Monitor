@@ -1,6 +1,15 @@
 ﻿cmake_minimum_required(VERSION 3.21)
 
-project(BatteryMonitor VERSION 0.1.6 LANGUAGES C CXX)
+project(BatteryMonitor VERSION 0.2.0 LANGUAGES C CXX)
+
+# Product naming convention (see README.md "Product naming" and docs/release-process.md):
+#   Display name:      ChargeView -- human-readable UI text, installer titles and shortcuts.
+#   Internal identity: BatteryMonitor / battery-monitor -- CMake project name, target and
+#                      executable names, artifact file names, registry keys and update
+#                      metadata. The internal identity is stable and must never be renamed;
+#                      upgrades, auto-updates and settings migration depend on it.
+set(BATTERY_MONITOR_DISPLAY_NAME "ChargeView")
+set(BATTERY_MONITOR_PUBLISHER "Orion Group")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -9,6 +18,20 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOMOC ON)
 option(BATTERY_MONITOR_ENABLE_QT "Enable Qt6 test GUI" ON)
 option(BATTERY_MONITOR_ENABLE_UPDATER "Enable the Windows auto-update client" ON)
+
+# Compiler warnings. Deliberately non-fatal: the tree is not warning-clean, so -Werror is
+# not used. Declared before any target so every target (including the executables and the
+# fetched dependencies) compiles with the same warning level.
+add_compile_options(
+    "$<$<COMPILE_LANG_AND_ID:C,MSVC>:/W4>"
+    "$<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/W4;/permissive-;/EHsc;/utf-8>"
+    "$<$<COMPILE_LANG_AND_ID:C,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic>"
+    "$<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic>"
+)
+
+# Registers the `test` target and the BUILD_TESTING option so `ctest` works in CI
+# (the release pipeline runs CTest before publishing; the suite may currently be empty).
+include(CTest)
 
 configure_file(
     ${PROJECT_SOURCE_DIR}/cmake/BatteryMonitorVersion.h.in
@@ -55,25 +78,6 @@ target_include_directories(
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_BINARY_DIR}/generated
 )
-
-if(MSVC)
-    target_compile_options(
-        battery-monitor-app
-        PRIVATE
-            /W4
-            /permissive-
-            /EHsc
-            /utf-8
-    )
-else()
-    target_compile_options(
-        battery-monitor-app
-        PRIVATE
-            -Wall
-            -Wextra
-            -Wpedantic
-    )
-endif()
 
 if(WIN32)
     if(BATTERY_MONITOR_ENABLE_UPDATER AND BATTERY_MONITOR_QT_ENABLED)
@@ -212,6 +216,8 @@ if(BATTERY_MONITOR_QT_ENABLED)
             src/ui/DeviceDiagnosticsDialog.h
             src/ui/NoiseControlUi.cpp
             src/ui/NoiseControlUi.h
+            src/ui/BatteryNotificationController.cpp
+            src/ui/BatteryNotificationController.h
             src/ui/BatteryWindow.cpp
             src/ui/BatteryWindow.h
             src/ui/BatteryWindowSettings.cpp
@@ -286,5 +292,80 @@ if(BATTERY_MONITOR_QT_ENABLED)
 else()
     add_executable(battery-monitor src/cli_main.cpp)
     target_link_libraries(battery-monitor PRIVATE battery-monitor-app)
+endif()
+
+# ---------------------------------------------------------------------------
+# Install rules.
+#
+# The Windows release pipeline stages the distributable with a single
+# `cmake --install --prefix <staging>` call; packaging scripts (MSI, bmup
+# bundle, ZIP) consume that staging tree instead of copying build outputs by
+# hand. Layout on Windows is intentionally flat (executables, Qt runtime and
+# data directories side by side) to match the shipped MSI/portable bundle.
+# ---------------------------------------------------------------------------
+include(GNUInstallDirs)
+
+if(WIN32)
+    set(BATTERY_MONITOR_RUNTIME_DEST ".")
+    set(BATTERY_MONITOR_PROFILES_DEST "profiles")
+    set(BATTERY_MONITOR_RESOURCES_DEST "resources")
+else()
+    set(BATTERY_MONITOR_RUNTIME_DEST "${CMAKE_INSTALL_BINDIR}")
+    set(BATTERY_MONITOR_PROFILES_DEST "${CMAKE_INSTALL_DATADIR}/battery-monitor/profiles")
+    set(BATTERY_MONITOR_RESOURCES_DEST "${CMAKE_INSTALL_DATADIR}/battery-monitor/resources")
+endif()
+
+# Runtime executables.
+install(
+    TARGETS battery-monitor
+    RUNTIME DESTINATION "${BATTERY_MONITOR_RUNTIME_DEST}"
+    COMPONENT Runtime
+)
+if(BATTERY_MONITOR_QT_ENABLED)
+    install(
+        TARGETS battery-monitor-cli
+        RUNTIME DESTINATION "${BATTERY_MONITOR_RUNTIME_DEST}"
+        COMPONENT Runtime
+    )
+    if(TARGET battery-monitor-maintenance)
+        install(
+            TARGETS battery-monitor-maintenance
+            RUNTIME DESTINATION "${BATTERY_MONITOR_RUNTIME_DEST}"
+            COMPONENT Runtime
+        )
+    endif()
+endif()
+
+# Runtime data: JSON device profiles are loaded from <install>/profiles/devices.
+install(
+    DIRECTORY profiles/
+    DESTINATION "${BATTERY_MONITOR_PROFILES_DEST}"
+    COMPONENT Data
+)
+# Qt resources (resources/device_icons.qrc) are compiled into the binaries via
+# CMAKE_AUTORCC; the sources are installed alongside the data component so the
+# staged tree fully describes the packaged UI resources.
+install(
+    DIRECTORY resources/
+    DESTINATION "${BATTERY_MONITOR_RESOURCES_DEST}"
+    COMPONENT Data
+)
+
+# Qt runtime deployment at install time. The POST_BUILD windeployqt run above
+# prepares the build tree for local development; this mirrors it into the
+# install prefix (the staging directory used for packaging).
+if(WIN32 AND BATTERY_MONITOR_QT_ENABLED)
+    install(CODE "
+        execute_process(
+            COMMAND \"${WINDEPLOYQT_EXECUTABLE}\"
+                    --no-translations
+                    --dir \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}\"
+                    \"$<TARGET_FILE:battery-monitor>\"
+            RESULT_VARIABLE _windeployqt_result
+        )
+        if(NOT _windeployqt_result EQUAL 0)
+            message(FATAL_ERROR \"windeployqt failed (exit code \${_windeployqt_result})\")
+        endif()
+    ")
 endif()
 

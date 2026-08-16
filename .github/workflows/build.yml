@@ -19,4 +19,32 @@ jobs:
           cache: true
       - run: cmake --fresh -S . -B build -G "Visual Studio 17 2022" -A x64
       - run: cmake --build build --config Release
+      - name: Run tests (CTest)
+        run: ctest --test-dir build -C Release --output-on-failure --no-tests=ignore
       - run: build\Release\battery-monitor-cli.exe --version
+      # Advisory clang-tidy pass: reports findings but never fails the build.
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+      - name: clang-tidy (advisory, non-blocking)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          cmake --fresh -S . -B build-tidy -G Ninja -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DBATTERY_MONITOR_ENABLE_UPDATER=OFF
+          $tidy = Get-Command clang-tidy -ErrorAction SilentlyContinue
+          if (-not $tidy) {
+            foreach ($candidate in @("${env:ProgramFiles}\LLVM\bin\clang-tidy.exe",
+                                     "${env:ProgramFiles(x86)}\LLVM\bin\clang-tidy.exe")) {
+              if (Test-Path $candidate) { $tidy = [pscustomobject]@{ Source = $candidate }; break }
+            }
+          }
+          if (-not $tidy) {
+            Write-Output "::warning::clang-tidy not found on the runner; skipping advisory analysis"
+            exit 0
+          }
+          $files = @(git ls-files -- "src/*.cpp" "src/*.h" "include/*.h")
+          if (-not $files) { Write-Output "no sources found; skipping"; exit 0 }
+          Write-Output "running $($tidy.Source) on $($files.Count) files (advisory only)"
+          & $tidy.Source -p build-tidy --quiet --header-filter "(^|[\\/])(src|include)[\\/]" --timeout 120 @files
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "::warning::clang-tidy reported findings (exit $LASTEXITCODE); build remains green"
+            exit 0
+          }

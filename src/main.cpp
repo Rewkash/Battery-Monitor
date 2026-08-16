@@ -1,10 +1,10 @@
+#include <chrono>
 #include <exception>
 #include <iostream>
 #include <memory>
 
 #ifdef _WIN32
 #include <windows.h>
-#include <tlhelp32.h>
 #endif
 
 #ifdef BATTERY_MONITOR_WITH_QT
@@ -35,7 +35,7 @@ namespace battery_monitor {
 namespace {
 
 #ifdef _WIN32
-bool ClaimGuiInstanceAndCloseLegacyCopies() {
+bool ClaimGuiInstance() {
     static HANDLE instance_mutex = CreateMutexW(nullptr, TRUE, L"Local\\ChargeViewGuiInstance");
     if (instance_mutex == nullptr) {
         return true;
@@ -46,38 +46,18 @@ bool ClaimGuiInstanceAndCloseLegacyCopies() {
         return false;
     }
 
-    const DWORD current_pid = GetCurrentProcessId();
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        return true;
-    }
-    PROCESSENTRY32W entry{};
-    entry.dwSize = sizeof(entry);
-    if (Process32FirstW(snapshot, &entry)) {
-        do {
-            if (entry.th32ProcessID == current_pid ||
-                _wcsicmp(entry.szExeFile, L"battery-monitor.exe") != 0) {
-                continue;
-            }
-            HANDLE process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, entry.th32ProcessID);
-            if (process != nullptr) {
-                TerminateProcess(process, 0);
-                WaitForSingleObject(process, 5000);
-                CloseHandle(process);
-            }
-        } while (Process32NextW(snapshot, &entry));
-    }
-    CloseHandle(snapshot);
     return true;
 }
 #endif
 
-int RunCliApplication(int argc, char** argv, const CommandLineOptions& options) {
+int RunCliApplication([[maybe_unused]] int argc, [[maybe_unused]] char** argv, const CommandLineOptions& options) {
     auto provider = CreateBatteryProvider();
 #ifdef BATTERY_MONITOR_WITH_UPDATER
     SignalUpdateStartupHealth(argc, argv);
 #endif
     BatteryQueryOptions query_options;
+    query_options.operation.deadline =
+        ProviderOperationContext::Clock::now() + std::chrono::seconds(15);
     query_options.include_disconnected = options.include_offline;
     const auto devices = provider->GetDevicesBattery(query_options);
     const auto format = options.json_output ? DeviceListOutputFormat::Json : DeviceListOutputFormat::Table;
@@ -90,7 +70,7 @@ int RunGuiApplication(int argc, char** argv) {
     QApplication app(argc, argv);
     QApplication::setApplicationDisplayName(QStringLiteral("ChargeView"));
 #ifdef _WIN32
-    if (!ClaimGuiInstanceAndCloseLegacyCopies()) {
+    if (!ClaimGuiInstance()) {
         return 0;
     }
 #endif
@@ -164,8 +144,13 @@ int RunUpdateCheck(int argc, char** argv, bool json_output) {
 
 }  // namespace battery_monitor
 
-int battery_monitor::BatteryMonitorMain(int argc, char** argv, bool prefer_gui) {
+int battery_monitor::BatteryMonitorMain(int argc, char** argv, [[maybe_unused]] bool prefer_gui) {
     const CommandLineOptions options = ParseCommandLine(argc, argv);
+
+    if (options.has_error) {
+        std::cerr << "Error: " << options.error_message << "\n\n" << CommandLineUsageText();
+        return 2;
+    }
 
     try {
         if (options.show_version) {

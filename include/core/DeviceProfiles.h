@@ -47,6 +47,23 @@ struct DeviceProfileQuery {
 std::filesystem::path ResolveDefaultDeviceProfileDirectory();
 LoadedDeviceProfiles LoadDeviceProfilesFromDirectory(const std::filesystem::path& directory);
 const LoadedDeviceProfiles& GetCachedDeviceProfiles();
+
+// Result of the most-specific profile selection. `profile` is null when no
+// profile matches the query. `notes` records diagnostics such as
+// equal-specificity conflicts between candidate profiles.
+struct DeviceProfileSelection {
+    const DeviceProfile* profile = nullptr;
+    std::vector<std::string> notes;
+};
+
+// Selects the single most specific profile matching the query. Specificity is
+// determined by the matched deviceIdContains tokens first (total matched
+// length), then by the matched nameContains tokens (total matched length).
+// Ties are broken by the lexicographically smallest profile id.
+DeviceProfileSelection SelectDeviceProfile(const LoadedDeviceProfiles& loaded_profiles,
+                                           const DeviceProfileQuery& query);
+
+// Kept for compatibility; returns at most one entry (the most specific match).
 std::vector<const DeviceProfile*> FindMatchingDeviceProfiles(const LoadedDeviceProfiles& loaded_profiles,
                                                             const DeviceProfileQuery& query);
 bool AnyMatchingDeviceProfileHasFamily(const LoadedDeviceProfiles& loaded_profiles,

@@ -19,6 +19,7 @@
 #include "core/IBluetoothBatteryProvider.h"
 #include "core/INoiseControlProvider.h"
 #include "ui/BatteryHistoryStore.h"
+#include "ui/BatteryNotificationController.h"
 #include "ui/BatteryWindowSettings.h"
 
 #ifdef _WIN32
@@ -145,8 +146,7 @@ class BatteryWindow : public QWidget {
     std::vector<std::string> disconnected_device_order_;
     std::string pending_bluetooth_refresh_device_id_;
     std::vector<DeviceBatteryInfo> last_devices_snapshot_;
-    std::unordered_map<std::string, std::uint8_t> last_live_component_levels_;
-    std::unordered_map<std::string, std::int64_t> last_low_battery_alert_ms_;
+    LowBatteryNotifier low_battery_notifier_;
     std::unordered_map<std::string, QPointer<BatteryHistoryDialog>> history_dialogs_;
     std::unordered_map<std::string, QPointer<BatteryStatsDialog>> stats_dialogs_;
     std::unordered_map<std::string, QPointer<DeviceDiagnosticsDialog>> diagnostics_dialogs_;
@@ -155,7 +155,7 @@ class BatteryWindow : public QWidget {
     std::unordered_map<std::string, std::string> runtime_state_key_by_device_;
     std::unordered_map<std::string, std::unordered_map<std::string, qint64>> runtime_deadline_ms_by_component_;
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> runtime_state_key_by_component_;
-    std::thread refresh_worker_;
+    std::jthread refresh_worker_;
     std::atomic<bool> refresh_in_progress_{false};
     bool active_force_live_refresh_ = false;
     std::string active_refresh_target_device_id_;

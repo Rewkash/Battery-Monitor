@@ -38,16 +38,19 @@ void EnsureWindowsBatteryProviderApartmentInitialized();
 WindowsBatteryQueryReaderContext MakeWindowsBatteryQueryReaderContext();
 WindowsBleCandidateBatteryCollectorContext MakeWindowsBleCandidateBatteryCollectorContext(
     const std::string& target_device_id = std::string(),
-    bool force_live_refresh = false);
+    bool force_live_refresh = false,
+    const ProviderOperationContext& operation = {});
 WindowsTwsCandidateBatteryCollectorContext MakeWindowsTwsCandidateBatteryCollectorContext(
     bool include_disconnected,
     const std::string& target_device_id = std::string(),
-    bool force_live_refresh = false);
+    bool force_live_refresh = false,
+    const ProviderOperationContext& operation = {});
 XiaomiControlActionContext MakeWindowsXiaomiControlActionContext();
 
 std::optional<winrt::Windows::Devices::Bluetooth::BluetoothLEDevice> TryOpenBleDeviceByAddress(
     std::uint64_t address,
-    std::chrono::milliseconds timeout);
+    std::chrono::milliseconds timeout,
+    const ProviderOperationContext& operation = {});
 bool DeviceIdMatchesBluetoothTarget(std::string_view device_id, std::string_view target_device_id);
 
 std::optional<ResolvedBluetoothTarget> ResolveConnectedXiaomiControlTarget(

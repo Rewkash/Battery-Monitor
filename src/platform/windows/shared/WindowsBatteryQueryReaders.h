@@ -32,11 +32,14 @@ struct WindowsBatteryQueryReaderContext {
 std::vector<DeviceBatteryInfo> ReadConnectedBluetoothDeviceBatteryFast(
     const WindowsBatteryQueryReaderContext& context,
     std::vector<EndpointCandidate>* tws_candidates,
-    const std::string& target_device_id = std::string());
+    const std::string& target_device_id = std::string(),
+    const ProviderOperationContext& operation = {});
 std::vector<DeviceBatteryInfo> ReadAssociationEndpointBattery(const WindowsBatteryQueryReaderContext& context,
-                                                              std::vector<EndpointCandidate>* tws_candidates,
-                                                              const std::string& target_device_id = std::string());
-std::vector<DeviceBatteryInfo> ReadGenericDeviceBattery(const WindowsBatteryQueryReaderContext& context);
+                                                               std::vector<EndpointCandidate>* tws_candidates,
+                                                               const std::string& target_device_id = std::string(),
+                                                               const ProviderOperationContext& operation = {});
+std::vector<DeviceBatteryInfo> ReadGenericDeviceBattery(const WindowsBatteryQueryReaderContext& context,
+                                                        const ProviderOperationContext& operation = {});
 
 }  // namespace battery_monitor
 

@@ -10,6 +10,7 @@ namespace {
 
 constexpr std::array<std::uint8_t, 3> kXiaomiMessageHeader = {0xFE, 0xDC, 0xBA};
 constexpr std::uint8_t kXiaomiMessageTrailer = 0xEF;
+constexpr std::size_t kMaxXiaomiWirePayloadLength = 256U;
 
 }  // namespace
 
@@ -53,6 +54,9 @@ bool ParseXiaomiMessage(const std::vector<std::uint8_t>& bytes, XiaomiMessage* m
     const auto type = static_cast<XiaomiMessageType>(bytes[3]);
     const bool is_request = IsXiaomiRequestType(type);
     const std::uint16_t payload_length = static_cast<std::uint16_t>((bytes[5] << 8) | bytes[6]);
+    if (payload_length > kMaxXiaomiWirePayloadLength) {
+        return false;
+    }
     const std::size_t expected_size = 8U + payload_length;
     if (bytes.size() != expected_size) {
         return false;
@@ -91,12 +95,12 @@ std::vector<XiaomiMessage> DecodeXiaomiMessages(std::vector<std::uint8_t>* buffe
             continue;
         }
 
-        if (cursor + 7U >= buffer->size()) {
-            break;
-        }
-
         const std::uint16_t payload_length =
             static_cast<std::uint16_t>(((*buffer)[cursor + 5U] << 8) | (*buffer)[cursor + 6U]);
+        if (payload_length > kMaxXiaomiWirePayloadLength) {
+            ++cursor;
+            continue;
+        }
         const std::size_t total_length = 8U + payload_length;
         if (cursor + total_length > buffer->size()) {
             break;
@@ -107,8 +111,10 @@ std::vector<XiaomiMessage> DecodeXiaomiMessages(std::vector<std::uint8_t>* buffe
         XiaomiMessage parsed;
         if (ParseXiaomiMessage(chunk, &parsed)) {
             messages.push_back(std::move(parsed));
+            cursor += total_length;
+        } else {
+            ++cursor;
         }
-        cursor += total_length;
     }
 
     if (cursor > 0U) {

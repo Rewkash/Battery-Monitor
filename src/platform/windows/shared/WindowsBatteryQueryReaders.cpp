@@ -47,14 +47,16 @@ void LogDebug(const WindowsBatteryQueryReaderContext& context, const std::string
 }
 
 template <typename TOperation>
-auto WaitForAsyncResult(TOperation operation, std::chrono::milliseconds timeout)
+auto WaitForAsyncResult(TOperation operation, std::chrono::milliseconds timeout,
+                        const ProviderOperationContext& operation_context = {})
     -> std::optional<decltype(operation.GetResults())> {
     using TResult = decltype(operation.GetResults());
 
     try {
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        const auto deadline = std::chrono::steady_clock::now() + operation_context.Remaining(timeout);
 
-        while (operation.Status() == AsyncStatus::Started && std::chrono::steady_clock::now() < deadline) {
+        while (operation.Status() == AsyncStatus::Started && !operation_context.IsCancelled() &&
+               std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
 
@@ -78,7 +80,8 @@ auto WaitForAsyncResult(TOperation operation, std::chrono::milliseconds timeout)
 std::vector<DeviceBatteryInfo> ReadConnectedBluetoothDeviceBatteryFast(
     const WindowsBatteryQueryReaderContext& context,
     std::vector<EndpointCandidate>* tws_candidates,
-    const std::string& target_device_id) {
+    const std::string& target_device_id,
+    const ProviderOperationContext& operation) {
     std::vector<DeviceBatteryInfo> entries;
     std::unordered_set<std::uint64_t> seen_addresses;
     std::unordered_set<std::string> seen_device_ids;
@@ -140,7 +143,7 @@ std::vector<DeviceBatteryInfo> ReadConnectedBluetoothDeviceBatteryFast(
         DeviceInformation::FindAllAsync(BluetoothDevice::GetDeviceSelectorFromConnectionStatus(BluetoothConnectionStatus::Connected),
                                         requested_properties,
                                         DeviceInformationKind::Device),
-        std::chrono::milliseconds(1800));
+        std::chrono::milliseconds(1800), operation);
     if (!maybe_device_infos.has_value() || !(*maybe_device_infos)) {
         LogDebug(context, "Fast connected-device query failed or timed out.");
         return entries;
@@ -155,6 +158,7 @@ std::vector<DeviceBatteryInfo> ReadConnectedBluetoothDeviceBatteryFast(
     LogDebug(context, "Fast connected-device entries scanned: " + std::to_string(device_infos.Size()));
 
     for (const auto& device_info : device_infos) {
+        if (operation.IsCancelled()) break;
         std::string device_name = ToUtf8(device_info.Name());
         if (device_name.empty()) {
             TryGetStringProperty(device_info, L"System.ItemNameDisplay", &device_name);
@@ -178,7 +182,8 @@ std::vector<DeviceBatteryInfo> ReadConnectedBluetoothDeviceBatteryFast(
         }
         if (!address.has_value()) {
             const auto maybe_bt_device =
-                WaitForAsyncResult(BluetoothDevice::FromIdAsync(device_info.Id()), std::chrono::milliseconds(700));
+                WaitForAsyncResult(BluetoothDevice::FromIdAsync(device_info.Id()), std::chrono::milliseconds(700),
+                                   operation);
             if (maybe_bt_device.has_value() && *maybe_bt_device) {
                 try {
                     const auto bt_address = (*maybe_bt_device).BluetoothAddress();
@@ -305,7 +310,8 @@ std::vector<DeviceBatteryInfo> ReadConnectedBluetoothDeviceBatteryFast(
 
 std::vector<DeviceBatteryInfo> ReadAssociationEndpointBattery(const WindowsBatteryQueryReaderContext& context,
                                                               std::vector<EndpointCandidate>* tws_candidates,
-                                                              const std::string& target_device_id) {
+                                                              const std::string& target_device_id,
+                                                              const ProviderOperationContext& operation) {
     std::vector<DeviceBatteryInfo> endpoint_entries;
     std::unordered_set<std::string> seen_tws_addresses;
 
@@ -327,7 +333,7 @@ OR (System.Devices.Aep.ProtocolId:="{BB7BB05E-5972-42B5-94FC-76EAA7084D49}")))";
     const auto endpoint_infos_operation =
         DeviceInformation::FindAllAsync(kEndpointSelector, requested_properties, DeviceInformationKind::AssociationEndpoint);
     const auto endpoint_infos_result =
-        WaitForAsyncResult(endpoint_infos_operation, std::chrono::milliseconds(3600));
+        WaitForAsyncResult(endpoint_infos_operation, std::chrono::milliseconds(3600), operation);
     if (context.debug_enabled) {
         const auto elapsed_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - query_started_at);
@@ -343,6 +349,7 @@ OR (System.Devices.Aep.ProtocolId:="{BB7BB05E-5972-42B5-94FC-76EAA7084D49}")))";
     LogDebug(context, "AEP entries scanned: " + std::to_string(endpoint_infos.Size()));
 
     for (const auto& endpoint_info : endpoint_infos) {
+        if (operation.IsCancelled()) break;
         if (!IsLikelyBluetoothEndpoint(endpoint_info)) {
             continue;
         }
@@ -434,7 +441,8 @@ OR (System.Devices.Aep.ProtocolId:="{BB7BB05E-5972-42B5-94FC-76EAA7084D49}")))";
     return endpoint_entries;
 }
 
-std::vector<DeviceBatteryInfo> ReadGenericDeviceBattery(const WindowsBatteryQueryReaderContext& context) {
+std::vector<DeviceBatteryInfo> ReadGenericDeviceBattery(const WindowsBatteryQueryReaderContext& context,
+                                                        const ProviderOperationContext& operation) {
     std::vector<DeviceBatteryInfo> entries;
 
     auto requested_properties = winrt::single_threaded_vector<winrt::hstring>();
@@ -449,7 +457,7 @@ std::vector<DeviceBatteryInfo> ReadGenericDeviceBattery(const WindowsBatteryQuer
 
     const auto maybe_devices = WaitForAsyncResult(
         DeviceInformation::FindAllAsync(kDeviceSelector, requested_properties, DeviceInformationKind::Device),
-        std::chrono::milliseconds(2200));
+        std::chrono::milliseconds(2200), operation);
     if (!maybe_devices.has_value() || !(*maybe_devices)) {
         LogDebug(context, "Generic Device query failed or timed out.");
         return entries;
@@ -458,6 +466,7 @@ std::vector<DeviceBatteryInfo> ReadGenericDeviceBattery(const WindowsBatteryQuer
     LogDebug(context, "Generic Device entries scanned: " + std::to_string(devices.Size()));
 
     for (const auto& device : devices) {
+        if (operation.IsCancelled()) break;
         if (!IsLikelyBluetoothDeviceInfo(device)) {
             continue;
         }

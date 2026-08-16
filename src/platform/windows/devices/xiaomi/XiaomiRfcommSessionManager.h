@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "core/INoiseControlProvider.h"
+#include "core/BatteryTypes.h"
 #include "platform/windows/devices/xiaomi/ClassicBluetoothBatteryFallback.h"
 #include "platform/windows/devices/xiaomi/XiaomiBatteryCodec.h"
 #include "platform/windows/devices/xiaomi/XiaomiHandshake.h"
@@ -20,7 +21,8 @@ class XiaomiRfcommSessionManager final {
     XiaomiRfcommSessionManager& operator=(const XiaomiRfcommSessionManager&) = delete;
 
     std::vector<BatteryReading> ReadBattery(std::uint64_t address,
-                                            ClassicBatteryService preferred_service);
+                                             ClassicBatteryService preferred_service,
+                                             const ProviderOperationContext& operation = {});
     bool SetExperimentalNoiseMode(std::uint64_t address,
                                   std::uint8_t mode_value,
                                   std::uint8_t detail_value);

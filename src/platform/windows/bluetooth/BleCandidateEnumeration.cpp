@@ -37,11 +37,13 @@ std::string ToUtf8(const winrt::hstring& value) {
 template <typename TResult>
 std::optional<TResult> WaitForAsyncResult(
     winrt::Windows::Foundation::IAsyncOperation<TResult> operation,
-    std::chrono::milliseconds timeout) {
+    std::chrono::milliseconds timeout,
+    const ProviderOperationContext& operation_context) {
     try {
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        const auto deadline = std::chrono::steady_clock::now() + operation_context.Remaining(timeout);
 
-        while (operation.Status() == AsyncStatus::Started && std::chrono::steady_clock::now() < deadline) {
+        while (operation.Status() == AsyncStatus::Started && !operation_context.IsCancelled() &&
+               std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
 
@@ -64,8 +66,9 @@ void AddCandidatesFromSelector(const winrt::hstring& selector,
                                std::vector<DeviceInformation>* candidates,
                                std::unordered_set<std::string>* known_ids,
                                bool debug_enabled,
-                               BleEnumerationDebugLogFn debug_log) {
-    if (candidates == nullptr || known_ids == nullptr) {
+                               BleEnumerationDebugLogFn debug_log,
+                               const ProviderOperationContext& operation) {
+    if (candidates == nullptr || known_ids == nullptr || operation.IsCancelled()) {
         return;
     }
 
@@ -76,7 +79,7 @@ void AddCandidatesFromSelector(const winrt::hstring& selector,
         AppendBluetoothVisualHintPropertyRequests(requested_properties);
         const auto maybe_device_infos =
             WaitForAsyncResult(DeviceInformation::FindAllAsync(selector, requested_properties),
-                               std::chrono::milliseconds(1800));
+                               std::chrono::milliseconds(1800), operation);
         if (!maybe_device_infos.has_value() || !(*maybe_device_infos)) {
             LogDebug(debug_enabled, debug_log, "Selector scan failed or timed out.");
             return;
@@ -97,7 +100,9 @@ void AddCandidatesFromSelector(const winrt::hstring& selector,
 
 }  // namespace
 
-std::vector<DeviceInformation> EnumerateBleCandidateDevices(bool debug_enabled, BleEnumerationDebugLogFn debug_log) {
+std::vector<DeviceInformation> EnumerateBleCandidateDevices(bool debug_enabled,
+                                                            BleEnumerationDebugLogFn debug_log,
+                                                            const ProviderOperationContext& operation) {
     std::vector<DeviceInformation> candidates;
     std::unordered_set<std::string> known_ids;
 
@@ -107,7 +112,8 @@ std::vector<DeviceInformation> EnumerateBleCandidateDevices(bool debug_enabled, 
             &candidates,
             &known_ids,
             debug_enabled,
-            debug_log);
+            debug_log,
+            operation);
     } catch (const winrt::hresult_error& error) {
         LogDebug(debug_enabled, debug_log,
                  "GetDeviceSelectorFromConnectionStatus failed: HRESULT=0x" +
@@ -118,8 +124,9 @@ std::vector<DeviceInformation> EnumerateBleCandidateDevices(bool debug_enabled, 
         AddCandidatesFromSelector(BluetoothLEDevice::GetDeviceSelectorFromPairingState(true),
                                   &candidates,
                                   &known_ids,
-                                  debug_enabled,
-                                  debug_log);
+                                   debug_enabled,
+                                   debug_log,
+                                   operation);
     } catch (const winrt::hresult_error& error) {
         LogDebug(debug_enabled, debug_log,
                  "GetDeviceSelectorFromPairingState failed: HRESULT=0x" +

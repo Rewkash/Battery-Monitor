@@ -1,5 +1,8 @@
 #include "update/UpdateService.h"
 
+#include <algorithm>
+#include <cstdint>
+
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
@@ -15,6 +18,7 @@
 #include <QSaveFile>
 #include <QStandardPaths>
 #include <QTimer>
+#include <QVariant>
 
 #include "BatteryMonitorVersion.h"
 #include "update/UpdateSecurity.h"
@@ -49,6 +53,29 @@ QString UniqueToken() {
         .arg(random->generate64(), 16, 16, QLatin1Char('0'));
 }
 
+qint64 DeclaredContentLength(QNetworkReply* reply) {
+    const QVariant length = reply->header(QNetworkRequest::ContentLengthHeader);
+    bool ok = false;
+    const qint64 value = length.toLongLong(&ok);
+    return ok && value >= 0 ? value : -1;
+}
+
+// Consumes newly arrived bytes while enforcing a hard transfer cap. Aborts the
+// reply as soon as the declared or received size exceeds the limit so a hostile
+// server cannot exhaust memory with an unbounded response.
+void ReadReplyWithinLimit(QNetworkReply* reply, QByteArray* buffer, qint64 limit, bool* exceeded) {
+    if (DeclaredContentLength(reply) > limit) {
+        *exceeded = true;
+        reply->abort();
+        return;
+    }
+    buffer->append(reply->readAll());
+    if (buffer->size() > static_cast<int>(limit)) {
+        *exceeded = true;
+        reply->abort();
+    }
+}
+
 }  // namespace
 
 UpdateService::UpdateService(QObject* parent)
@@ -60,13 +87,29 @@ void UpdateService::CheckForUpdates(bool user_initiated) {
         return;
     }
     active_reply_ = network_->get(MakeRequest(QUrl(QStringLiteral(BATTERY_MONITOR_UPDATE_MANIFEST_URL))));
-    connect(active_reply_, &QNetworkReply::finished, this, [this, user_initiated]() {
+    auto* buffer = new QByteArray();
+    auto* limit_exceeded = new bool(false);
+    connect(active_reply_, &QNetworkReply::readyRead, this, [this, buffer, limit_exceeded]() {
+        ReadReplyWithinLimit(active_reply_, buffer, kMaximumManifestDownloadBytes, limit_exceeded);
+    });
+    connect(active_reply_, &QNetworkReply::finished, this, [this, user_initiated, buffer, limit_exceeded]() {
         QNetworkReply* reply = active_reply_;
         active_reply_ = nullptr;
-        const QByteArray bytes = reply->readAll();
+        if (!*limit_exceeded) {
+            buffer->append(reply->readAll());
+        }
         const QString error = reply->error() == QNetworkReply::NoError ? QString() : reply->errorString();
         const bool allowed_url = IsAllowedDownloadUrl(reply->url());
         reply->deleteLater();
+        if (*limit_exceeded || buffer->size() > static_cast<int>(kMaximumManifestDownloadBytes)) {
+            delete buffer;
+            delete limit_exceeded;
+            FailCheck(user_initiated, QStringLiteral("Манифест обновления слишком большой."));
+            return;
+        }
+        const QByteArray bytes = *buffer;
+        delete buffer;
+        delete limit_exceeded;
         if (!error.isEmpty() || !allowed_url) {
             FailCheck(user_initiated, allowed_url ? error : QStringLiteral("Недопустимое перенаправление манифеста."));
             return;
@@ -81,13 +124,30 @@ void UpdateService::CheckForUpdates(bool user_initiated) {
 
 void UpdateService::DownloadManifestSignature(const QByteArray& manifest_bytes, bool user_initiated) {
     active_reply_ = network_->get(MakeRequest(QUrl(QStringLiteral(BATTERY_MONITOR_UPDATE_SIGNATURE_URL))));
-    connect(active_reply_, &QNetworkReply::finished, this, [this, manifest_bytes, user_initiated]() {
+    auto* buffer = new QByteArray();
+    auto* limit_exceeded = new bool(false);
+    connect(active_reply_, &QNetworkReply::readyRead, this, [this, buffer, limit_exceeded]() {
+        ReadReplyWithinLimit(active_reply_, buffer, kMaximumSignatureDownloadBytes, limit_exceeded);
+    });
+    connect(active_reply_, &QNetworkReply::finished, this,
+            [this, manifest_bytes, user_initiated, buffer, limit_exceeded]() {
         QNetworkReply* reply = active_reply_;
         active_reply_ = nullptr;
-        const QByteArray signature = reply->readAll();
+        if (!*limit_exceeded) {
+            buffer->append(reply->readAll());
+        }
         const QString error = reply->error() == QNetworkReply::NoError ? QString() : reply->errorString();
         const bool allowed_url = IsAllowedDownloadUrl(reply->url());
         reply->deleteLater();
+        if (*limit_exceeded || buffer->size() > static_cast<int>(kMaximumSignatureDownloadBytes)) {
+            delete buffer;
+            delete limit_exceeded;
+            FailCheck(user_initiated, QStringLiteral("Подпись слишком большая."));
+            return;
+        }
+        const QByteArray signature = *buffer;
+        delete buffer;
+        delete limit_exceeded;
         if (!error.isEmpty() || !allowed_url || signature.size() > 256) {
             FailCheck(user_initiated, !allowed_url ? QStringLiteral("Недопустимое перенаправление подписи.")
                                                    : (signature.size() > 256 ? QStringLiteral("Подпись слишком большая.") : error));
@@ -139,6 +199,10 @@ void UpdateService::DownloadAndInstall(const UpdateManifest& manifest) {
         emit InstallFailed(QStringLiteral("Для MSI-установки в этом выпуске нет MSI-обновления."));
         return;
     }
+    if (artifact.size > kMaximumPackageDownloadBytes) {
+        emit InstallFailed(QStringLiteral("Пакет обновления слишком большой."));
+        return;
+    }
     if (active_reply_ != nullptr || !IsAllowedDownloadUrl(artifact.url) ||
         (msi_install && artifact.format != QStringLiteral("msi")) ||
         (!msi_install && artifact.format != QStringLiteral("bmup-1"))) {
@@ -166,6 +230,11 @@ void UpdateService::DownloadAndInstall(const UpdateManifest& manifest) {
         return;
     }
     connect(active_reply_, &QNetworkReply::readyRead, this, [this, output, artifact]() {
+        if (DeclaredContentLength(active_reply_) >
+            static_cast<qint64>(std::min<std::uint64_t>(artifact.size, kMaximumPackageDownloadBytes))) {
+            active_reply_->abort();
+            return;
+        }
         const QByteArray chunk = active_reply_->readAll();
         if (output->pos() + chunk.size() > static_cast<qint64>(artifact.size) ||
             output->write(chunk) != chunk.size()) {

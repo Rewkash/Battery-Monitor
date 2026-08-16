@@ -25,6 +25,43 @@ struct JsonValue {
     Storage storage = nullptr;
 };
 
+constexpr std::size_t kMaxNestingDepth = 64;
+constexpr std::size_t kMaxJsonFileSize = 16U * 1024U * 1024U;
+
+void AppendUtf8(std::string* output, unsigned int code_point) {
+    if (code_point <= 0x7FU) {
+        output->push_back(static_cast<char>(code_point));
+    } else if (code_point <= 0x7FFU) {
+        output->push_back(static_cast<char>(0xC0U | (code_point >> 6U)));
+        output->push_back(static_cast<char>(0x80U | (code_point & 0x3FU)));
+    } else if (code_point <= 0xFFFFU) {
+        output->push_back(static_cast<char>(0xE0U | (code_point >> 12U)));
+        output->push_back(static_cast<char>(0x80U | ((code_point >> 6U) & 0x3FU)));
+        output->push_back(static_cast<char>(0x80U | (code_point & 0x3FU)));
+    } else {
+        output->push_back(static_cast<char>(0xF0U | (code_point >> 18U)));
+        output->push_back(static_cast<char>(0x80U | ((code_point >> 12U) & 0x3FU)));
+        output->push_back(static_cast<char>(0x80U | ((code_point >> 6U) & 0x3FU)));
+        output->push_back(static_cast<char>(0x80U | (code_point & 0x3FU)));
+    }
+}
+
+class DepthGuard {
+   public:
+    explicit DepthGuard(std::size_t* depth) : depth_(depth) {
+        if (*depth_ >= kMaxNestingDepth) {
+            throw std::runtime_error("maximum JSON nesting depth exceeded");
+        }
+        ++(*depth_);
+    }
+    ~DepthGuard() { --(*depth_); }
+    DepthGuard(const DepthGuard&) = delete;
+    DepthGuard& operator=(const DepthGuard&) = delete;
+
+   private:
+    std::size_t* depth_;
+};
+
 class JsonParser {
    public:
     explicit JsonParser(std::string_view input) : input_(input) {}
@@ -75,6 +112,7 @@ class JsonParser {
     }
 
     JsonObject ParseObject() {
+        DepthGuard guard(&depth_);
         Expect('{');
         SkipWhitespace();
 
@@ -101,6 +139,7 @@ class JsonParser {
     }
 
     JsonArray ParseArray() {
+        DepthGuard guard(&depth_);
         Expect('[');
         SkipWhitespace();
 
@@ -133,6 +172,10 @@ class JsonParser {
             }
 
             if (ch != '\\') {
+                if (static_cast<unsigned char>(ch) >= 0x80U) {
+                    AppendValidatedUtf8Sequence(ch, &result);
+                    continue;
+                }
                 result.push_back(ch);
                 continue;
             }
@@ -164,7 +207,7 @@ class JsonParser {
                     result.push_back('\t');
                     break;
                 case 'u':
-                    SkipUnicodeEscape(&result);
+                    DecodeUnicodeEscape(&result);
                     break;
                 default:
                     throw std::runtime_error("unsupported escape sequence");
@@ -220,18 +263,90 @@ class JsonParser {
         }
     }
 
-    void SkipUnicodeEscape(std::string* output) {
-        if (output == nullptr || position_ + 4 > input_.size()) {
+    unsigned int ParseHex4() {
+        if (position_ + 4 > input_.size()) {
+            throw std::runtime_error("truncated \\u escape");
+        }
+
+        unsigned int value = 0;
+        for (int digit_index = 0; digit_index < 4; ++digit_index) {
+            const char digit = input_[position_++];
+            value <<= 4U;
+            if (digit >= '0' && digit <= '9') {
+                value |= static_cast<unsigned int>(digit - '0');
+            } else if (digit >= 'a' && digit <= 'f') {
+                value |= static_cast<unsigned int>(digit - 'a' + 10);
+            } else if (digit >= 'A' && digit <= 'F') {
+                value |= static_cast<unsigned int>(digit - 'A' + 10);
+            } else {
+                throw std::runtime_error("invalid hex digit in \\u escape");
+            }
+        }
+        return value;
+    }
+
+    void DecodeUnicodeEscape(std::string* output) {
+        if (output == nullptr) {
             throw std::runtime_error("invalid unicode escape");
         }
 
-        const std::string hex = std::string(input_.substr(position_, 4));
-        position_ += 4;
-        const unsigned int code_point = static_cast<unsigned int>(std::stoul(hex, nullptr, 16));
-        if (code_point <= 0x7FU) {
-            output->push_back(static_cast<char>(code_point));
+        unsigned int code_point = ParseHex4();
+        if (code_point >= 0xD800U && code_point <= 0xDBFFU) {
+            // High surrogate: must be followed by a matching low surrogate.
+            if (position_ + 1 >= input_.size() || input_[position_] != '\\' ||
+                input_[position_ + 1] != 'u') {
+                throw std::runtime_error("unpaired high surrogate in \\u escape");
+            }
+            position_ += 2;
+            const unsigned int low_surrogate = ParseHex4();
+            if (low_surrogate < 0xDC00U || low_surrogate > 0xDFFFU) {
+                throw std::runtime_error("invalid low surrogate in \\u escape");
+            }
+            code_point = 0x10000U + ((code_point - 0xD800U) << 10U) + (low_surrogate - 0xDC00U);
+        } else if (code_point >= 0xDC00U && code_point <= 0xDFFFU) {
+            throw std::runtime_error("unpaired low surrogate in \\u escape");
+        }
+
+        AppendUtf8(output, code_point);
+    }
+
+    void AppendValidatedUtf8Sequence(char lead_byte, std::string* output) {
+        const auto lead = static_cast<unsigned char>(lead_byte);
+        unsigned int length = 0;
+        unsigned int code_point = 0;
+        if ((lead & 0xE0U) == 0xC0U) {
+            length = 2;
+            code_point = lead & 0x1FU;
+        } else if ((lead & 0xF0U) == 0xE0U) {
+            length = 3;
+            code_point = lead & 0x0FU;
+        } else if ((lead & 0xF8U) == 0xF0U) {
+            length = 4;
+            code_point = lead & 0x07U;
         } else {
-            output->push_back('?');
+            throw std::runtime_error("invalid UTF-8 lead byte in string");
+        }
+
+        if (position_ + (length - 1) > input_.size()) {
+            throw std::runtime_error("truncated UTF-8 sequence in string");
+        }
+
+        output->push_back(lead_byte);
+        for (unsigned int byte_index = 1; byte_index < length; ++byte_index) {
+            const auto continuation = static_cast<unsigned char>(input_[position_]);
+            if ((continuation & 0xC0U) != 0x80U) {
+                throw std::runtime_error("invalid UTF-8 continuation byte in string");
+            }
+            code_point = (code_point << 6U) | (continuation & 0x3FU);
+            output->push_back(input_[position_++]);
+        }
+
+        const bool overlong = (length == 2 && code_point < 0x80U) ||
+                              (length == 3 && code_point < 0x800U) ||
+                              (length == 4 && code_point < 0x10000U);
+        const bool surrogate = code_point >= 0xD800U && code_point <= 0xDFFFU;
+        if (overlong || surrogate || code_point > 0x10FFFFU) {
+            throw std::runtime_error("invalid UTF-8 code point in string");
         }
     }
 
@@ -254,6 +369,7 @@ class JsonParser {
 
     std::string_view input_;
     std::size_t position_ = 0;
+    std::size_t depth_ = 0;
 };
 
 std::string ToLowerAscii(std::string value) {
@@ -340,6 +456,47 @@ bool ReadBooleanField(const JsonObject& object, std::string_view key, bool fallb
     throw std::runtime_error("field '" + std::string(key) + "' must be a boolean");
 }
 
+bool IsBlank(const std::string& value) {
+    return std::all_of(value.begin(), value.end(),
+                       [](unsigned char ch) { return std::isspace(ch) != 0; });
+}
+
+const std::vector<std::string>& AllowedPlatforms() {
+    static const std::vector<std::string> values = {"any", "windows", "linux", "macos", "android", "ios"};
+    return values;
+}
+
+const std::vector<std::string>& AllowedDeviceCategories() {
+    static const std::vector<std::string> values = {
+        "tws", "headphone", "headset", "earbuds", "speaker", "phone", "tablet",
+        "laptop", "watch", "mouse", "keyboard", "controller", "pen", "other"};
+    return values;
+}
+
+const std::vector<std::string>& AllowedTransports() {
+    static const std::vector<std::string> values = {"rfcomm", "ble", "hid", "usb", "serial", "any"};
+    return values;
+}
+
+void ValidateEnumValue(std::string_view field_name,
+                       const std::string& value,
+                       const std::vector<std::string>& allowed) {
+    if (std::find(allowed.begin(), allowed.end(), value) != allowed.end()) {
+        return;
+    }
+
+    std::string message = "field '" + std::string(field_name) + "' has unsupported value '" + value +
+                          "' (allowed:";
+    for (const auto& candidate : allowed) {
+        message += " " + candidate + ",";
+    }
+    if (!allowed.empty()) {
+        message.pop_back();
+    }
+    message += ")";
+    throw std::runtime_error(message);
+}
+
 DeviceProfileCapability ParseCapability(const JsonObject& object, std::string_view key) {
     DeviceProfileCapability capability;
 
@@ -357,6 +514,18 @@ DeviceProfileCapability ParseCapability(const JsonObject& object, std::string_vi
     capability.reader = ReadStringField(*capability_object, "reader").value_or("");
     capability.transport = ReadStringField(*capability_object, "transport").value_or("");
     capability.strategy = ReadStringField(*capability_object, "strategy").value_or("");
+
+    if (capability.enabled) {
+        if (capability.reader.empty()) {
+            throw std::runtime_error("field '" + std::string(key) +
+                                     ".reader' must be a non-empty string when enabled");
+        }
+        if (!capability.transport.empty()) {
+            ValidateEnumValue(std::string(key) + ".transport", ToLowerAscii(capability.transport),
+                              AllowedTransports());
+        }
+    }
+
     return capability;
 }
 
@@ -378,6 +547,18 @@ DeviceProfileMatch ParseMatch(const JsonObject& object) {
         throw std::runtime_error("field 'match' must contain at least one matcher");
     }
 
+    const auto reject_blank_matchers = [](const std::vector<std::string>& tokens,
+                                          const char* field_name) {
+        for (const auto& token : tokens) {
+            if (IsBlank(token)) {
+                throw std::runtime_error(std::string("field 'match.") + field_name +
+                                         "' must not contain blank entries");
+            }
+        }
+    };
+    reject_blank_matchers(match.name_contains, "nameContains");
+    reject_blank_matchers(match.device_id_contains, "deviceIdContains");
+
     return match;
 }
 
@@ -394,17 +575,19 @@ std::vector<std::string> NormalizeStringVector(const std::vector<std::string>& v
 }
 
 DeviceProfile ParseDeviceProfile(const JsonObject& object, const std::filesystem::path& source_path) {
-    if (const auto* schema_value = FindObjectValue(object, "schemaVersion"); schema_value != nullptr) {
-        const auto* schema_number = AsNumber(*schema_value);
-        if (schema_number == nullptr || static_cast<int>(*schema_number) != 1) {
-            throw std::runtime_error("unsupported schemaVersion; expected 1");
-        }
+    const auto* schema_value = FindObjectValue(object, "schemaVersion");
+    if (schema_value == nullptr) {
+        throw std::runtime_error("field 'schemaVersion' is required and must be the number 1");
+    }
+    const auto* schema_number = AsNumber(*schema_value);
+    if (schema_number == nullptr || static_cast<int>(*schema_number) != 1) {
+        throw std::runtime_error("unsupported schemaVersion; expected 1");
     }
 
     DeviceProfile profile;
     profile.id = ReadStringField(object, "id").value_or("");
-    if (profile.id.empty()) {
-        throw std::runtime_error("field 'id' is required");
+    if (profile.id.empty() || IsBlank(profile.id)) {
+        throw std::runtime_error("field 'id' is required and must be a non-blank string");
     }
 
     profile.display_name = ReadStringField(object, "displayName").value_or(profile.id);
@@ -412,10 +595,16 @@ DeviceProfile ParseDeviceProfile(const JsonObject& object, const std::filesystem
     if (profile.platforms.empty()) {
         profile.platforms = {"any"};
     }
+    for (const auto& platform : profile.platforms) {
+        ValidateEnumValue("platforms", platform, AllowedPlatforms());
+    }
 
     profile.vendor = ToLowerAscii(ReadStringField(object, "vendor").value_or(""));
     profile.family = ToLowerAscii(ReadStringField(object, "family").value_or(""));
     profile.device_categories = NormalizeStringVector(ReadStringArrayField(object, "deviceCategories"));
+    for (const auto& category : profile.device_categories) {
+        ValidateEnumValue("deviceCategories", category, AllowedDeviceCategories());
+    }
     profile.match = ParseMatch(object);
     profile.match.name_contains = NormalizeStringVector(profile.match.name_contains);
     profile.match.device_id_contains = NormalizeStringVector(profile.match.device_id_contains);
@@ -449,21 +638,108 @@ bool ContainsToken(std::string_view haystack, const std::vector<std::string>& to
     });
 }
 
-bool ProfileMatchesQuery(const DeviceProfile& profile, const DeviceProfileQuery& query) {
+bool ProfileMatchesQuery(const DeviceProfile& profile,
+                         const DeviceProfileQuery& query,
+                         const std::string& combined_names,
+                         const std::string& lowered_device_id) {
     if (!ProfileSupportsPlatform(profile, query.platform)) {
         return false;
     }
 
+    const bool name_match =
+        profile.match.name_contains.empty() || ContainsToken(combined_names, profile.match.name_contains);
+    const bool device_id_match =
+        profile.match.device_id_contains.empty() ||
+        ContainsToken(lowered_device_id, profile.match.device_id_contains);
+
+    return name_match && device_id_match;
+}
+
+struct MatchSpecificity {
+    std::size_t device_id_chars = 0;
+    std::size_t name_chars = 0;
+
+    bool operator<(const MatchSpecificity& other) const {
+        if (device_id_chars != other.device_id_chars) {
+            return device_id_chars < other.device_id_chars;
+        }
+        return name_chars < other.name_chars;
+    }
+    bool operator==(const MatchSpecificity& other) const {
+        return device_id_chars == other.device_id_chars && name_chars == other.name_chars;
+    }
+};
+
+std::size_t MatchedTokenChars(std::string_view haystack, const std::vector<std::string>& tokens) {
+    std::size_t total = 0;
+    for (const auto& token : tokens) {
+        if (!token.empty() && haystack.find(token) != std::string_view::npos) {
+            total += token.size();
+        }
+    }
+    return total;
+}
+
+MatchSpecificity ComputeSpecificity(const DeviceProfile& profile,
+                                    const std::string& combined_names,
+                                    const std::string& lowered_device_id) {
+    MatchSpecificity specificity;
+    specificity.device_id_chars = MatchedTokenChars(lowered_device_id, profile.match.device_id_contains);
+    specificity.name_chars = MatchedTokenChars(combined_names, profile.match.name_contains);
+    return specificity;
+}
+
+DeviceProfileSelection SelectBestDeviceProfile(const LoadedDeviceProfiles& loaded_profiles,
+                                               const DeviceProfileQuery& query) {
     const std::string combined_names =
         ToLowerAscii(query.primary_name + " " + query.secondary_name + " " + query.device_id);
     const std::string lowered_device_id = ToLowerAscii(query.device_id);
 
-    const bool name_match =
-        profile.match.name_contains.empty() || ContainsToken(combined_names, profile.match.name_contains);
-    const bool device_id_match =
-        profile.match.device_id_contains.empty() || ContainsToken(lowered_device_id, profile.match.device_id_contains);
+    struct Candidate {
+        const DeviceProfile* profile;
+        MatchSpecificity specificity;
+    };
+    std::vector<Candidate> candidates;
 
-    return name_match && device_id_match;
+    for (const auto& profile : loaded_profiles.profiles) {
+        if (ProfileMatchesQuery(profile, query, combined_names, lowered_device_id)) {
+            candidates.push_back({&profile, ComputeSpecificity(profile, combined_names, lowered_device_id)});
+        }
+    }
+
+    if (candidates.empty()) {
+        return DeviceProfileSelection{};
+    }
+
+    MatchSpecificity best_specificity = candidates.front().specificity;
+    for (const auto& candidate : candidates) {
+        if (best_specificity < candidate.specificity) {
+            best_specificity = candidate.specificity;
+        }
+    }
+
+    const DeviceProfile* best = nullptr;
+    for (const auto& candidate : candidates) {
+        if (!(candidate.specificity == best_specificity)) {
+            continue;
+        }
+        if (best == nullptr || candidate.profile->id < best->id) {
+            best = candidate.profile;
+        }
+    }
+
+    DeviceProfileSelection selection;
+    selection.profile = best;
+    for (const auto& candidate : candidates) {
+        if (candidate.specificity == best_specificity && candidate.profile != best) {
+            selection.notes.push_back(
+                "equal-specificity conflict: profile '" + best->id + "' wins over '" +
+                candidate.profile->id + "' by lexicographic id tie-breaker (both match with " +
+                "deviceIdChars=" + std::to_string(best_specificity.device_id_chars) + ", nameChars=" +
+                std::to_string(best_specificity.name_chars) + ")");
+        }
+    }
+    return selection;
 }
 
 std::filesystem::path ResolveProfilesDirectoryFromSearchRoots() {
@@ -526,6 +802,7 @@ LoadedDeviceProfiles LoadDeviceProfilesFromDirectory(const std::filesystem::path
     }
 
     std::sort(files.begin(), files.end());
+    std::map<std::string, std::filesystem::path> loaded_ids;
     for (const auto& file_path : files) {
         try {
             const auto content = ReadFileUtf8(file_path);
@@ -535,6 +812,10 @@ LoadedDeviceProfiles LoadDeviceProfilesFromDirectory(const std::filesystem::path
                 continue;
             }
 
+            if (content->size() > kMaxJsonFileSize) {
+                throw std::runtime_error("profile file exceeds the maximum supported size");
+            }
+
             JsonParser parser(*content);
             const JsonValue root_value = parser.Parse();
             const auto* root_object = AsObject(root_value);
@@ -542,7 +823,13 @@ LoadedDeviceProfiles LoadDeviceProfilesFromDirectory(const std::filesystem::path
                 throw std::runtime_error("root JSON value must be an object");
             }
 
-            loaded_profiles.profiles.push_back(ParseDeviceProfile(*root_object, file_path));
+            DeviceProfile profile = ParseDeviceProfile(*root_object, file_path);
+            const auto [existing, inserted] = loaded_ids.emplace(profile.id, file_path);
+            if (!inserted) {
+                throw std::runtime_error("duplicate profile id '" + profile.id + "'; already defined in '" +
+                                         existing->second.string() + "'");
+            }
+            loaded_profiles.profiles.push_back(std::move(profile));
         } catch (const std::exception& error) {
             loaded_profiles.warnings.push_back(
                 "Failed to load device profile '" + file_path.string() + "': " + error.what());
@@ -558,13 +845,17 @@ const LoadedDeviceProfiles& GetCachedDeviceProfiles() {
     return loaded_profiles;
 }
 
+DeviceProfileSelection SelectDeviceProfile(const LoadedDeviceProfiles& loaded_profiles,
+                                           const DeviceProfileQuery& query) {
+    return SelectBestDeviceProfile(loaded_profiles, query);
+}
+
 std::vector<const DeviceProfile*> FindMatchingDeviceProfiles(const LoadedDeviceProfiles& loaded_profiles,
                                                             const DeviceProfileQuery& query) {
     std::vector<const DeviceProfile*> matches;
-    for (const auto& profile : loaded_profiles.profiles) {
-        if (ProfileMatchesQuery(profile, query)) {
-            matches.push_back(&profile);
-        }
+    const DeviceProfileSelection selection = SelectBestDeviceProfile(loaded_profiles, query);
+    if (selection.profile != nullptr) {
+        matches.push_back(selection.profile);
     }
     return matches;
 }
@@ -573,26 +864,22 @@ bool AnyMatchingDeviceProfileHasFamily(const LoadedDeviceProfiles& loaded_profil
                                        const DeviceProfileQuery& query,
                                        const std::string& family) {
     const std::string normalized_family = ToLowerAscii(family);
-    return std::any_of(loaded_profiles.profiles.begin(), loaded_profiles.profiles.end(),
-                       [&](const DeviceProfile& profile) {
-                           return profile.family == normalized_family && ProfileMatchesQuery(profile, query);
-                       });
+    const DeviceProfileSelection selection = SelectBestDeviceProfile(loaded_profiles, query);
+    return selection.profile != nullptr && selection.profile->family == normalized_family;
 }
 
 bool AnyMatchingDeviceProfileHasCategory(const LoadedDeviceProfiles& loaded_profiles,
                                          const DeviceProfileQuery& query,
                                          const std::string& category) {
     const std::string normalized_category = ToLowerAscii(category);
-    return std::any_of(loaded_profiles.profiles.begin(), loaded_profiles.profiles.end(),
-                       [&](const DeviceProfile& profile) {
-                           if (!ProfileMatchesQuery(profile, query)) {
-                               return false;
-                           }
+    const DeviceProfileSelection selection = SelectBestDeviceProfile(loaded_profiles, query);
+    if (selection.profile == nullptr) {
+        return false;
+    }
 
-                           return std::find(profile.device_categories.begin(),
-                                            profile.device_categories.end(),
-                                            normalized_category) != profile.device_categories.end();
-                       });
+    return std::find(selection.profile->device_categories.begin(),
+                     selection.profile->device_categories.end(),
+                     normalized_category) != selection.profile->device_categories.end();
 }
 
 }  // namespace battery_monitor

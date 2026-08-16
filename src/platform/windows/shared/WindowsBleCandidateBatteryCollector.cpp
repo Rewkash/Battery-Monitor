@@ -86,11 +86,13 @@ void ForgetEmptyBleCandidate(const std::string& candidate_id) {
 
 template <typename TResult>
 std::optional<TResult> WaitForAsyncResult(winrt::Windows::Foundation::IAsyncOperation<TResult> operation,
-                                          std::chrono::milliseconds timeout) {
+                                          std::chrono::milliseconds timeout,
+                                          const ProviderOperationContext& operation_context) {
     try {
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        const auto deadline = std::chrono::steady_clock::now() + operation_context.Remaining(timeout);
 
-        while (operation.Status() == AsyncStatus::Started && std::chrono::steady_clock::now() < deadline) {
+        while (operation.Status() == AsyncStatus::Started && !operation_context.IsCancelled() &&
+               std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
 
@@ -118,10 +120,15 @@ void CollectBleCandidateBatteryEntries(const WindowsBleCandidateBatteryCollector
         return;
     }
 
-    const auto device_infos = EnumerateBleCandidateDevices(context.debug_enabled, context.debug_log);
+    if (context.operation.IsCancelled()) {
+        return;
+    }
+    const auto device_infos =
+        EnumerateBleCandidateDevices(context.debug_enabled, context.debug_log, context.operation);
     LogDebug(context.debug_log, "BLE candidates from selectors: " + std::to_string(device_infos.size()));
 
     for (const auto& device_info : device_infos) {
+        if (context.operation.IsCancelled()) break;
         try {
             const std::string candidate_id = ToUtf8(device_info.Id());
             if (!context.target_device_id.empty() &&
@@ -141,7 +148,8 @@ void CollectBleCandidateBatteryEntries(const WindowsBleCandidateBatteryCollector
 
             const auto open_started_at = std::chrono::steady_clock::now();
             const auto maybe_ble_device =
-                WaitForAsyncResult(BluetoothLEDevice::FromIdAsync(device_info.Id()), std::chrono::milliseconds(1200));
+                WaitForAsyncResult(BluetoothLEDevice::FromIdAsync(device_info.Id()),
+                                   std::chrono::milliseconds(1200), context.operation);
             if (!maybe_ble_device.has_value() || !(*maybe_ble_device)) {
                 if (context.debug_enabled) {
                     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -209,7 +217,8 @@ void CollectBleCandidateBatteryEntries(const WindowsBleCandidateBatteryCollector
                     ble_device,
                     std::chrono::milliseconds(1600),
                     context.debug_enabled,
-                    context.debug_log);
+                    context.debug_log,
+                    context.operation);
                 if (likely_zmi) {
                     CaptureBleGattLayoutDebugSnapshot(
                         ble_device,
@@ -221,7 +230,7 @@ void CollectBleCandidateBatteryEntries(const WindowsBleCandidateBatteryCollector
             std::vector<BatteryReading> battery_readings;
             if (!likely_xiaomi_tws) {
                 const auto read_started_at = std::chrono::steady_clock::now();
-                battery_readings = ReadBleBatteryReadings(ble_device, likely_tws);
+                battery_readings = ReadBleBatteryReadings(ble_device, likely_tws, context.operation);
                 if (context.debug_enabled) {
                     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - read_started_at);
@@ -248,7 +257,8 @@ void CollectBleCandidateBatteryEntries(const WindowsBleCandidateBatteryCollector
                                                    likely_zmi ? ClassicBatteryService::kZmiPurPodsSerial
                                                               : ClassicBatteryService::kXiaomiDeviceControl,
                                                     context.force_live_refresh,
-                                                   2U);
+                                                    2U,
+                                                    context.operation);
                     if (!classic_result.readings.empty()) {
                         resolved_readings = classic_result.readings;
                         resolved_from_persistent_cache = classic_result.from_persistent_cache;
@@ -260,7 +270,8 @@ void CollectBleCandidateBatteryEntries(const WindowsBleCandidateBatteryCollector
             }
 
             if (resolved_readings.empty()) {
-                const auto fff1_readings = TryReadBleFff1Battery(ble_device, context.debug_enabled, context.debug_log);
+                const auto fff1_readings =
+                    TryReadBleFff1Battery(ble_device, context.debug_enabled, context.debug_log, context.operation);
                 if (!fff1_readings.empty()) {
                     resolved_readings = fff1_readings;
                     resolved_from_persistent_cache = false;
@@ -269,7 +280,8 @@ void CollectBleCandidateBatteryEntries(const WindowsBleCandidateBatteryCollector
             }
 
             if (likely_tws && resolved_readings.size() <= 1U) {
-                const auto vendor_triplet = TryReadBleVendorTripletBattery(ble_device, context.debug_enabled, context.debug_log);
+                const auto vendor_triplet = TryReadBleVendorTripletBattery(
+                    ble_device, context.debug_enabled, context.debug_log, context.operation);
                 if (vendor_triplet.size() >= 2U) {
                     resolved_readings = vendor_triplet;
                     resolved_from_persistent_cache = false;
@@ -279,7 +291,7 @@ void CollectBleCandidateBatteryEntries(const WindowsBleCandidateBatteryCollector
 
             if (likely_xiaomi_tws &&
                 !HasUsefulXiaomiTwsReadings(resolved_readings)) {
-                const auto late_standard_readings = ReadBleBatteryReadings(ble_device, likely_tws);
+                const auto late_standard_readings = ReadBleBatteryReadings(ble_device, likely_tws, context.operation);
                 if (XiaomiReadingsRichnessScore(late_standard_readings) > XiaomiReadingsRichnessScore(resolved_readings)) {
                     resolved_readings = late_standard_readings;
                     resolved_from_persistent_cache = false;

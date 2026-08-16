@@ -2,6 +2,15 @@
 
 Current application version is defined once in the root `CMakeLists.txt`. Windows builds include an optional signed GitHub Releases updater; see [auto-update design](docs/auto-update-design.md) and [release process](docs/release-process.md).
 
+## Product naming
+
+The product uses two distinct names on purpose:
+
+- **Display name: `ChargeView`** — the human-readable name used in UI titles, dialogs, the installer wizard, shortcuts and release communication. Defined as `BATTERY_MONITOR_DISPLAY_NAME` (with `BATTERY_MONITOR_PUBLISHER`) in `CMakeLists.txt`; installer metadata derives its display strings from there.
+- **Internal identity: `BatteryMonitor` / `battery-monitor`** — the stable machine identity: the CMake project name, target names (`battery-monitor`, `battery-monitor-cli`, `battery-monitor-maintenance`), executable and artifact file names (`battery-monitor-vX.Y.Z-win-x64.{msi,zip,bmup}`), the MSI UpgradeCode, registry keys under `Software\Orion Group\Battery Monitor`, and QSettings organization/application names.
+
+The internal identity is frozen. Never rename targets, executables, installer paths, registry keys or settings identifiers: upgrades, the auto-updater and user settings depend on them. Only human-readable strings may follow the display name.
+
 For first-time installation on Windows, download the x64 MSI from [GitHub Releases](https://github.com/Rewkash/Battery-Monitor/releases). The ZIP remains available for portable use, and the `.bmup` asset is used internally by portable automatic updates.
 
 Version and update check:

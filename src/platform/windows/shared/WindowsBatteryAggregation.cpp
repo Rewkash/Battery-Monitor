@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <chrono>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -16,6 +15,7 @@
 #include "platform/windows/shared/BatteryComponentNaming.h"
 #include "platform/windows/devices/phone/BluetoothPnpHints.h"
 #include "platform/windows/shared/BluetoothVisualHintProperties.h"
+#include "platform/windows/shared/WindowsAsyncWait.h"
 #include "platform/windows/shared/WindowsBluetoothAddressUtils.h"
 #include "platform/windows/shared/WindowsDeviceInfoProperties.h"
 #include "platform/windows/devices/xiaomi/XiaomiModeCache.h"
@@ -28,8 +28,6 @@ using winrt::Windows::Devices::Bluetooth::BluetoothDevice;
 using winrt::Windows::Devices::Bluetooth::BluetoothLEDevice;
 using winrt::Windows::Devices::Enumeration::DeviceInformation;
 using winrt::Windows::Devices::Enumeration::DeviceInformationKind;
-using winrt::Windows::Foundation::AsyncStatus;
-using winrt::Windows::Foundation::IAsyncOperation;
 
 std::string ToUtf8(const winrt::hstring& value) {
     return winrt::to_string(value);
@@ -60,30 +58,6 @@ std::string BatteryValueTag(const std::optional<std::uint8_t>& battery_level_per
 std::string MakeEntryKey(const DeviceBatteryInfo& entry) {
     return entry.device_id + "|" + entry.battery_component + "|" + BatteryValueTag(entry.battery_level_percent) +
            "|" + (entry.is_cached ? "cached" : "live");
-}
-
-template <typename TResult>
-std::optional<TResult> WaitForAsyncResult(IAsyncOperation<TResult> operation, std::chrono::milliseconds timeout) {
-    try {
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
-
-        while (operation.Status() == AsyncStatus::Started && std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        }
-
-        if (operation.Status() == AsyncStatus::Started) {
-            operation.Cancel();
-            return std::nullopt;
-        }
-
-        if (operation.Status() != AsyncStatus::Completed) {
-            return std::nullopt;
-        }
-
-        return operation.GetResults();
-    } catch (const winrt::hresult_error&) {
-        return std::nullopt;
-    }
 }
 
 }  // namespace
@@ -180,7 +154,10 @@ std::vector<DeviceBatteryInfo> DeviceBatteryAccumulator::TakeEntries() {
     return std::move(entries_);
 }
 
-DisconnectedPairedCollection CollectDisconnectedPairedBluetoothEntries(bool debug_enabled, XiaomiDebugLogFn debug_log) {
+DisconnectedPairedCollection CollectDisconnectedPairedBluetoothEntries(
+    bool debug_enabled,
+    XiaomiDebugLogFn debug_log,
+    const ProviderOperationContext& operation) {
     DisconnectedPairedCollection result;
     (void)debug_enabled;
 
@@ -192,15 +169,17 @@ DisconnectedPairedCollection CollectDisconnectedPairedBluetoothEntries(bool debu
 
     std::unordered_set<std::string> processed_paired_ids;
     auto collect_paired = [&](const winrt::hstring& selector) {
+        if (operation.IsCancelled()) return;
         const auto maybe_paired_infos = WaitForAsyncResult(
             DeviceInformation::FindAllAsync(selector, requested_properties, DeviceInformationKind::Device),
-            std::chrono::milliseconds(2200));
+            std::chrono::milliseconds(2200), operation);
         if (!maybe_paired_infos.has_value() || !(*maybe_paired_infos)) {
             return;
         }
         result.snapshot.loaded = true;
         const auto paired_infos = *maybe_paired_infos;
         for (const auto& device_info : paired_infos) {
+            if (operation.IsCancelled()) break;
             if (!IsLikelyBluetoothDeviceInfo(device_info)) {
                 continue;
             }
@@ -298,9 +277,17 @@ void ApplyPnpVisualHints(std::vector<DeviceBatteryInfo>* entries) {
     }
 }
 
+int ReadingSourcePriority(const DeviceBatteryInfo& entry) {
+    if (!entry.is_cached) {
+        return 2;  // Live value from a dedicated/vendor or standard BLE reader.
+    }
+    return 1;      // Cached or PnP-queried value.
+}
+
 std::vector<DeviceBatteryInfo> FinalizeCollectedEntries(std::vector<DeviceBatteryInfo> entries,
                                                         bool include_disconnected,
-                                                        const PairedBluetoothSnapshot* paired_snapshot) {
+                                                        const PairedBluetoothSnapshot* paired_snapshot,
+                                                        XiaomiDebugLogFn debug_log) {
     std::unordered_set<std::string> devices_with_real_battery;
     std::unordered_set<std::uint64_t> addresses_with_any_real_battery;
     std::unordered_set<std::string> devices_with_tws_components;
@@ -388,7 +375,19 @@ std::vector<DeviceBatteryInfo> FinalizeCollectedEntries(std::vector<DeviceBatter
         const auto dedup_it = final_dedup.find(key);
         if (dedup_it != final_dedup.end()) {
             auto& existing = filtered_entries[dedup_it->second];
-            if (!existing.is_cached && entry.is_cached) {
+            const int existing_priority = ReadingSourcePriority(existing);
+            const int incoming_priority = ReadingSourcePriority(entry);
+            if (existing.battery_level_percent != entry.battery_level_percent) {
+                LogDebug(debug_log,
+                         "Battery value conflict component='" + normalized_component + "' id='" +
+                             entry.device_id + "' kept=" + BatteryValueTag(existing.battery_level_percent) +
+                             " (priority " + std::to_string(existing_priority) + ") dropped=" +
+                             BatteryValueTag(entry.battery_level_percent) + " (priority " +
+                             std::to_string(incoming_priority) + ")");
+            }
+            // First writer for a key is the highest-priority source (stage order above);
+            // equal or lower-priority duplicates only enrich metadata, never the value.
+            if (existing_priority >= incoming_priority) {
                 existing.is_connected = existing.is_connected || entry.is_connected;
                 if (!existing.device_mode.has_value()) {
                     existing.device_mode = entry.device_mode;

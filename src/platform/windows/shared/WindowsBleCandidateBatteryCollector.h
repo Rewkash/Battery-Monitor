@@ -2,6 +2,7 @@
 
 #include <string>
 
+#include "core/BatteryTypes.h"
 #include "platform/windows/shared/WindowsBatteryAggregation.h"
 #include "platform/windows/devices/xiaomi/XiaomiBatteryCaches.h"
 
@@ -14,6 +15,7 @@ struct WindowsBleCandidateBatteryCollectorContext {
     XiaomiDebugLogFn debug_log = nullptr;
     std::string target_device_id;
     bool force_live_refresh = false;
+    ProviderOperationContext operation;
     DeviceBatteryHeuristicFn is_likely_tws_device = nullptr;
     DeviceBatteryHeuristicFn is_likely_xiaomi_earbuds = nullptr;
     DeviceBatteryHeuristicFn should_aggressive_xiaomi_classic_retry = nullptr;

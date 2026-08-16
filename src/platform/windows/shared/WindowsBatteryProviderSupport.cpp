@@ -473,13 +473,15 @@ WindowsBatteryQueryReaderContext MakeWindowsBatteryQueryReaderContext() {
 
 WindowsBleCandidateBatteryCollectorContext MakeWindowsBleCandidateBatteryCollectorContext(
     const std::string& target_device_id,
-    bool force_live_refresh) {
+    bool force_live_refresh,
+    const ProviderOperationContext& operation) {
     const auto& runtime_options = GetWindowsBatteryProviderRuntimeOptions();
     return WindowsBleCandidateBatteryCollectorContext{
         .debug_enabled = runtime_options.debug_enabled,
         .debug_log = &WindowsBatteryProviderDebugLog,
         .target_device_id = target_device_id,
         .force_live_refresh = force_live_refresh,
+        .operation = operation,
         .is_likely_tws_device = &IsLikelyTwsDevice,
         .is_likely_xiaomi_earbuds = &IsLikelyXiaomiEarbuds,
         .should_aggressive_xiaomi_classic_retry = &ShouldAggressiveXiaomiClassicRetry,
@@ -489,7 +491,8 @@ WindowsBleCandidateBatteryCollectorContext MakeWindowsBleCandidateBatteryCollect
 WindowsTwsCandidateBatteryCollectorContext MakeWindowsTwsCandidateBatteryCollectorContext(
     bool include_disconnected,
     const std::string& target_device_id,
-    bool force_live_refresh) {
+    bool force_live_refresh,
+    const ProviderOperationContext& operation) {
     const auto& runtime_options = GetWindowsBatteryProviderRuntimeOptions();
     return WindowsTwsCandidateBatteryCollectorContext{
         .debug_enabled = runtime_options.debug_enabled,
@@ -498,6 +501,7 @@ WindowsTwsCandidateBatteryCollectorContext MakeWindowsTwsCandidateBatteryCollect
         .target_device_id = target_device_id,
         .force_live_refresh = force_live_refresh,
         .force_aep_scan = runtime_options.force_aep_scan,
+        .operation = operation,
         .is_likely_xiaomi_earbuds = &IsLikelyXiaomiEarbuds,
         .should_aggressive_xiaomi_classic_retry = &ShouldAggressiveXiaomiClassicRetry,
         .open_ble_device_by_address = &TryOpenBleDeviceByAddress,
@@ -513,12 +517,14 @@ XiaomiControlActionContext MakeWindowsXiaomiControlActionContext() {
 }
 
 std::optional<BluetoothLEDevice> TryOpenBleDeviceByAddress(std::uint64_t address,
-                                                           std::chrono::milliseconds timeout) {
-    auto wait_for_operation = [timeout](auto operation) -> std::optional<BluetoothLEDevice> {
+                                                           std::chrono::milliseconds timeout,
+                                                           const ProviderOperationContext& operation_context) {
+    auto wait_for_operation = [timeout, &operation_context](auto operation) -> std::optional<BluetoothLEDevice> {
         try {
-            const auto deadline = std::chrono::steady_clock::now() + timeout;
+            const auto deadline = std::chrono::steady_clock::now() + operation_context.Remaining(timeout);
 
             while (operation.Status() == AsyncStatus::Started &&
+                   !operation_context.IsCancelled() &&
                    std::chrono::steady_clock::now() < deadline) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
@@ -546,17 +552,20 @@ std::optional<BluetoothLEDevice> TryOpenBleDeviceByAddress(std::uint64_t address
         }
     };
 
+    if (operation_context.IsCancelled()) return std::nullopt;
     if (const auto device = wait_for_operation(BluetoothLEDevice::FromBluetoothAddressAsync(address));
         device.has_value()) {
         return device;
     }
 
+    if (operation_context.IsCancelled()) return std::nullopt;
     if (const auto device =
             wait_for_operation(BluetoothLEDevice::FromBluetoothAddressAsync(address, BluetoothAddressType::Public));
         device.has_value()) {
         return device;
     }
 
+    if (operation_context.IsCancelled()) return std::nullopt;
     if (const auto device =
             wait_for_operation(BluetoothLEDevice::FromBluetoothAddressAsync(address, BluetoothAddressType::Random));
         device.has_value()) {

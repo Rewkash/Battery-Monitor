@@ -155,10 +155,11 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
 
     std::vector<EndpointCandidate> tws_candidates;
     const auto fast_connected_entries = ReadConnectedBluetoothDeviceBatteryFast(
-        query_reader_context, &tws_candidates, context.target_device_id);
+        query_reader_context, &tws_candidates, context.target_device_id, context.operation);
 
     const bool targeted = !context.target_device_id.empty();
     for (const auto& fast_entry : fast_connected_entries) {
+        if (context.operation.IsCancelled()) break;
         if (targeted && !DeviceIdMatchesBluetoothTarget(fast_entry.device_id, context.target_device_id)) {
             continue;
         }
@@ -187,7 +188,7 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
     if (should_scan_aep) {
         std::vector<EndpointCandidate> aep_tws_candidates;
         const auto endpoint_entries = ReadAssociationEndpointBattery(
-            query_reader_context, &aep_tws_candidates, context.target_device_id);
+            query_reader_context, &aep_tws_candidates, context.target_device_id, context.operation);
         LogDebug(context.debug_log, "AEP battery entries: " + std::to_string(endpoint_entries.size()));
         LogDebug(context.debug_log, "AEP TWS candidates: " + std::to_string(aep_tws_candidates.size()));
 
@@ -201,6 +202,7 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
     }
 
     for (const auto& candidate : tws_candidates) {
+        if (context.operation.IsCancelled()) break;
         if (!candidate.is_connected) {
             if (context.include_disconnected) {
                 AddOfflineCandidateEntry(accumulator, candidate);
@@ -228,7 +230,8 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
                 xiaomi_classic_cache->Read(candidate.bluetooth_address,
                                            classic_service,
                                            force_classic_refresh,
-                                           2U);
+                                           2U,
+                                           context.operation);
             if (!classic_result.readings.empty()) {
                 if (!classic_result.from_persistent_cache &&
                     XiaomiResolvedTwsComponentCount(classic_result.readings) >= 1U) {
@@ -273,7 +276,8 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
         }
 
         const auto maybe_ble_device =
-            context.open_ble_device_by_address(candidate.bluetooth_address, std::chrono::milliseconds(1200));
+            context.open_ble_device_by_address(candidate.bluetooth_address, std::chrono::milliseconds(1200),
+                                               context.operation);
         if (!maybe_ble_device.has_value()) {
             if (context.debug_enabled && ShouldTraceCandidate(candidate)) {
                 LogDebug(context.debug_log,
@@ -302,7 +306,7 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
 
         std::vector<BatteryReading> resolved_readings;
         if (!likely_xiaomi_tws) {
-            resolved_readings = ReadBleBatteryReadings(ble_device, true);
+            resolved_readings = ReadBleBatteryReadings(ble_device, true, context.operation);
         } else {
             LogDebug(context.debug_log, "AEP candidate: Xiaomi-family TWS, skip standard battery service read");
         }
@@ -314,7 +318,8 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
                 xiaomi_classic_cache->Read(candidate.bluetooth_address,
                                            classic_service,
                                            force_classic_refresh,
-                                           2U);
+                                           2U,
+                                           context.operation);
             if (!classic_result.readings.empty()) {
                 resolved_readings = classic_result.readings;
                 resolved_from_persistent_cache = classic_result.from_persistent_cache;
@@ -322,7 +327,8 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
         }
 
         if (resolved_readings.empty()) {
-            const auto fff1_readings = TryReadBleFff1Battery(ble_device, context.debug_enabled, context.debug_log);
+            const auto fff1_readings =
+                TryReadBleFff1Battery(ble_device, context.debug_enabled, context.debug_log, context.operation);
             if (!fff1_readings.empty()) {
                 resolved_readings = fff1_readings;
                 resolved_from_persistent_cache = false;
@@ -333,7 +339,8 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
 
         if (resolved_readings.size() <= 1U) {
             const auto vendor_triplet =
-                TryReadBleVendorTripletBattery(ble_device, context.debug_enabled, context.debug_log);
+                TryReadBleVendorTripletBattery(ble_device, context.debug_enabled, context.debug_log,
+                                               context.operation);
             if (vendor_triplet.size() >= 2U) {
                 resolved_readings = vendor_triplet;
                 resolved_from_persistent_cache = false;
@@ -352,7 +359,7 @@ void CollectTwsCandidateBatteryEntries(const WindowsTwsCandidateBatteryCollector
 
         if (should_try_classic_for_candidate &&
             !HasUsefulXiaomiTwsReadings(resolved_readings)) {
-            const auto late_standard_readings = ReadBleBatteryReadings(ble_device, true);
+            const auto late_standard_readings = ReadBleBatteryReadings(ble_device, true, context.operation);
             if (XiaomiReadingsRichnessScore(late_standard_readings) >
                 XiaomiReadingsRichnessScore(resolved_readings)) {
                 resolved_readings = late_standard_readings;

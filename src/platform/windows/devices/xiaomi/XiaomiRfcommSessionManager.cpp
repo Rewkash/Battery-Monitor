@@ -79,12 +79,21 @@ class XiaomiRfcommSessionManager::Session final {
 
     ~Session() { Stop(); }
 
-    std::vector<BatteryReading> ReadBattery(ClassicBatteryService preferred_service) {
+    std::vector<BatteryReading> ReadBattery(ClassicBatteryService preferred_service,
+                                            const ProviderOperationContext& operation) {
+        if (operation.IsCancelled()) return {};
         auto request = MakeRequest(RequestKind::kBattery);
         request->preferred_service = preferred_service;
         auto future = request->completion.get_future();
-        return Enqueue(request) ? std::get<std::vector<BatteryReading>>(future.get())
-                                : std::vector<BatteryReading>{};
+        if (!Enqueue(request)) return {};
+        while (!operation.IsCancelled()) {
+            const auto wait = operation.Remaining(std::chrono::milliseconds(50));
+            if (wait <= std::chrono::milliseconds::zero()) break;
+            if (future.wait_for(wait) == std::future_status::ready) {
+                return std::get<std::vector<BatteryReading>>(future.get());
+            }
+        }
+        return {};
     }
 
     bool SetExperimentalNoiseMode(std::uint8_t mode_value, std::uint8_t detail_value) {
@@ -241,7 +250,7 @@ class XiaomiRfcommSessionManager::Session final {
         if (battery == nullptr || message.payload.empty()) return;
         if (message.opcode == XiaomiOpcode::kGetDeviceInfo) {
             const auto snapshot = ExtractBatterySnapshotFromXiaomiPayload(
-                message.payload, std::optional<std::uint8_t>{0x07U}, debug_enabled_, debug_log_);
+                message.payload, std::optional<std::uint8_t>{std::uint8_t{0x07}}, debug_enabled_, debug_log_);
             if (snapshot.has_value()) {
                 battery->device_info = snapshot;
                 battery->device_info_received_at = Clock::now();
@@ -249,7 +258,7 @@ class XiaomiRfcommSessionManager::Session final {
         } else if (message.opcode == XiaomiOpcode::kReportStatus) {
             battery->report_status_seen_at = Clock::now();
             const auto snapshot = ExtractBatterySnapshotFromXiaomiPayload(
-                message.payload, std::optional<std::uint8_t>{0x00U}, debug_enabled_, debug_log_);
+                message.payload, std::optional<std::uint8_t>{std::uint8_t{0x00}}, debug_enabled_, debug_log_);
             if (snapshot.has_value()) battery->status = snapshot;
         }
     }
@@ -496,9 +505,11 @@ std::shared_ptr<XiaomiRfcommSessionManager::Session> XiaomiRfcommSessionManager:
 }
 
 std::vector<BatteryReading> XiaomiRfcommSessionManager::ReadBattery(std::uint64_t address,
-                                                                    ClassicBatteryService preferred_service) {
+                                                                     ClassicBatteryService preferred_service,
+                                                                     const ProviderOperationContext& operation) {
     const auto session = GetOrCreateSession(address);
-    return session != nullptr ? session->ReadBattery(preferred_service) : std::vector<BatteryReading>{};
+    return session != nullptr ? session->ReadBattery(preferred_service, operation)
+                              : std::vector<BatteryReading>{};
 }
 
 bool XiaomiRfcommSessionManager::SetExperimentalNoiseMode(std::uint64_t address, std::uint8_t mode_value,

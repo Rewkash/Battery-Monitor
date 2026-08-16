@@ -1,5 +1,6 @@
 #include "app/BatteryOutputFormatter.h"
 
+#include <iomanip>
 #include <sstream>
 #include <string>
 
@@ -32,9 +33,18 @@ std::string EscapeJson(const std::string& input) {
             case '\t':
                 escaped << "\\t";
                 break;
-            default:
-                escaped << ch;
+            default: {
+                const auto byte = static_cast<unsigned char>(ch);
+                // Remaining control characters must not appear raw in JSON
+                // strings; UTF-8 continuation bytes (>= 0x80) pass through.
+                if (byte < 0x20) {
+                    escaped << "\\u00" << std::hex << std::setw(2) << std::setfill('0')
+                            << static_cast<int>(byte) << std::dec;
+                } else {
+                    escaped << ch;
+                }
                 break;
+            }
         }
     }
     return escaped.str();

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <unordered_set>
 
+#include <QDebug>
 #include <QSettings>
 #include <QString>
 #include <QStringList>
@@ -17,6 +18,9 @@ constexpr const char* kSettingsDisconnectedOrderKey = "disconnected_order";
 constexpr const char* kSettingsRefreshIntervalMsKey = "refresh_interval_ms";
 constexpr const char* kSettingsLowBatteryThresholdPercentKey = "low_battery_threshold_percent";
 constexpr const char* kSettingsLowBatteryRepeatMinutesKey = "low_battery_repeat_minutes";
+// Upper bound for restored device-order lists so a corrupted or hostile
+// settings file cannot grow memory without limit.
+constexpr int kMaxStoredOrderEntries = 4096;
 
 QSettings CreateUiSettings() {
     return QSettings(
@@ -33,9 +37,12 @@ std::vector<std::string> ReadOrderFromSettings(QSettings* settings, const char* 
 
     const QStringList saved_values = settings->value(QString::fromLatin1(key)).toStringList();
     std::vector<std::string> order;
-    order.reserve(static_cast<std::size_t>(saved_values.size()));
+    order.reserve(static_cast<std::size_t>(std::min(saved_values.size(), qsizetype(kMaxStoredOrderEntries))));
     std::unordered_set<std::string> seen;
     for (const auto& value : saved_values) {
+        if (static_cast<int>(order.size()) >= kMaxStoredOrderEntries) {
+            break;
+        }
         const std::string device_id = value.toUtf8().toStdString();
         if (device_id.empty() || !seen.emplace(device_id).second) {
             continue;
@@ -101,6 +108,12 @@ BatteryWindowPersistedState LoadBatteryWindowPersistedState() {
     state.connected_device_order = ReadOrderFromSettings(&settings, kSettingsConnectedOrderKey);
     state.disconnected_device_order = ReadOrderFromSettings(&settings, kSettingsDisconnectedOrderKey);
     settings.endGroup();
+    if (settings.status() == QSettings::FormatError) {
+        // QSettings already falls back to defaults for unreadable entries;
+        // surface the damaged file instead of resetting silently.
+        qWarning() << "Battery Monitor UI settings file is corrupted, using defaults:"
+                   << settings.fileName();
+    }
     return state;
 }
 

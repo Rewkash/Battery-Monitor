@@ -98,3 +98,6 @@ debug*.log
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Local agent/tool state
+/.serena/

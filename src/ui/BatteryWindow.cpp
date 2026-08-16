@@ -1,5 +1,6 @@
 #include "ui/BatteryWindow.h"
 #include "ui/BatteryHistoryDialog.h"
+#include "ui/BatteryNotificationController.h"
 #include "ui/BatteryRuntimeEstimator.h"
 #include "ui/NoiseControlUi.h"
 #include "ui/BatteryStatsDialog.h"
@@ -91,6 +92,8 @@
 namespace battery_monitor {
 
 namespace {
+
+constexpr auto kProviderRefreshTimeout = std::chrono::seconds(15);
 
 bool UiDebugEnabled() {
     const QByteArray value = qgetenv("BATTERY_MONITOR_DEBUG");
@@ -2454,11 +2457,8 @@ BatteryWindow::~BatteryWindow() {
     quitting_ = true;
     StopBluetoothDeviceWatcher();
     if (refresh_worker_.joinable()) {
-        if (refresh_worker_.get_id() == std::this_thread::get_id()) {
-            refresh_worker_.detach();
-        } else {
-            refresh_worker_.join();
-        }
+        refresh_worker_.request_stop();
+        refresh_worker_.join();
     }
 }
 
@@ -2733,91 +2733,70 @@ void BatteryWindow::UpdateTrayTooltip(const std::vector<DeviceBatteryInfo>& devi
 }
 
 void BatteryWindow::NotifyLowBatteryIfNeeded(const std::vector<DeviceBatteryInfo>& devices) {
-    std::unordered_map<std::string, LowBatteryDeviceState> device_states;
-    const std::uint8_t threshold_percent =
-        static_cast<std::uint8_t>(
-            ClampBatteryWindowLowBatteryThresholdPercent(low_battery_threshold_percent_));
-    const std::int64_t repeat_interval_ms =
-        static_cast<std::int64_t>(
-            ClampBatteryWindowLowBatteryRepeatMinutes(low_battery_repeat_minutes_)) *
-        60LL * 1000LL;
-    const std::int64_t now_ms = QDateTime::currentMSecsSinceEpoch();
+    low_battery_notifier_.SetThresholdPercent(
+        ClampBatteryWindowLowBatteryThresholdPercent(low_battery_threshold_percent_));
+    low_battery_notifier_.SetRepeatIntervalMinutes(
+        ClampBatteryWindowLowBatteryRepeatMinutes(low_battery_repeat_minutes_));
 
+    // Group readings per physical device (e.g. left/right/case components of
+    // the same headset) so suppression is tracked per device, not per
+    // component, avoiding simultaneous duplicate notifications.
+    std::vector<LowBatteryDeviceSnapshot> snapshots;
+    std::unordered_map<std::string, std::size_t> snapshot_index_by_key;
     for (const auto& entry : devices) {
+        const std::string device_key = DeviceGroupingKey(entry.device_id);
+        auto index_it = snapshot_index_by_key.find(device_key);
+        if (index_it == snapshot_index_by_key.end()) {
+            LowBatteryDeviceSnapshot snapshot;
+            snapshot.device_key = device_key;
+            snapshot.device_name = entry.device_name;
+            snapshots.push_back(std::move(snapshot));
+            index_it = snapshot_index_by_key.emplace(device_key, snapshots.size() - 1).first;
+        }
+
+        LowBatteryDeviceSnapshot& snapshot = snapshots[index_it->second];
+        snapshot.connected = snapshot.connected || entry.is_connected;
+
+        if (!entry.is_connected || entry.is_cached || !entry.battery_level_percent.has_value()) {
+            continue;
+        }
+
         const std::string component = NormalizeComponentName(entry.battery_component);
-        const std::string key = entry.device_id + "|" + component;
-        if (!entry.is_connected) {
-            last_live_component_levels_.erase(key);
-            last_low_battery_alert_ms_.erase(key);
-            continue;
-        }
-        if (entry.is_cached || !entry.battery_level_percent.has_value()) {
-            continue;
-        }
-        const std::uint8_t current_level = *entry.battery_level_percent;
-        const auto previous_it = last_live_component_levels_.find(key);
-        const bool is_below_threshold = current_level < threshold_percent;
-        bool should_alert = false;
-        if (is_below_threshold) {
-            if (previous_it == last_live_component_levels_.end() || previous_it->second >= threshold_percent) {
-                should_alert = true;
-            } else {
-                const auto alert_it = last_low_battery_alert_ms_.find(key);
-                should_alert = (alert_it == last_low_battery_alert_ms_.end()) ||
-                               (now_ms - alert_it->second >= repeat_interval_ms);
-            }
-        } else {
-            last_low_battery_alert_ms_.erase(key);
-        }
-        last_live_component_levels_[key] = current_level;
-        if (!should_alert) {
-            // keep component state for contextual line2 formatting
-        } else {
-            last_low_battery_alert_ms_[key] = now_ms;
-        }
-
-        auto& device_state = device_states[entry.device_id];
-        if (device_state.device_name.isEmpty()) {
-            device_state.device_name = ToQString(entry.device_name);
-        }
-
-        auto component_it = std::find_if(device_state.components.begin(),
-                                         device_state.components.end(),
-                                         [&](const LowBatteryComponentState& state) {
-                                             return state.component == component;
-                                         });
-        if (component_it == device_state.components.end()) {
-            device_state.components.push_back(
-                LowBatteryComponentState{component, current_level, is_below_threshold, should_alert});
-        } else {
-            component_it->level = current_level;
-            component_it->below_threshold = is_below_threshold;
-            component_it->triggered = component_it->triggered || should_alert;
-        }
-    }
-
-    std::vector<LowBatteryNotificationText> notifications;
-    notifications.reserve(device_states.size());
-    for (const auto& [device_id, state] : device_states) {
-        Q_UNUSED(device_id);
-        const bool has_triggered = std::any_of(state.components.begin(), state.components.end(),
-                                               [](const LowBatteryComponentState& component) {
-                                                   return component.triggered;
+        auto& components = snapshot.live_components;
+        const auto duplicate_it = std::find_if(components.begin(), components.end(),
+                                               [&](const LowBatteryComponentReading& reading) {
+                                                   return reading.component == component;
                                                });
-        if (!has_triggered) {
-            continue;
+        if (duplicate_it == components.end()) {
+            components.push_back(LowBatteryComponentReading{component, *entry.battery_level_percent});
+        } else {
+            duplicate_it->level_percent = *entry.battery_level_percent;
         }
-        notifications.push_back(FormatLowBatteryNotification(state));
     }
 
-    if (notifications.empty()) {
+    const std::vector<LowBatteryAlert> alerts =
+        low_battery_notifier_.Evaluate(snapshots, QDateTime::currentMSecsSinceEpoch());
+    if (alerts.empty()) {
         return;
     }
 
-    std::sort(notifications.begin(), notifications.end(),
-              [](const LowBatteryNotificationText& lhs, const LowBatteryNotificationText& rhs) {
-                  return lhs.critical_level < rhs.critical_level;
-              });
+    std::vector<LowBatteryNotificationText> notifications;
+    notifications.reserve(alerts.size());
+    for (const auto& alert : alerts) {
+        LowBatteryDeviceState device_state;
+        device_state.device_name = ToQString(alert.device_name);
+        for (const auto& reading : alert.components) {
+            const bool triggered = std::find(alert.triggered_components.begin(),
+                                             alert.triggered_components.end(),
+                                             reading.component) != alert.triggered_components.end();
+            device_state.components.push_back(LowBatteryComponentState{
+                reading.component, reading.level_percent,
+                static_cast<int>(reading.level_percent) <=
+                        low_battery_notifier_.threshold_percent(),
+                triggered});
+        }
+        notifications.push_back(FormatLowBatteryNotification(device_state));
+    }
 
     QApplication::beep();
 
@@ -3053,8 +3032,7 @@ void BatteryWindow::ApplyLowBatteryThresholdPercent(int percent, bool announce_s
 
     if (threshold_changed) {
         // Re-arm edge-detection for the new threshold and evaluate current snapshot once.
-        last_live_component_levels_.clear();
-        last_low_battery_alert_ms_.clear();
+        low_battery_notifier_.ResetAll();
         if (!last_devices_snapshot_.empty()) {
             NotifyLowBatteryIfNeeded(last_devices_snapshot_);
         }
@@ -3368,6 +3346,7 @@ void BatteryWindow::RefreshBatteryDataForDevice(const std::string& device_id, bo
     }
 
     if (refresh_worker_.joinable()) {
+        refresh_worker_.request_stop();
         refresh_worker_.join();
     }
     refresh_in_progress_.store(true, std::memory_order_release);
@@ -3378,13 +3357,15 @@ void BatteryWindow::RefreshBatteryDataForDevice(const std::string& device_id, bo
     show_all_button_->setEnabled(false);
     status_label_->setText(QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435..."));
 
-    refresh_worker_ = std::thread([this, device_id, force_live_refresh, refresh_id]() {
+    refresh_worker_ = std::jthread([this, device_id, force_live_refresh, refresh_id](std::stop_token stop_token) {
         RefreshTaskResult result;
         try {
             BatteryQueryOptions query_options;
             query_options.include_disconnected = false;
             query_options.force_live_refresh = force_live_refresh;
             query_options.target_device_id = device_id;
+            query_options.operation.stop_token = stop_token;
+            query_options.operation.deadline = ProviderOperationContext::Clock::now() + kProviderRefreshTimeout;
             UiDebugLog("refresh#" + std::to_string(refresh_id) +
                        " provider query targeted include_disconnected=false target='" + device_id + "'");
             result.devices = provider_->GetDevicesBattery(query_options);
@@ -3443,8 +3424,11 @@ void BatteryWindow::RefreshBatteryDataForDevice(const std::string& device_id, bo
                             }),
                         merged_devices.end());
                     merged_devices.insert(merged_devices.end(), result.devices.begin(), result.devices.end());
-                    NotifyLowBatteryIfNeeded(result.devices);
-                    RecordBatteryHistory(result.devices);
+                    // merged_devices is the complete device snapshot; the fresh
+                    // result only covers the target device, and the notifier /
+                    // history store now treat absent devices as disconnected.
+                    NotifyLowBatteryIfNeeded(merged_devices);
+                    RecordBatteryHistory(merged_devices);
                     last_devices_snapshot_ = std::move(merged_devices);
                     UiDebugLogDevices("refresh#" + std::to_string(refresh_id) + " snapshot after targeted merge",
                                       last_devices_snapshot_);
@@ -3497,6 +3481,7 @@ void BatteryWindow::ApplyNoiseControlMode(const std::string& device_id, NoiseCon
     }
 
     if (refresh_worker_.joinable()) {
+        refresh_worker_.request_stop();
         refresh_worker_.join();
     }
     refresh_in_progress_.store(true, std::memory_order_release);
@@ -3505,7 +3490,7 @@ void BatteryWindow::ApplyNoiseControlMode(const std::string& device_id, NoiseCon
     status_label_->setText(QString::fromUtf8(u8"\u041F\u0435\u0440\u0435\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435 "
                                              u8"\u0440\u0435\u0436\u0438\u043C\u0430..."));
 
-    refresh_worker_ = std::thread([this, device_id, mode]() {
+    refresh_worker_ = std::jthread([this, device_id, mode](std::stop_token) {
         bool ok = false;
         std::string error_text;
         try {
@@ -3565,6 +3550,7 @@ void BatteryWindow::ApplyNoiseSubmode(const std::string& device_id,
     }
 
     if (refresh_worker_.joinable()) {
+        refresh_worker_.request_stop();
         refresh_worker_.join();
     }
     refresh_in_progress_.store(true, std::memory_order_release);
@@ -3573,7 +3559,7 @@ void BatteryWindow::ApplyNoiseSubmode(const std::string& device_id,
     status_label_->setText(QString::fromUtf8(u8"\u041F\u0435\u0440\u0435\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435 "
                                              u8"\u043F\u043E\u0434\u0440\u0435\u0436\u0438\u043C\u0430..."));
 
-    refresh_worker_ = std::thread([this, device_id, mode, submode_id]() {
+    refresh_worker_ = std::jthread([this, device_id, mode, submode_id](std::stop_token) {
         bool ok = false;
         std::string error_text;
         try {
@@ -3690,6 +3676,7 @@ void BatteryWindow::RefreshBatteryData(bool include_disconnected,
     }
 
     if (refresh_worker_.joinable()) {
+        refresh_worker_.request_stop();
         refresh_worker_.join();
     }
     refresh_in_progress_.store(true, std::memory_order_release);
@@ -3700,12 +3687,16 @@ void BatteryWindow::RefreshBatteryData(bool include_disconnected,
     show_all_button_->setEnabled(false);
     status_label_->setText(QString::fromUtf8(u8"\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435..."));
 
-    refresh_worker_ = std::thread([this, include_disconnected, preserve_disconnected_snapshot, force_live_refresh, refresh_id]() {
+    refresh_worker_ = std::jthread(
+        [this, include_disconnected, preserve_disconnected_snapshot, force_live_refresh,
+         refresh_id](std::stop_token stop_token) {
         RefreshTaskResult result;
         try {
             BatteryQueryOptions query_options;
             query_options.include_disconnected = include_disconnected;
             query_options.force_live_refresh = force_live_refresh;
+            query_options.operation.stop_token = stop_token;
+            query_options.operation.deadline = ProviderOperationContext::Clock::now() + kProviderRefreshTimeout;
             UiDebugLog("refresh#" + std::to_string(refresh_id) +
                        " provider query full include_disconnected=" +
                        (include_disconnected ? "true" : "false") + " target='' preserve_disconnected_snapshot=" +
@@ -3830,7 +3821,7 @@ void BatteryWindow::RefreshBatteryData(bool include_disconnected,
                 }
             },
             Qt::QueuedConnection);
-    });
+        });
 }
 
 void BatteryWindow::RefreshBatteryDataFromUser() {

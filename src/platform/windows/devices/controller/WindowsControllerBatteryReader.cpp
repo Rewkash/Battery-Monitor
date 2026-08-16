@@ -488,7 +488,7 @@ std::optional<std::uint8_t> TryReadDualShockBatteryFromHid(const std::string& de
         std::vector<std::uint8_t> report(static_cast<std::size_t>(input_report_len), 0U);
         bool got_report = false;
         for (const auto report_id : std::array<std::uint8_t, 2>{0x11U, 0x01U}) {
-            std::fill(report.begin(), report.end(), 0U);
+            std::fill(report.begin(), report.end(), std::uint8_t{0U});
             report[0] = report_id;
             if (HidD_GetInputReport(device_handle, report.data(), static_cast<ULONG>(report.size()))) {
                 got_report = true;
@@ -502,7 +502,7 @@ std::optional<std::uint8_t> TryReadDualShockBatteryFromHid(const std::string& de
             overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
             if (overlapped.hEvent != nullptr) {
                 DWORD bytes_read = 0;
-                std::fill(report.begin(), report.end(), 0U);
+                std::fill(report.begin(), report.end(), std::uint8_t{0U});
                 BOOL read_result = ReadFile(device_handle, report.data(), static_cast<DWORD>(report.size()),
                                             nullptr, &overlapped);
                 if (!read_result) {

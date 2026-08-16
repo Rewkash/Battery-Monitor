@@ -12,6 +12,7 @@
 #include "platform/windows/devices/xiaomi/XiaomiBatteryCodec.h"
 #include "platform/windows/devices/xiaomi/ClassicBluetoothBatteryFallback.h"
 #include "platform/windows/devices/xiaomi/XiaomiHandshake.h"
+#include "core/BatteryTypes.h"
 
 namespace battery_monitor {
 
@@ -33,9 +34,10 @@ class XiaomiClassicBatteryCache {
                               XiaomiDebugLogFn debug_log = nullptr);
 
     XiaomiReadResult Read(std::uint64_t address,
-                          ClassicBatteryService preferred_service,
-                          bool aggressive_retry,
-                          std::size_t min_tws_components = 1U);
+                           ClassicBatteryService preferred_service,
+                           bool aggressive_retry,
+                           std::size_t min_tws_components = 1U,
+                           const ProviderOperationContext& operation = {});
     void Persist(std::uint64_t address, const std::vector<BatteryReading>& readings) const;
 
    private:

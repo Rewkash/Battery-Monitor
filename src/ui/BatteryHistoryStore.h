@@ -16,6 +16,10 @@ struct BatteryHistorySample {
     QMap<QString, int> component_levels;
     QString device_mode;
     QString device_submode;
+    // Marks an explicit offline (disconnect) event recorded when the device
+    // disappeared. Offline samples carry no component levels so cached values
+    // are never presented as live readings.
+    bool offline = false;
 };
 
 struct BatteryHistoryData {

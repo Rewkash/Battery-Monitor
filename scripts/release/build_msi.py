@@ -36,6 +36,15 @@ def read_upgrade_code(identity_file: pathlib.Path) -> str:
     return match.group(1).upper()
 
 
+def read_cmake_string(identity_file: pathlib.Path, name: str, fallback: str) -> str:
+    """Read a human-readable product define (e.g. the display name) from CMakeLists.txt."""
+    match = re.search(
+        r'set\s*\(\s*' + re.escape(name) + r'\s+"([^"]+)"\s*\)',
+        identity_file.read_text(encoding="utf-8"),
+    )
+    return match.group(1) if match is not None else fallback
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, type=pathlib.Path)
@@ -47,6 +56,12 @@ def main() -> int:
 
     source_root = args.input.resolve()
     upgrade_code = read_upgrade_code(args.identity_file)
+    # Product naming (see README.md "Product naming"): the display name is
+    # human-readable and sourced from CMake; the internal identity (upgrade
+    # code, registry keys, folder paths, executable names) stays literal and
+    # must never change, or upgrades and updates would break.
+    display_name = read_cmake_string(args.identity_file, "BATTERY_MONITOR_DISPLAY_NAME", "ChargeView")
+    publisher_name = read_cmake_string(args.identity_file, "BATTERY_MONITOR_PUBLISHER", "Orion Group")
     required = ("battery-monitor.exe", "battery-monitor-cli.exe", "battery-monitor-maintenance.exe")
     if not source_root.is_dir() or any(not (source_root / name).is_file() for name in required):
         raise SystemExit("staged application is incomplete")
@@ -57,15 +72,17 @@ def main() -> int:
     ET.register_namespace("ui", "http://wixtoolset.org/schemas/v4/wxs/ui")
     wix = ET.Element(f"{{{WIX_NAMESPACE}}}Wix")
     package = ET.SubElement(
-        wix, "Package", Name="ChargeView", Manufacturer="Orion Group", Version=args.version,
+        wix, "Package", Name=display_name, Manufacturer=publisher_name, Version=args.version,
         UpgradeCode=upgrade_code, Scope="perUser", Language="1049", Compressed="yes",
         ProductCode=str(uuid.uuid5(GUID_NAMESPACE, "product/" + args.version)).upper(),
     )
-    ET.SubElement(package, "SummaryInformation", Description="ChargeView Battery Monitor", Manufacturer="Orion Group")
-    ET.SubElement(package, "MajorUpgrade", DowngradeErrorMessage="A newer version of ChargeView is already installed.")
+    ET.SubElement(package, "SummaryInformation", Description=f"{display_name} Battery Monitor",
+                  Manufacturer=publisher_name)
+    ET.SubElement(package, "MajorUpgrade",
+                  DowngradeErrorMessage=f"A newer version of {display_name} is already installed.")
     ET.SubElement(package, "MediaTemplate", EmbedCab="yes")
     ET.SubElement(package, "Property", Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT",
-                  Value="Launch ChargeView")
+                  Value=f"Launch {display_name}")
     ET.SubElement(package, "Property", Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX", Value="1")
     ET.SubElement(package, f"{{http://wixtoolset.org/schemas/v4/wxs/ui}}WixUI",
                   Id="WixUI_InstallDir", InstallDirectory="INSTALLFOLDER")
@@ -132,7 +149,7 @@ def main() -> int:
     shortcut_component = ET.SubElement(menu_dir, "Component", Id="StartMenuShortcut",
                                        Guid=str(uuid.uuid5(GUID_NAMESPACE, "start-menu")).upper())
     component_ids.append("StartMenuShortcut")
-    ET.SubElement(shortcut_component, "Shortcut", Id="ApplicationStartMenuShortcut", Name="ChargeView",
+    ET.SubElement(shortcut_component, "Shortcut", Id="ApplicationStartMenuShortcut", Name=display_name,
                   Target="[INSTALLFOLDER]battery-monitor.exe", WorkingDirectory="INSTALLFOLDER")
     ET.SubElement(shortcut_component, "RemoveFolder", Id="RemoveApplicationProgramsFolder", On="uninstall")
     ET.SubElement(shortcut_component, "RegistryValue", Root="HKCU",
@@ -143,7 +160,7 @@ def main() -> int:
     desktop_component = ET.SubElement(desktop, "Component", Id="DesktopShortcut",
                                       Guid=str(uuid.uuid5(GUID_NAMESPACE, "desktop")).upper())
     component_ids.append("DesktopShortcut")
-    ET.SubElement(desktop_component, "Shortcut", Id="ApplicationDesktopShortcut", Name="ChargeView",
+    ET.SubElement(desktop_component, "Shortcut", Id="ApplicationDesktopShortcut", Name=display_name,
                   Target="[INSTALLFOLDER]battery-monitor.exe", WorkingDirectory="INSTALLFOLDER")
     ET.SubElement(desktop_component, "RegistryValue", Root="HKCU",
                   Key=r"Software\Orion Group\Battery Monitor\Install", Name="DesktopShortcut",
@@ -164,7 +181,7 @@ def main() -> int:
                   Value="LaunchChargeView",
                   Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed")
 
-    feature = ET.SubElement(package, "Feature", Id="MainFeature", Title="ChargeView", Level="1")
+    feature = ET.SubElement(package, "Feature", Id="MainFeature", Title=display_name, Level="1")
     for component_id in component_ids:
         ET.SubElement(feature, "ComponentRef", Id=component_id)
 

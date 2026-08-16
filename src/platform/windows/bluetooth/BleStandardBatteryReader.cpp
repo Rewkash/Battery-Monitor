@@ -31,11 +31,13 @@ using winrt::Windows::Storage::Streams::DataReader;
 template <typename TResult>
 std::optional<TResult> WaitForAsyncResult(
     winrt::Windows::Foundation::IAsyncOperation<TResult> operation,
-    std::chrono::milliseconds timeout) {
+    std::chrono::milliseconds timeout,
+    const ProviderOperationContext& operation_context) {
     try {
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        const auto deadline = std::chrono::steady_clock::now() + operation_context.Remaining(timeout);
 
-        while (operation.Status() == AsyncStatus::Started && std::chrono::steady_clock::now() < deadline) {
+        while (operation.Status() == AsyncStatus::Started && !operation_context.IsCancelled() &&
+               std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
 
@@ -60,21 +62,24 @@ std::string ToUtf8(const winrt::hstring& value) {
 
 }  // namespace
 
-std::vector<BatteryReading> ReadBleBatteryReadings(const BluetoothLEDevice& device, bool prefer_tws_labels) {
+std::vector<BatteryReading> ReadBleBatteryReadings(const BluetoothLEDevice& device,
+                                                   bool prefer_tws_labels,
+                                                   const ProviderOperationContext& operation) {
     std::vector<BatteryReading> readings;
 
     const auto service_result =
         WaitForAsyncResult(device.GetGattServicesForUuidAsync(GattServiceUuids::Battery()),
-                           std::chrono::milliseconds(1500));
+                           std::chrono::milliseconds(1500), operation);
     if (!service_result.has_value() || service_result->Status() != GattCommunicationStatus::Success) {
         return readings;
     }
 
     const auto services = service_result->Services();
     for (const auto& service : services) {
+        if (operation.IsCancelled()) break;
         const auto characteristic_result = WaitForAsyncResult(
             service.GetCharacteristicsForUuidAsync(GattCharacteristicUuids::BatteryLevel()),
-            std::chrono::milliseconds(1200));
+            std::chrono::milliseconds(1200), operation);
         if (!characteristic_result.has_value() ||
             characteristic_result->Status() != GattCommunicationStatus::Success) {
             continue;
@@ -82,15 +87,16 @@ std::vector<BatteryReading> ReadBleBatteryReadings(const BluetoothLEDevice& devi
 
         const auto characteristics = characteristic_result->Characteristics();
         for (const auto& characteristic : characteristics) {
+            if (operation.IsCancelled()) break;
             const auto read_result =
                 WaitForAsyncResult(characteristic.ReadValueAsync(BluetoothCacheMode::Uncached),
-                                   std::chrono::milliseconds(900));
+                                    std::chrono::milliseconds(900), operation);
             auto resolved_read_result = read_result;
             if (!resolved_read_result.has_value() ||
                 resolved_read_result->Status() != GattCommunicationStatus::Success) {
                 resolved_read_result = WaitForAsyncResult(
                     characteristic.ReadValueAsync(BluetoothCacheMode::Cached),
-                    std::chrono::milliseconds(900));
+                    std::chrono::milliseconds(900), operation);
             }
             if (!resolved_read_result.has_value() ||
                 resolved_read_result->Status() != GattCommunicationStatus::Success) {

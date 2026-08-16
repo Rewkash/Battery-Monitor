@@ -91,6 +91,7 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
     const auto& runtime_options = GetWindowsBatteryProviderRuntimeOptions();
 
     try {
+        if (options.operation.IsCancelled()) return {};
         const WindowsBatteryQueryReaderContext query_reader_context = MakeWindowsBatteryQueryReaderContext();
         DeviceBatteryAccumulator device_accumulator;
         auto try_add_entry = [&](DeviceBatteryInfo entry) {
@@ -103,7 +104,8 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
             const std::size_t before_tws = device_accumulator.Entries().size();
             CollectTwsCandidateBatteryEntries(
                 MakeWindowsTwsCandidateBatteryCollectorContext(
-                    options.include_disconnected, options.target_device_id, options.force_live_refresh),
+                    options.include_disconnected, options.target_device_id, options.force_live_refresh,
+                    options.operation),
                 query_reader_context,
                 &device_accumulator,
                 &xiaomi_classic_cache_);
@@ -112,17 +114,19 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
             // Endpoint properties and endpoint BLE mapping are optional.
         }
 
+        if (options.operation.IsCancelled()) return std::move(device_accumulator).TakeEntries();
         const std::size_t before_ble = device_accumulator.Entries().size();
         CollectBleCandidateBatteryEntries(
-            MakeWindowsBleCandidateBatteryCollectorContext(options.target_device_id, options.force_live_refresh),
+            MakeWindowsBleCandidateBatteryCollectorContext(options.target_device_id, options.force_live_refresh,
+                                                            options.operation),
             &device_accumulator,
             &xiaomi_classic_cache_);
         LogProviderEntriesSince("Provider stage BLE", device_accumulator.Entries(), before_ble);
 
         const bool run_generic_scan = !has_target && (runtime_options.generic_scan_enabled || device_accumulator.Empty());
-        if (run_generic_scan) {
+        if (run_generic_scan && !options.operation.IsCancelled()) {
             try {
-                const auto generic_entries = ReadGenericDeviceBattery(query_reader_context);
+                const auto generic_entries = ReadGenericDeviceBattery(query_reader_context, options.operation);
                 WindowsBatteryProviderDebugLog(
                     "Generic battery entries: " + std::to_string(generic_entries.size()));
                 const std::size_t before_generic = device_accumulator.Entries().size();
@@ -139,11 +143,12 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
         }
 
         DisconnectedPairedCollection paired_collection;
-        if (options.include_disconnected && !has_target) {
+        if (options.include_disconnected && !has_target && !options.operation.IsCancelled()) {
             try {
                 paired_collection = CollectDisconnectedPairedBluetoothEntries(
                     runtime_options.debug_enabled,
-                    &WindowsBatteryProviderDebugLog);
+                    &WindowsBatteryProviderDebugLog,
+                    options.operation);
                 const std::size_t before_disconnected = device_accumulator.Entries().size();
                 for (auto& entry : paired_collection.offline_entries) {
                     const auto entry_address = ParseBluetoothAddressFromDeviceId(entry.device_id);
@@ -180,7 +185,8 @@ std::vector<DeviceBatteryInfo> WinRtBatteryProvider::GetDevicesBattery(const Bat
         auto finalized_entries = FinalizeCollectedEntries(
             std::move(devices_with_battery),
             options.include_disconnected,
-            paired_snapshot);
+            paired_snapshot,
+            &WindowsBatteryProviderDebugLog);
         LogProviderEntries("Provider final", finalized_entries);
         return finalized_entries;
     } catch (const winrt::hresult_error& error) {

@@ -34,14 +34,23 @@ jobs:
           "test=$isTest".ToLowerInvariant() >> $env:GITHUB_OUTPUT
       - run: cmake --fresh -S . -B build -G "Visual Studio 17 2022" -A x64
       - run: cmake --build build --config Release
-      - name: Stage package
+      - name: Run tests (CTest)
+        # Gates the publish on the test suite before any signing or packaging
+        # happens. The suite may be empty until tests are registered in CMake.
+        run: ctest --test-dir build -C Release --output-on-failure --no-tests=ignore
+      - name: CLI smoke test
+        # The CLI must run and report exactly the version being released.
         shell: pwsh
         run: |
-          New-Item -ItemType Directory release-staging\app | Out-Null
-          Copy-Item build\Release\*.exe release-staging\app
-          Copy-Item build\Release\*.dll release-staging\app
-          Get-ChildItem build\Release -Directory | ForEach-Object { Copy-Item $_.FullName release-staging\app -Recurse }
-          Copy-Item profiles release-staging\app -Recurse
+          $version = "${{ steps.release_meta.outputs.version }}"
+          $output = (& build\Release\battery-monitor-cli.exe --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "battery-monitor-cli --version exited with $LASTEXITCODE" }
+          if ($output -ne $version) { throw "battery-monitor-cli --version printed '$output', expected '$version'" }
+      - name: Stage package (cmake --install)
+        # Single source of the staged tree: executables, Qt runtime
+        # (windeployqt), profiles/ and resources/ all come from the install
+        # rules in CMakeLists.txt. Packaging scripts consume this staging only.
+        run: cmake --install build --config Release --prefix release-staging/app
       - name: Authenticode production signing
         if: steps.release_meta.outputs.test != 'true'
         shell: pwsh
@@ -121,6 +130,18 @@ jobs:
           } finally {
             Remove-Item $pfx -Force -ErrorAction SilentlyContinue
           }
+      - name: Verify MSI product identity
+        # Fails the release before publishing if the MSI database does not carry
+        # the released version and the stable BATTERY_MONITOR_MSI_UPGRADE_CODE.
+        if: steps.release_meta.outputs.test != 'true'
+        shell: pwsh
+        run: |
+          $upgradeCode = (Select-String -Path CMakeLists.txt -Pattern 'BATTERY_MONITOR_MSI_UPGRADE_CODE\s+"\{([0-9A-Fa-f-]{36})\}"').Matches.Groups[1].Value
+          $msi = "release-staging\battery-monitor-${{ github.ref_name }}-win-x64.msi"
+          $info = .\scripts\release\Get-MsiInfo.ps1 -MsiPath $msi `
+            -ExpectedVersion "${{ steps.release_meta.outputs.version }}" -ExpectedUpgradeCode $upgradeCode
+          $info | ConvertTo-Json -Compress | Set-Content -Encoding Ascii release-staging\msi-info.json
+          Get-Content release-staging\msi-info.json
       - name: Build and sign update
         shell: pwsh
         env:
@@ -136,17 +157,28 @@ jobs:
           $notesPath = Join-Path $env:RUNNER_TEMP release-notes.md
           [IO.File]::WriteAllText($notesPath, $notes, [Text.UTF8Encoding]::new($false))
           $manifestArgs = @("scripts\release\sign_manifest.py", "--version", $version, "--sequence", "${{ github.run_number }}", "--bundle", "release-staging\battery-monitor-${{ github.ref_name }}-win-x64.bmup", "--artifact-url", "https://github.com/Rewkash/Battery-Monitor/releases/download/${{ github.ref_name }}/battery-monitor-${{ github.ref_name }}-win-x64.bmup", "--release-notes-file", $notesPath, "--release-notes-url", "https://github.com/Rewkash/Battery-Monitor/releases/tag/${{ github.ref_name }}", "--output-dir", "release-staging")
-          $verifyArgs = @("scripts\release\verify_release.py", "--manifest", "release-staging\update-manifest.json", "--signature", "release-staging\update-manifest.json.sig", "--bundle", "release-staging\battery-monitor-${{ github.ref_name }}-win-x64.bmup")
+          $verifyArgs = @("scripts\release\verify_release.py", "--manifest", "release-staging\update-manifest.json", "--signature", "release-staging\update-manifest.json.sig", "--bundle", "release-staging\battery-monitor-${{ github.ref_name }}-win-x64.bmup", "--expected-version", $version)
           if ("${{ steps.release_meta.outputs.test }}" -ne "true") {
             $msi = "release-staging\battery-monitor-${{ github.ref_name }}-win-x64.msi"
             $manifestArgs += @("--msi", $msi, "--msi-url", "https://github.com/Rewkash/Battery-Monitor/releases/download/${{ github.ref_name }}/battery-monitor-${{ github.ref_name }}-win-x64.msi")
-            $verifyArgs += @("--msi", $msi)
+            $verifyArgs += @("--msi", $msi, "--msi-info", "release-staging\msi-info.json")
           }
           py -3.11 @manifestArgs
           if ($LASTEXITCODE -ne 0) { throw "Manifest signing failed" }
           py -3.11 @verifyArgs
           if ($LASTEXITCODE -ne 0) { throw "Release verification failed" }
           Compress-Archive -Path release-staging\app\* -DestinationPath release-staging\battery-monitor-${{ github.ref_name }}-win-x64.zip -CompressionLevel Optimal
+      - name: Portable ZIP smoke test
+        # Re-run the CLI from the exact portable artifact that is about to be
+        # published; catches staging regressions invisible to hash checks.
+        shell: pwsh
+        run: |
+          $extract = Join-Path $env:RUNNER_TEMP "zip-smoke"
+          Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive "release-staging\battery-monitor-${{ github.ref_name }}-win-x64.zip" -DestinationPath $extract
+          $output = (& (Join-Path $extract "battery-monitor-cli.exe") --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "portable battery-monitor-cli --version exited with $LASTEXITCODE" }
+          if ($output -ne "${{ steps.release_meta.outputs.version }}") { throw "portable battery-monitor-cli --version printed '$output', expected '${{ steps.release_meta.outputs.version }}'" }
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           generate_release_notes: true

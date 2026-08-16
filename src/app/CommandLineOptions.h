@@ -22,10 +22,13 @@ struct CommandLineOptions {
     bool cli_output = false;
     bool gui_forced = false;
     bool include_offline = false;
+    bool has_error = false;
+    std::string error_message;
     PlatformCommandOptions platform_commands;
 };
 
 [[nodiscard]] CommandLineOptions ParseCommandLine(int argc, char** argv);
 [[nodiscard]] bool ShouldLaunchGui(const CommandLineOptions& options, bool prefer_gui) noexcept;
+[[nodiscard]] std::string CommandLineUsageText();
 
 }  // namespace battery_monitor
