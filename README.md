@@ -1,59 +1,65 @@
 # ChargeView
 
-Current application version is defined once in the root `CMakeLists.txt`. Windows builds include an optional signed GitHub Releases updater; see [auto-update design](docs/auto-update-design.md) and [release process](docs/release-process.md).
+[English version](README.en.md)
 
-## Product naming
+Нативное приложение на C++20 для просмотра уровня заряда Bluetooth-устройств.
 
-The product uses two distinct names on purpose:
+Текущая версия приложения задаётся один раз в корневом `CMakeLists.txt`. Сборки для Windows включают опциональный подписанный автообновлятор через GitHub Releases; см. [дизайн автообновления](docs/auto-update-design.md) и [процесс релиза](docs/release-process.md).
 
-- **Display name: `ChargeView`** — the human-readable name used in UI titles, dialogs, the installer wizard, shortcuts and release communication. Defined as `BATTERY_MONITOR_DISPLAY_NAME` (with `BATTERY_MONITOR_PUBLISHER`) in `CMakeLists.txt`; installer metadata derives its display strings from there.
-- **Internal identity: `BatteryMonitor` / `battery-monitor`** — the stable machine identity: the CMake project name, target names (`battery-monitor`, `battery-monitor-cli`, `battery-monitor-maintenance`), executable and artifact file names (`battery-monitor-vX.Y.Z-win-x64.{msi,zip,bmup}`), the MSI UpgradeCode, registry keys under `Software\Orion Group\Battery Monitor`, and QSettings organization/application names.
+## Именование продукта
 
-The internal identity is frozen. Never rename targets, executables, installer paths, registry keys or settings identifiers: upgrades, the auto-updater and user settings depend on them. Only human-readable strings may follow the display name.
+Продукт намеренно использует два разных имени:
 
-For first-time installation on Windows, download the x64 MSI from [GitHub Releases](https://github.com/Rewkash/Battery-Monitor/releases). The ZIP remains available for portable use, and the `.bmup` asset is used internally by portable automatic updates.
+- **Отображаемое имя: `ChargeView`** — человекочитаемое имя в заголовках окон, диалогах, мастере установки, ярлыках и анонсах релизов. Задаётся как `BATTERY_MONITOR_DISPLAY_NAME` (вместе с `BATTERY_MONITOR_PUBLISHER`) в `CMakeLists.txt`; метаданные установщика берут отображаемые строки оттуда.
+- **Внутренняя идентичность: `BatteryMonitor` / `battery-monitor`** — стабильная машинная идентичность: имя проекта CMake, имена таргетов (`battery-monitor`, `battery-monitor-cli`, `battery-monitor-maintenance`), имена исполняемых файлов и артефактов (`battery-monitor-vX.Y.Z-win-x64.{msi,zip,bmup}`), MSI UpgradeCode, ключи реестра `Software\Orion Group\Battery Monitor` и идентификаторы QSettings.
 
-Version and update check:
+Внутренняя идентичность заморожена. Никогда не переименовывайте таргеты, исполняемые файлы, пути установщика, ключи реестра и идентификаторы настроек: от них зависят обновления, автообновлятор и пользовательские настройки. Меняться могут только человекочитаемые строки.
+
+## Установка
+
+Для первой установки на Windows скачайте x64 MSI из [GitHub Releases](https://github.com/Rewkash/Battery-Monitor/releases). Установщик работает per-user (без прав администратора), запоминает выбранную папку при обновлениях и при выборе корня диска автоматически дополняет путь папкой `ChargeView` (например, `H:\` → `H:\ChargeView`). Обновление достаточно запустить поверх существующей установки — оно закроет работающее приложение, сохранит папку установки и заменит файлы на месте.
+
+ZIP-архив остаётся доступным для портативного использования, а артефакт `.bmup` используется внутри портативных автообновлений.
+
+Проверка версии и наличия обновлений:
 
 ```powershell
 .\build\Debug\battery-monitor-cli.exe --version
 .\build\Debug\battery-monitor-cli.exe --check-updates --json
 ```
 
-Native C++20 application for viewing Bluetooth device battery state.
+## Возможности
 
-The project provides a shared core, a CLI, and an optional Qt 6 desktop UI. Windows uses WinRT Bluetooth APIs with extra device-specific readers for several common device classes. Linux reads battery data from BlueZ over D-Bus.
+- Показывает Bluetooth-устройства с уровнем заряда, когда он доступен.
+- Поддерживает покомпонентные показания: `main`, `left`, `right`, `case`.
+- Разделяет кэшированные/офлайн-показания и живые значения.
+- Текстовый и JSON-вывод в CLI; некорректные аргументы дают понятную ошибку и ненулевой код возврата.
+- Опциональный Qt Widgets UI (собирается при наличии Qt 6).
+- Уведомления о низком заряде с порогом и интервалом повтора на физическое устройство.
+- История заряда за 14 дней с offline-событиями, статистикой и оценкой времени работы (ETA).
+- JSON-профили устройств из `profiles/devices` для семейственного сопоставления без перекомпиляции.
+- Windows-специфичная поддержка BLE-устройств, телефонов, геймпадов и Xiaomi/Redmi TWS.
 
-## Features
-
-- Lists Bluetooth devices with battery level when available.
-- Supports component-aware battery readings: `main`, `left`, `right`, and `case`.
-- Marks cached/offline readings separately from live values.
-- Provides plain text and JSON CLI output.
-- Builds an optional Qt Widgets UI when Qt 6 is available.
-- Loads JSON device profiles from `profiles/devices` for device-family matching.
-- Includes Windows-specific support for BLE devices, phones, controllers, and Xiaomi/Redmi TWS devices.
-
-## Requirements
+## Требования
 
 ### Windows
 
 - Windows 10/11
-- Visual Studio 2022 Build Tools with MSVC
+- Visual Studio 2022+ Build Tools с MSVC
 - Windows 10/11 SDK
 - CMake 3.21+
-- Qt 6 Widgets and Svg modules for the GUI build, optional
+- Qt 6 (модули Widgets и Svg) для GUI-сборки — опционально
 
 ### Linux
 
-- GCC or Clang with C++20 support
+- GCC или Clang с поддержкой C++20
 - CMake 3.21+
 - `pkg-config`
 - `libdbus-1-dev`
-- BlueZ running on the system bus
-- Qt 6 Widgets and Svg modules for the GUI build, optional
+- BlueZ в системной шине
+- Qt 6 (Widgets и Svg) для GUI-сборки — опционально
 
-## Build
+## Сборка
 
 ### Windows
 
@@ -62,12 +68,12 @@ cmake --fresh -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Debug
 ```
 
-When Qt 6 is found, the build creates:
+При найденном Qt 6 сборка создаёт:
 
-- `build\Debug\battery-monitor.exe` for the GUI
-- `build\Debug\battery-monitor-cli.exe` for the CLI
+- `build\Debug\battery-monitor.exe` — GUI
+- `build\Debug\battery-monitor-cli.exe` — CLI
 
-Without Qt 6, `battery-monitor.exe` is built as the CLI executable.
+Без Qt 6 `battery-monitor.exe` собирается как CLI-исполняемый файл.
 
 ### Linux
 
@@ -76,56 +82,64 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build -j
 ```
 
-When Qt 6 is found, the build creates both `battery-monitor` and `battery-monitor-cli`. Without Qt 6, `battery-monitor` is the CLI executable.
+При найденном Qt 6 собираются `battery-monitor` (GUI) и `battery-monitor-cli`. Без Qt 6 `battery-monitor` — CLI-исполняемый файл.
 
-To force a CLI-only build on any platform:
+Принудительная CLI-only сборка на любой платформе:
 
 ```bash
 cmake -S . -B build -DBATTERY_MONITOR_ENABLE_QT=OFF
 ```
 
-## Run
+## Запуск
 
 ```bash
 battery-monitor
 battery-monitor-cli --json
 ```
 
-Useful CLI options:
+Полезные опции CLI:
 
-- `--json` prints machine-readable device data.
-- `--debug` enables diagnostic logging where supported.
+- `--version` — вывести версию и выйти.
+- `--json` — машиночитаемый вывод данных об устройствах.
+- `--all`, `--include-offline` — включить офлайн/кэшированные устройства.
+- `--cli` / `--gui` — принудительно выбрать режим вывода/приложения.
+- `--check-updates` — проверить обновления и выйти.
+- `--xiaomi-set-noise <режим> [устройство]` — установить режим шумоподавления Xiaomi.
+- `--xiaomi-set-submode <семейство> <индекс> [устройство]` — установить подрежим шумоподавления.
 
-## Device Profiles
+Некорректные аргументы (неизвестный флаг, отсутствие значения, несовместимые `--gui`/`--cli`/`--json`) приводят к сообщению с использованием и коду возврата 2.
 
-Device profiles live under `profiles/devices` and are regular JSON files. They are used to extend device-family/category matching without recompiling C++ heuristics.
+## Профили устройств
 
-Profile lookup order:
+Профили устройств лежат в `profiles/devices` и представляют собой обычные JSON-файлы. Они расширяют семейственное/категорийное сопоставление устройств без изменения C++-эвристик.
 
-- `BATTERY_MONITOR_PROFILE_DIR`, if set
-- `profiles/devices` in the current working directory
-- `profiles/devices` in parent directories of the current working directory
+Порядок поиска профилей:
 
-See `profiles/devices/README.md` for the schema example.
+- `BATTERY_MONITOR_PROFILE_DIR`, если задана
+- `profiles/devices` в текущем рабочем каталоге
+- `profiles/devices` в родительских каталогах текущего рабочего каталога
 
-## Architecture
+Схема, правила специфичности и валидации описаны в `profiles/devices/README.md`.
 
-Important source areas:
+## Архитектура
 
-- `include/core`: public domain types and provider interfaces.
-- `src/app`: command-line parsing, output formatting, and application entry helpers.
-- `src/core`: shared core implementations.
-- `src/platform/windows`: Windows provider, WinRT integration, and Windows-specific device readers.
-- `src/platform/linux`: Linux BlueZ provider.
-- `src/ui`: Qt Widgets UI.
-- `profiles/devices`: data-driven device profiles.
-- `assets` and `resources`: UI assets and Qt resources.
+Ключевые области исходного кода:
 
-Platform-specific Bluetooth code stays under its platform folder. Shared code should not include WinRT, Windows headers, BlueZ, or D-Bus headers directly.
+- `include/core`: публичные доменные типы и интерфейсы провайдеров.
+- `src/app`: разбор аргументов командной строки, форматирование вывода, помощники входа приложения.
+- `src/core`: общие реализации ядра.
+- `src/platform/windows`: Windows-провайдер, интеграция WinRT и специфичные для Windows ридеры устройств.
+- `src/platform/linux`: Linux-провайдер BlueZ.
+- `src/ui`: Qt Widgets UI (окно, история, ETA, уведомления).
+- `src/update`: сервис обновлений, подпись манифеста, maintenance-инструмент.
+- `profiles/devices`: дата-ориентированные профили устройств.
+- `assets` и `resources`: UI-ассеты и Qt-ресурсы.
 
-## Notes
+Платформенно-зависимый Bluetooth-код остаётся в своей платформенной папке. Общий код не должен напрямую включать заголовки WinRT, Windows, BlueZ или D-Bus.
 
-- Not every Bluetooth device exposes battery data through a standard API.
-- On Linux, `org.bluez.Battery1` availability depends on BlueZ and device support.
-- On Windows, some devices require fallback readers or cached values because the standard GATT Battery Service is not always exposed.
-- Device control support is currently platform- and device-specific.
+## Замечания
+
+- Не каждое Bluetooth-устройство отдаёт уровень заряда через стандартный API.
+- На Linux доступность `org.bluez.Battery1` зависит от BlueZ и поддержки устройства.
+- На Windows некоторым устройствам нужны fallback-ридеры или кэшированные значения, поскольку стандартный GATT Battery Service exposed не всегда.
+- Поддержка управления устройствами пока платформо- и девайсозависима.
