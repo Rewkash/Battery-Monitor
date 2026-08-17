@@ -130,6 +130,7 @@ class BatteryWindow : public QWidget {
     QTimer* refresh_timer_ = nullptr;
     QTimer* runtime_timer_ = nullptr;
     QTimer* bluetooth_refresh_debounce_timer_ = nullptr;
+    QTimer* push_refresh_debounce_timer_ = nullptr;
 #ifdef _WIN32
     winrt::Windows::Devices::Enumeration::DeviceWatcher bluetooth_classic_watcher_{nullptr};
     winrt::Windows::Devices::Enumeration::DeviceWatcher bluetooth_le_watcher_{nullptr};

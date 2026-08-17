@@ -7,6 +7,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "platform/windows/devices/xiaomi/XiaomiBatteryCodec.h"
@@ -38,6 +39,7 @@ class XiaomiClassicBatteryCache {
                            bool aggressive_retry,
                            std::size_t min_tws_components = 1U,
                            const ProviderOperationContext& operation = {});
+    void NotifyPushDataAvailable(std::uint64_t address);
     void Persist(std::uint64_t address, const std::vector<BatteryReading>& readings) const;
 
    private:
@@ -53,6 +55,7 @@ class XiaomiClassicBatteryCache {
     std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> last_successful_live_read_;
     std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> last_failed_live_read_;
     std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> live_read_in_progress_;
+    std::unordered_set<std::uint64_t> push_data_available_;
     std::unordered_map<std::uint64_t, bool> services_exhausted_;
 };
 

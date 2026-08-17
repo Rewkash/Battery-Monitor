@@ -74,6 +74,19 @@ WinRtBatteryProvider::~WinRtBatteryProvider() {
     xiaomi_sessions_.Shutdown();
 }
 
+void WinRtBatteryProvider::SetDataChangedCallback(std::function<void()> callback) {
+    if (!callback) {
+        xiaomi_sessions_.SetDataChangedHandler({});
+        return;
+    }
+    xiaomi_sessions_.SetDataChangedHandler([this, callback = std::move(callback)](std::uint64_t address) {
+        xiaomi_classic_cache_.NotifyPushDataAvailable(address);
+        if (callback) {
+            callback();
+        }
+    });
+}
+
 void WinRtBatteryProvider::NotifyDeviceConnectionChanged(const std::string& device_id, bool connected) {
     const auto address = ParseBluetoothAddressFromDeviceId(device_id);
     if (address.has_value()) {

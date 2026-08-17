@@ -266,10 +266,15 @@ BatteryHistoryStore::BatteryHistoryStore() {
 
 void BatteryHistoryStore::RecordSnapshot(const std::vector<DeviceBatteryInfo>& devices) {
     QHash<QString, PendingHistorySnapshot> pending_by_device;
+    QSet<QString> connected_devices;
     for (const auto& entry : devices) {
         const QString device_id = QString::fromUtf8(entry.device_id.c_str());
         if (device_id.trimmed().isEmpty()) {
             continue;
+        }
+
+        if (entry.is_connected) {
+            connected_devices.insert(device_id);
         }
 
         if (!ShouldTrackEntry(entry)) {
@@ -322,7 +327,7 @@ void BatteryHistoryStore::RecordSnapshot(const std::vector<DeviceBatteryInfo>& d
     // live readings when the history is rendered.
     for (auto it = history_by_device_.begin(); it != history_by_device_.end(); ++it) {
         auto& history = it.value();
-        if (!pending_by_device.contains(it.key()) && !history.samples.isEmpty() &&
+        if (!connected_devices.contains(it.key()) && !history.samples.isEmpty() &&
             !history.samples.back().offline) {
             BatteryHistorySample offline_sample;
             offline_sample.timestamp_ms = now_ms;

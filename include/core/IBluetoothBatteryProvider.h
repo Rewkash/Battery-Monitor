@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -18,6 +19,12 @@ class IBluetoothBatteryProvider {
     virtual void NotifyDeviceConnectionChanged(const std::string& device_id, bool connected) {
         (void)device_id;
         (void)connected;
+    }
+    // Invoked from a background thread when a persistent device session
+    // receives fresh data outside of polling (e.g. a Xiaomi protocol push).
+    // Implementations must marshal the callback to their own thread.
+    virtual void SetDataChangedCallback(std::function<void()> callback) {
+        (void)callback;
     }
 
     std::vector<DeviceBatteryInfo> GetConnectedDevicesBattery() {

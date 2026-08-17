@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+
 #include "core/IBluetoothBatteryProvider.h"
 #include "core/INoiseControlProvider.h"
 #include "platform/windows/devices/xiaomi/XiaomiBatteryCaches.h"
@@ -14,6 +16,7 @@ class WinRtBatteryProvider final : public IBluetoothBatteryProvider, public INoi
 
     std::vector<DeviceBatteryInfo> GetDevicesBattery(const BatteryQueryOptions& options) override;
     void NotifyDeviceConnectionChanged(const std::string& device_id, bool connected) override;
+    void SetDataChangedCallback(std::function<void()> callback) override;
     INoiseControlProvider* GetNoiseControlProvider() override { return this; }
     bool SupportsNoiseControl(const std::string& device_id) override;
     bool SetNoiseControlMode(const std::string& device_id, NoiseControlMode mode) override;

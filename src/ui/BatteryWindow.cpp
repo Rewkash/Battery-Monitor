@@ -668,19 +668,14 @@ PrimaryBattery ComputePrimaryBattery(const DeviceEntry& device) {
     const auto* right = FindComponent(device, "right");
     const auto* case_level = FindComponent(device, "case");
 
-    const bool has_left = left != nullptr && left->battery_level_percent.has_value();
-    const bool has_right = right != nullptr && right->battery_level_percent.has_value();
+    const bool has_left = left != nullptr && left->battery_level_percent.has_value() && !left->is_charging;
+    const bool has_right = right != nullptr && right->battery_level_percent.has_value() && !right->is_charging;
     const bool has_case = case_level != nullptr && case_level->battery_level_percent.has_value();
+    const bool has_earbud_components = left != nullptr || right != nullptr;
 
     // For TWS, primary level should represent earbuds. Ignore case when both earbuds are available.
     if (has_left && has_right) {
         return ComputeAveragePrimary({left, right});
-    }
-
-    if (const auto* main = FindComponent(device, "main"); main != nullptr && main->battery_level_percent.has_value()) {
-        result.level = main->battery_level_percent;
-        result.cached = main->is_cached;
-        return result;
     }
 
     if (has_left) {
@@ -695,6 +690,15 @@ PrimaryBattery ComputePrimaryBattery(const DeviceEntry& device) {
         return result;
     }
 
+    if (!has_earbud_components) {
+        if (const auto* main = FindComponent(device, "main");
+            main != nullptr && main->battery_level_percent.has_value()) {
+            result.level = main->battery_level_percent;
+            result.cached = main->is_cached;
+            return result;
+        }
+    }
+
     if (has_case) {
         result.level = case_level->battery_level_percent;
         result.cached = case_level->is_cached;
@@ -704,7 +708,10 @@ PrimaryBattery ComputePrimaryBattery(const DeviceEntry& device) {
     std::vector<const ComponentEntry*> candidates;
     if (candidates.empty()) {
         for (const auto& component : device.components) {
-            if (component.battery_level_percent.has_value()) {
+            const bool is_charging_earbud =
+                (component.component == "left" || component.component == "right") && component.is_charging;
+            const bool is_aggregate_main = has_earbud_components && component.component == "main";
+            if (component.battery_level_percent.has_value() && !is_charging_earbud && !is_aggregate_main) {
                 candidates.push_back(&component);
             }
         }
@@ -2387,6 +2394,27 @@ QWidget#listContainer {
     bluetooth_refresh_debounce_timer_ = new QTimer(this);
     bluetooth_refresh_debounce_timer_->setSingleShot(true);
     bluetooth_refresh_debounce_timer_->setInterval(250);
+    push_refresh_debounce_timer_ = new QTimer(this);
+    push_refresh_debounce_timer_->setSingleShot(true);
+    push_refresh_debounce_timer_->setInterval(800);
+    connect(push_refresh_debounce_timer_, &QTimer::timeout, this, [this]() {
+        if (!quitting_) {
+            RefreshBatteryData(false, true);
+        }
+    });
+    if (provider_ != nullptr) {
+        provider_->SetDataChangedCallback([this]() {
+            QMetaObject::invokeMethod(
+                this,
+                [this]() {
+                    if (!quitting_ && push_refresh_debounce_timer_ != nullptr &&
+                        !push_refresh_debounce_timer_->isActive()) {
+                        push_refresh_debounce_timer_->start();
+                    }
+                },
+                Qt::QueuedConnection);
+        });
+    }
     const BatteryWindowPersistedState persisted_state = LoadBatteryWindowPersistedState();
     refresh_interval_ms_ = persisted_state.refresh_interval_ms;
     low_battery_threshold_percent_ = persisted_state.low_battery_threshold_percent;
@@ -2465,6 +2493,9 @@ QWidget#listContainer {
 
 BatteryWindow::~BatteryWindow() {
     quitting_ = true;
+    if (provider_ != nullptr) {
+        provider_->SetDataChangedCallback({});
+    }
     StopBluetoothDeviceWatcher();
     if (refresh_worker_.joinable()) {
         refresh_worker_.request_stop();

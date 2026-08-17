@@ -52,8 +52,9 @@ XiaomiReadResult XiaomiClassicBatteryCache::Read(std::uint64_t address,
         const auto now = std::chrono::steady_clock::now();
         auto found = cache_.find(address);
         const bool has_cached_result = found != cache_.end();
+        const bool push_data_available = push_data_available_.contains(address);
         if (preferred_service == ClassicBatteryService::kZmiPurPodsSerial && has_cached_result &&
-            !last_failed_live_read_.contains(address) && !aggressive_retry) {
+            !last_failed_live_read_.contains(address) && !aggressive_retry && !push_data_available) {
             LogDebug(debug_log_,
                      "ZMI classic fallback: reusing session cache without another RFCOMM connection address=" +
                          std::to_string(address));
@@ -62,14 +63,15 @@ XiaomiReadResult XiaomiClassicBatteryCache::Read(std::uint64_t address,
             return result;
         }
         if (preferred_service == ClassicBatteryService::kZmiPurPodsSerial &&
-            services_exhausted_[address] && !aggressive_retry) {
+            services_exhausted_[address] && !aggressive_retry && !push_data_available) {
             LogDebug(debug_log_,
                      "Xiaomi classic fallback: all RFCOMM services already failed for current connection address=" +
                          std::to_string(address));
             return {};
         }
         if (const auto successful = last_successful_live_read_.find(address);
-            !aggressive_retry && has_cached_result && successful != last_successful_live_read_.end() &&
+            !aggressive_retry && !push_data_available && has_cached_result &&
+            successful != last_successful_live_read_.end() &&
             now - successful->second < kClassicLiveReadInterval) {
             auto result = found->second;
             result.from_persistent_cache = true;
@@ -83,7 +85,7 @@ XiaomiReadResult XiaomiClassicBatteryCache::Read(std::uint64_t address,
             return {};
         }
         if (const auto failed = last_failed_live_read_.find(address);
-            !aggressive_retry && failed != last_failed_live_read_.end() &&
+            !aggressive_retry && !push_data_available && failed != last_failed_live_read_.end() &&
             now - failed->second < kClassicLiveReadInterval) {
             if (has_cached_result) {
                 LogDebug(debug_log_,
@@ -97,6 +99,7 @@ XiaomiReadResult XiaomiClassicBatteryCache::Read(std::uint64_t address,
         }
 
         live_read_in_progress_[address] = now;
+        push_data_available_.erase(address);
     }
 
     XiaomiReadResult read_result;
@@ -190,6 +193,11 @@ XiaomiReadResult XiaomiClassicBatteryCache::Read(std::uint64_t address,
         return inserted.first->second;
     }
     return read_result;
+}
+
+void XiaomiClassicBatteryCache::NotifyPushDataAvailable(std::uint64_t address) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    push_data_available_.insert(address);
 }
 
 void XiaomiClassicBatteryCache::Persist(std::uint64_t address, const std::vector<BatteryReading>& readings) const {

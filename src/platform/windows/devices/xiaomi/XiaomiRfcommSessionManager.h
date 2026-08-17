@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -31,6 +32,12 @@ class XiaomiRfcommSessionManager final {
 
     void NotifyConnectionChanged(std::uint64_t address, bool connected);
     void Shutdown();
+
+    // Called from session worker threads (rate-limited) when a push message
+    // changed battery levels, charging flags or the noise mode. Install it
+    // right after construction: existing sessions capture the handler at
+    // creation time.
+    void SetDataChangedHandler(std::function<void(std::uint64_t)> handler);
 
    private:
     class Session;

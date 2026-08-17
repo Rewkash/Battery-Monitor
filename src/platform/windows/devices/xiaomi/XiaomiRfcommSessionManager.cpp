@@ -74,10 +74,22 @@ std::uint8_t NoiseModeValue(NoiseControlMode mode) {
 
 class XiaomiRfcommSessionManager::Session final {
    public:
-    Session(std::uint64_t address, bool debug_enabled, XiaomiDebugLogFn debug_log)
-        : address_(address), debug_enabled_(debug_enabled), debug_log_(debug_log), worker_(&Session::WorkerMain, this) {}
+    Session(std::uint64_t address,
+            bool debug_enabled,
+            XiaomiDebugLogFn debug_log,
+            std::function<void(std::uint64_t)> data_changed)
+        : address_(address),
+          debug_enabled_(debug_enabled),
+          debug_log_(debug_log),
+          data_changed_(std::move(data_changed)),
+          worker_(&Session::WorkerMain, this) {}
 
     ~Session() { Stop(); }
+
+    void SetDataChangedHandler(std::function<void(std::uint64_t)> handler) {
+        std::lock_guard lock(data_changed_mutex_);
+        data_changed_ = std::move(handler);
+    }
 
     std::vector<BatteryReading> ReadBattery(ClassicBatteryService preferred_service,
                                             const ProviderOperationContext& operation) {
@@ -120,6 +132,7 @@ class XiaomiRfcommSessionManager::Session final {
     }
 
     void Stop() {
+        SetDataChangedHandler({});
         RequestStop();
         if (worker_.joinable()) worker_.join();
     }
@@ -240,19 +253,29 @@ class XiaomiRfcommSessionManager::Session final {
             connected_ = false;
             return;
         }
+        bool data_changed = false;
         const auto mode = ParseXiaomiNoiseModeCode(static_cast<std::uint8_t>(message.opcode), message.payload);
         if (mode.has_value()) {
             const auto submode = static_cast<std::uint8_t>(message.opcode) == 0xF4U
                                      ? ParseXiaomiNoiseSubmodeCodeFromF4Payload(message.payload)
                                      : std::optional<std::uint8_t>{};
             PutXiaomiModeCacheEntry(address_, *mode, submode);
+            if (!last_mode_.has_value() || *last_mode_ != *mode) {
+                data_changed = true;
+            }
             last_mode_ = *mode;
         }
-        if (battery == nullptr || message.payload.empty()) return;
+        if (battery == nullptr || message.payload.empty()) {
+            if (data_changed) NotifyDataChanged();
+            return;
+        }
         if (message.opcode == XiaomiOpcode::kGetDeviceInfo) {
             const auto snapshot = ExtractBatterySnapshotFromXiaomiPayload(
                 message.payload, std::optional<std::uint8_t>{std::uint8_t{0x07}}, debug_enabled_, debug_log_);
             if (snapshot.has_value()) {
+                if (XiaomiSnapshotChanged(battery->device_info, *snapshot)) {
+                    data_changed = true;
+                }
                 battery->device_info = snapshot;
                 battery->device_info_received_at = Clock::now();
             }
@@ -260,7 +283,36 @@ class XiaomiRfcommSessionManager::Session final {
             battery->report_status_seen_at = Clock::now();
             const auto snapshot = ExtractBatterySnapshotFromXiaomiPayload(
                 message.payload, std::optional<std::uint8_t>{std::uint8_t{0x00}}, debug_enabled_, debug_log_);
-            if (snapshot.has_value()) battery->status = snapshot;
+            if (snapshot.has_value()) {
+                if (XiaomiSnapshotChanged(battery->status, *snapshot)) {
+                    data_changed = true;
+                }
+                battery->status = snapshot;
+            }
+        }
+        if (data_changed) NotifyDataChanged();
+    }
+
+    static bool XiaomiSnapshotChanged(const std::optional<XiaomiBatterySnapshot>& previous,
+                                      const XiaomiBatterySnapshot& current) {
+        if (!previous.has_value()) {
+            return XiaomiBatteryPresenceCount(current) > 0;
+        }
+        return previous->left != current.left || previous->right != current.right ||
+               previous->case_level != current.case_level || previous->left_charging != current.left_charging ||
+               previous->right_charging != current.right_charging || previous->case_charging != current.case_charging;
+    }
+
+    void NotifyDataChanged() {
+        std::function<void(std::uint64_t)> callback;
+        {
+            std::lock_guard lock(data_changed_mutex_);
+            callback = data_changed_;
+        }
+        if (callback == nullptr) return;
+        try {
+            callback(address_);
+        } catch (...) {
         }
     }
 
@@ -477,6 +529,8 @@ class XiaomiRfcommSessionManager::Session final {
     std::uint64_t address_;
     bool debug_enabled_;
     XiaomiDebugLogFn debug_log_;
+    std::mutex data_changed_mutex_;
+    std::function<void(std::uint64_t)> data_changed_;
     mutable std::mutex mutex_;
     std::condition_variable condition_;
     std::deque<std::shared_ptr<SessionRequest>> requests_;
@@ -498,6 +552,7 @@ struct XiaomiRfcommSessionManager::State {
     std::mutex mutex;
     std::condition_variable condition;
     bool stopping = false;
+    std::function<void(std::uint64_t)> data_changed_handler;
     std::unordered_map<std::uint64_t, std::shared_ptr<Session>> sessions;
     std::deque<std::shared_ptr<Session>> retired_sessions;
     std::thread cleanup_worker;
@@ -532,8 +587,26 @@ std::shared_ptr<XiaomiRfcommSessionManager::Session> XiaomiRfcommSessionManager:
     std::lock_guard lock(state_->mutex);
     if (state_->stopping) return {};
     auto& session = state_->sessions[address];
-    if (session == nullptr) session = std::make_shared<Session>(address, debug_enabled_, debug_log_);
+    if (session == nullptr) {
+        session = std::make_shared<Session>(address, debug_enabled_, debug_log_, state_->data_changed_handler);
+    }
     return session;
+}
+
+void XiaomiRfcommSessionManager::SetDataChangedHandler(std::function<void(std::uint64_t)> handler) {
+    std::lock_guard lock(state_->mutex);
+    state_->data_changed_handler = handler;
+    for (const auto& [address, session] : state_->sessions) {
+        (void)address;
+        if (session != nullptr) {
+            session->SetDataChangedHandler(handler);
+        }
+    }
+    for (const auto& session : state_->retired_sessions) {
+        if (session != nullptr) {
+            session->SetDataChangedHandler(handler);
+        }
+    }
 }
 
 std::vector<BatteryReading> XiaomiRfcommSessionManager::ReadBattery(std::uint64_t address,
