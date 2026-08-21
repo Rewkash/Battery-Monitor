@@ -57,6 +57,7 @@
 #include <QPainterPath>
 #include <QPointer>
 #include <QPropertyAnimation>
+#include <QSignalBlocker>
 #include <QProgressBar>
 #include <QPixmap>
 #include <QPushButton>
@@ -2595,6 +2596,10 @@ void BatteryWindow::InitializeTray() {
     reset_hidden_action_ = tray_menu_->addAction(QString::fromUtf8(
         u8"\u041F\u043E\u043A\u0430\u0437\u0430\u0442\u044C \u0441\u043A\u0440\u044B\u0442\u044B\u0435 "
         u8"\u0443\u0441\u0442\u0440\u043E\u0439\u0441\u0442\u0432\u0430"));
+    autostart_action_ = tray_menu_->addAction(
+        QString::fromUtf8(u8"Запускать при входе в Windows"));
+    autostart_action_->setCheckable(true);
+    autostart_action_->setChecked(IsApplicationAutostartEnabled());
     tray_menu_->addSeparator();
 #ifdef BATTERY_MONITOR_WITH_UPDATER
     check_updates_action_ = tray_menu_->addAction(
@@ -2612,6 +2617,17 @@ void BatteryWindow::InitializeTray() {
     });
     connect(refresh_action_, &QAction::triggered, this, [this]() { RefreshBatteryDataFromUser(); });
     connect(reset_hidden_action_, &QAction::triggered, this, [this]() { ResetHiddenDevices(); });
+    connect(autostart_action_, &QAction::toggled, this, [this](bool checked) {
+        if (!SetApplicationAutostartEnabled(checked) && autostart_action_ != nullptr) {
+            // Revert on failure so the checkbox reflects the real state.
+            const QSignalBlocker blocker(autostart_action_);
+            autostart_action_->setChecked(IsApplicationAutostartEnabled());
+            if (status_label_ != nullptr) {
+                status_label_->setText(QString::fromUtf8(
+                    u8"Не удалось изменить автозапуск (нет доступа к реестру)."));
+            }
+        }
+    });
 #ifdef BATTERY_MONITOR_WITH_UPDATER
     connect(check_updates_action_, &QAction::triggered, this,
             [this]() { CheckForApplicationUpdates(true); });

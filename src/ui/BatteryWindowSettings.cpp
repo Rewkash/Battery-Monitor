@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <unordered_set>
 
+#include <QCoreApplication>
 #include <QDebug>
 #include <QSettings>
 #include <QString>
@@ -155,6 +156,45 @@ void SaveBatteryWindowDeviceOrder(const std::vector<std::string>& connected_orde
     WriteOrderToSettings(&settings, kSettingsDisconnectedOrderKey, disconnected_order);
     settings.endGroup();
     settings.sync();
+}
+
+#ifdef _WIN32
+QSettings CreateAutostartRunKeySettings() {
+    return QSettings(QStringLiteral("HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"),
+                     QSettings::NativeFormat);
+}
+
+constexpr const char* kAutostartValueName = "ChargeView";
+#endif
+
+bool IsApplicationAutostartEnabled() {
+#ifdef _WIN32
+    QSettings settings = CreateAutostartRunKeySettings();
+    return settings.contains(QString::fromLatin1(kAutostartValueName));
+#else
+    return false;
+#endif
+}
+
+bool SetApplicationAutostartEnabled(bool enabled) {
+#ifdef _WIN32
+    QSettings settings = CreateAutostartRunKeySettings();
+    const QString value_name = QString::fromLatin1(kAutostartValueName);
+    if (enabled) {
+        const QString exe_path = QCoreApplication::applicationFilePath();
+        if (exe_path.isEmpty()) {
+            return false;
+        }
+        settings.setValue(value_name, QStringLiteral("\"%1\"").arg(exe_path));
+    } else {
+        settings.remove(value_name);
+    }
+    settings.sync();
+    return settings.status() == QSettings::NoError;
+#else
+    (void)enabled;
+    return false;
+#endif
 }
 
 }  // namespace battery_monitor

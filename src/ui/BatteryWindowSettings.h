@@ -33,4 +33,9 @@ void SaveBatteryWindowLowBatteryRepeatMinutes(int minutes);
 void SaveBatteryWindowDeviceOrder(const std::vector<std::string>& connected_order,
                                   const std::vector<std::string>& disconnected_order);
 
+// Windows autostart (per-user Run registry key). The value points at the
+// current executable; the app starts hidden in the tray by default.
+bool IsApplicationAutostartEnabled();
+bool SetApplicationAutostartEnabled(bool enabled);
+
 }  // namespace battery_monitor

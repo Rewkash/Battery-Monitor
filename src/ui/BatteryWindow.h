@@ -125,6 +125,7 @@ class BatteryWindow : public QWidget {
     QAction* toggle_window_action_ = nullptr;
     QAction* refresh_action_ = nullptr;
     QAction* reset_hidden_action_ = nullptr;
+    QAction* autostart_action_ = nullptr;
     QAction* check_updates_action_ = nullptr;
     QAction* quit_action_ = nullptr;
     QTimer* refresh_timer_ = nullptr;
