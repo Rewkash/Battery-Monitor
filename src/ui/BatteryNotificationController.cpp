@@ -49,19 +49,25 @@ std::vector<LowBatteryAlert> LowBatteryNotifier::Evaluate(
 
         bool should_alert = false;
         bool any_below = false;
-        bool any_above = false;
+        bool any_recovered = false;
 
         for (const auto& reading : snapshot.live_components) {
             const bool below_threshold =
                 static_cast<int>(reading.level_percent) <= threshold_percent_;
+            const auto previous_it = state.previous_levels.find(reading.component);
+            const bool had_previous = previous_it != state.previous_levels.end();
+            const bool was_below =
+                had_previous && static_cast<int>(previous_it->second) <= threshold_percent_;
+
             if (below_threshold) {
                 any_below = true;
-            } else {
-                any_above = true;
+            } else if (was_below) {
+                // A component known to be low is now observed above the
+                // threshold -- a real recovery, unlike invisibility.
+                any_recovered = true;
             }
 
-            const auto previous_it = state.previous_levels.find(reading.component);
-            const bool crossed_down = previous_it == state.previous_levels.end() ||
+            const bool crossed_down = !had_previous ||
                                       static_cast<int>(previous_it->second) > threshold_percent_;
             if (below_threshold && crossed_down) {
                 should_alert = true;
@@ -76,9 +82,12 @@ std::vector<LowBatteryAlert> LowBatteryNotifier::Evaluate(
             }
         }
 
-        if (any_above && !any_below) {
-            // All components are back above the threshold: allow an immediate
-            // alert on the next crossing.
+        if (!any_below && any_recovered) {
+            // Every previously-low component that is visible is back above
+            // the threshold: allow an immediate alert on the next crossing.
+            // Cycles where a low component is simply not visible (cached
+            // reading, bud in case) must NOT reset the repeat state -- that
+            // used to silence repeat alerts until the level changed.
             state.has_last_alert = false;
             state.last_alert_ms = 0;
         }
